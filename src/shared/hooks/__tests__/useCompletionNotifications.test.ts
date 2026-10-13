@@ -622,6 +622,7 @@ describe("useCompletionNotifications", () => {
     );
 
     mocks.getCurrentWindow.mockReturnValue({
+      isFocused: vi.fn().mockResolvedValue(true),
       onFocusChanged: vi.fn((handler) => {
         focusChanged = handler;
         return Promise.resolve(vi.fn());
@@ -813,6 +814,49 @@ describe("useCompletionNotifications", () => {
         {
           body: "Deferred start finished",
           sessionId: "session-defer",
+          sound: "berd-sounds-4.mp3",
+        },
+      ),
+    );
+    const desktopCalls = mocks.invoke.mock.calls.filter(
+      ([command]) => command === "show_completion_notification",
+    );
+    expect(desktopCalls).toHaveLength(1);
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+
+  it("delivers a desktop notification for an actively viewed session completing before the focus query settles in an unfocused window", async () => {
+    const focusQuery = deferred<boolean>();
+    const { onFocusChanged } = makeAppWindow(() => focusQuery.promise);
+
+    renderHook(() => useCompletionNotifications(vi.fn()));
+    await waitFor(() => expect(onFocusChanged).toHaveBeenCalled());
+
+    // The user is "viewing" this session, but the window is actually
+    // backgrounded — the hook must not drop the completion based on the
+    // placeholder focused default before the query settles.
+    useChatStore.setState({
+      activeSessionId: "session-viewed",
+      isViewingActiveSession: true,
+    });
+    completeSession("session-viewed", "Viewed background");
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(mocks.invoke).not.toHaveBeenCalledWith(
+      "show_completion_notification",
+      expect.anything(),
+    );
+
+    focusQuery.resolve(false);
+
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        "show_completion_notification",
+        {
+          body: "Viewed background finished",
+          sessionId: "session-viewed",
           sound: "berd-sounds-4.mp3",
         },
       ),

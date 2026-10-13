@@ -263,13 +263,11 @@ export function useCompletionNotifications(
             pendingSessions.delete(sessionId);
 
             const chatStoreState = useChatStore.getState();
-            const isViewingThisSession = isSessionActivelyViewed(
-              chatStoreState,
-              sessionId,
-            );
-            // Skip if user is already watching this session in a focused window.
-            if (isViewingThisSession && windowFocusedRef.current) continue;
-
+            // The "actively watching in a focused window" skip is evaluated
+            // only after the focus state is seeded (inside the buffered
+            // continuation below): checking it here would read the
+            // placeholder `true` default and silently drop a completion
+            // that lands while the mount-time focus query is in flight.
             const messages = chatStoreState.messagesBySession[sessionId] ?? [];
             const outcome = getCompletionOutcome(messages);
             const session = useChatSessionStore
