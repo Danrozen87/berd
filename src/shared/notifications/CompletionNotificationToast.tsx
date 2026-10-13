@@ -1,9 +1,12 @@
 import { toast } from "sonner";
 import { ToastActionButton, ToastActionGroup } from "@/shared/ui/sonner";
+import {
+  DEFAULT_TOAST_DURATION_SECONDS,
+  NEVER_DISMISS_TOAST_DURATION_SECONDS,
+  toastDurationSecondsToMs,
+} from "@/shared/notifications/toastDuration";
 
 export type CompletionNotificationOutcome = "completed" | "error" | "stopped";
-
-const TOAST_DURATION_MS = 8000;
 
 export function getCompletionToastDescription(
   outcome: CompletionNotificationOutcome,
@@ -18,11 +21,22 @@ export function showCompletionNotificationToast({
   outcome,
   onView,
   onChangeSound,
+  durationSeconds = DEFAULT_TOAST_DURATION_SECONDS,
+  dismissLabel = "Dismiss",
+  viewLabel = "View",
+  changeSoundLabel = "Change sound",
 }: {
   title: string;
   outcome: CompletionNotificationOutcome;
   onView: () => void;
   onChangeSound?: () => void;
+  durationSeconds?: number;
+  /** Localized label for the explicit dismiss action on persistent toasts. */
+  dismissLabel?: string;
+  /** Localized label for the primary view/navigate action. */
+  viewLabel?: string;
+  /** Localized label for the secondary change-sound action. */
+  changeSoundLabel?: string;
 }): void {
   let toastId: string | number | undefined;
   const handleView = () => {
@@ -38,27 +52,54 @@ export function showCompletionNotificationToast({
     onChangeSound?.();
   };
 
-  const action = onChangeSound ? (
-    <ToastActionGroup>
+  // Persistent (never-dismiss) toasts stay on screen until the user acts, so
+  // they need an explicit dismissal that neither navigates nor opens settings.
+  const isPersistent = durationSeconds === NEVER_DISMISS_TOAST_DURATION_SECONDS;
+  const handleDismiss = () => {
+    if (toastId !== undefined) {
+      toast.dismiss(toastId);
+    }
+  };
+
+  const secondaryActions = [
+    isPersistent ? (
       <ToastActionButton
+        key="dismiss"
+        className="ml-0"
+        emphasis="secondary"
+        onClick={handleDismiss}
+      >
+        {dismissLabel}
+      </ToastActionButton>
+    ) : null,
+    onChangeSound ? (
+      <ToastActionButton
+        key="change-sound"
         className="ml-0"
         emphasis="secondary"
         onClick={handleChangeSound}
       >
-        Change sound
+        {changeSoundLabel}
       </ToastActionButton>
-      <ToastActionButton className="ml-0" onClick={handleView}>
-        View
-      </ToastActionButton>
-    </ToastActionGroup>
-  ) : (
-    <ToastActionButton onClick={handleView}>View</ToastActionButton>
-  );
+    ) : null,
+  ].filter((element) => element !== null);
+
+  const action =
+    secondaryActions.length > 0 ? (
+      <ToastActionGroup>
+        {...secondaryActions}
+        <ToastActionButton key="view" className="ml-0" onClick={handleView}>
+          {viewLabel}
+        </ToastActionButton>
+      </ToastActionGroup>
+    ) : (
+      <ToastActionButton onClick={handleView}>{viewLabel}</ToastActionButton>
+    );
 
   const options = {
     action,
     description: getCompletionToastDescription(outcome),
-    duration: TOAST_DURATION_MS,
+    duration: toastDurationSecondsToMs(durationSeconds),
   };
 
   if (outcome === "error") {

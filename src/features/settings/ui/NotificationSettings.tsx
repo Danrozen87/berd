@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown } from "lucide-react";
 import { IconPlayerPlayFilled } from "@tabler/icons-react";
@@ -9,11 +9,18 @@ import { SettingsRow } from "@/shared/ui/settings-row";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Button } from "@/shared/ui/button";
 import { TopBarIconButton } from "@/shared/ui/top-bar-icon-button";
+import { Slider } from "@/shared/ui/slider";
 import {
   getNotificationPrefs,
   setNotificationPrefs,
   type NotificationPrefs,
 } from "@/features/settings/lib/notificationPrefs";
+import {
+  clampToastDurationSeconds,
+  MIN_TOAST_DURATION_SECONDS,
+  MAX_TOAST_DURATION_SECONDS,
+  NEVER_DISMISS_TOAST_DURATION_SECONDS,
+} from "@/shared/notifications/toastDuration";
 import {
   NOTIFICATION_SOUNDS,
   SILENT_NOTIFICATION_SOUND,
@@ -150,6 +157,7 @@ function NotificationChannelSetting({
   soundValue,
   onSoundChange,
   getPreviewAriaLabel,
+  extraDetails,
 }: {
   label: string;
   description: string;
@@ -160,6 +168,7 @@ function NotificationChannelSetting({
   soundValue: NotificationSoundId;
   onSoundChange: (value: NotificationSoundId) => void;
   getPreviewAriaLabel: (soundLabel: string) => string;
+  extraDetails?: ReactNode;
 }) {
   return (
     <SettingsRow
@@ -174,16 +183,19 @@ function NotificationChannelSetting({
       }
       details={
         checked ? (
-          <div className="w-56">
-            <p className="text-xs text-muted-foreground">{soundLabel}</p>
-            <div className="mt-2">
-              <SoundSelect
-                value={soundValue}
-                onValueChange={onSoundChange}
-                ariaLabel={soundAriaLabel}
-                getPreviewAriaLabel={getPreviewAriaLabel}
-              />
+          <div className="w-56 space-y-4">
+            <div>
+              <p className="text-xs text-muted-foreground">{soundLabel}</p>
+              <div className="mt-2">
+                <SoundSelect
+                  value={soundValue}
+                  onValueChange={onSoundChange}
+                  ariaLabel={soundAriaLabel}
+                  getPreviewAriaLabel={getPreviewAriaLabel}
+                />
+              </div>
             </div>
+            {extraDetails}
           </div>
         ) : undefined
       }
@@ -191,9 +203,78 @@ function NotificationChannelSetting({
   );
 }
 
+function ToastDurationControl({
+  label,
+  description,
+  draftToastDurationSeconds,
+  isNeverDismiss,
+  onSliderChange,
+  onSliderCommit,
+  onToggle,
+  durationLabel,
+  durationLabelId,
+}: {
+  label: string;
+  description: string;
+  draftToastDurationSeconds: number;
+  isNeverDismiss: boolean;
+  onSliderChange: (value: number) => void;
+  onSliderCommit: (value: number) => void;
+  onToggle: () => void;
+  durationLabel: string;
+  durationLabelId: string;
+}) {
+  const { t } = useTranslation("settings");
+  const descriptionId = useId();
+
+  return (
+    <div className="space-y-2 border-t border-border pt-4">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p id={descriptionId} className="text-[11px] text-muted-foreground">
+        {description}
+      </p>
+      <p id={durationLabelId} className="text-xs text-muted-foreground">
+        {durationLabel}
+      </p>
+      {isNeverDismiss ? null : (
+        <Slider
+          value={[draftToastDurationSeconds]}
+          min={MIN_TOAST_DURATION_SECONDS}
+          max={MAX_TOAST_DURATION_SECONDS}
+          step={1}
+          onValueChange={(values) => onSliderChange(values[0])}
+          onValueCommit={(values) => onSliderCommit(values[0])}
+          aria-label={label}
+          aria-valuetext={durationLabel}
+          aria-describedby={descriptionId}
+        />
+      )}
+      <Button
+        type="button"
+        variant="ghost"
+        size="xs"
+        className="-ml-2.5"
+        onClick={onToggle}
+      >
+        {isNeverDismiss
+          ? t("notifications.toastDuration.autoDismiss")
+          : t("notifications.toastDuration.neverDismiss")}
+      </Button>
+    </div>
+  );
+}
+
 export function NotificationSettings() {
   const { t } = useTranslation("settings");
+  const durationLabelId = useId();
   const [prefs, setPrefs] = useState<NotificationPrefs>(getNotificationPrefs);
+  const [draftToastDurationSeconds, setDraftToastDurationSeconds] = useState(
+    prefs.toastDurationSeconds,
+  );
+  // The most recent *timed* duration the user chose lives in the persisted
+  // prefs (not component state) so that leaving never-dismiss restores it
+  // even after navigating away from settings and back.
+  const lastTimedToastDurationSeconds = prefs.lastTimedToastDurationSeconds;
 
   function update(patch: Partial<NotificationPrefs>) {
     setNotificationPrefs(patch);
@@ -203,6 +284,32 @@ export function NotificationSettings() {
     );
     setPrefs((current) => ({ ...current, ...patch }));
   }
+
+  useEffect(() => {
+    setDraftToastDurationSeconds(prefs.toastDurationSeconds);
+  }, [prefs.toastDurationSeconds]);
+
+  function commitToastDurationSeconds(value: number) {
+    const clamped = clampToastDurationSeconds(value);
+    setDraftToastDurationSeconds(clamped);
+    update(
+      clamped === NEVER_DISMISS_TOAST_DURATION_SECONDS
+        ? { toastDurationSeconds: clamped }
+        : {
+            toastDurationSeconds: clamped,
+            lastTimedToastDurationSeconds: clamped,
+          },
+    );
+  }
+
+  const isNeverDismiss =
+    draftToastDurationSeconds === NEVER_DISMISS_TOAST_DURATION_SECONDS;
+
+  const durationLabel = isNeverDismiss
+    ? t("notifications.toastDuration.never")
+    : t("notifications.toastDuration.seconds", {
+        count: draftToastDurationSeconds,
+      });
 
   return (
     <SettingsPage title={t("notifications.title")}>
@@ -228,6 +335,33 @@ export function NotificationSettings() {
               onSoundChange={(inAppSound) => update({ inAppSound })}
               getPreviewAriaLabel={(sound) =>
                 t("notifications.soundPreview.ariaLabel", { sound })
+              }
+              extraDetails={
+                // Scoped to the in-app row: this preference only affects the
+                // in-app completion banner's dismiss timing, not desktop
+                // notifications, so it's only reachable (and only takes
+                // effect) while in-app notifications are enabled.
+                <ToastDurationControl
+                  label={t("notifications.toastDuration.label")}
+                  description={t("notifications.toastDuration.description")}
+                  draftToastDurationSeconds={draftToastDurationSeconds}
+                  isNeverDismiss={isNeverDismiss}
+                  onSliderChange={(value) =>
+                    setDraftToastDurationSeconds(
+                      clampToastDurationSeconds(value),
+                    )
+                  }
+                  onSliderCommit={commitToastDurationSeconds}
+                  onToggle={() =>
+                    commitToastDurationSeconds(
+                      isNeverDismiss
+                        ? lastTimedToastDurationSeconds
+                        : NEVER_DISMISS_TOAST_DURATION_SECONDS,
+                    )
+                  }
+                  durationLabel={durationLabel}
+                  durationLabelId={durationLabelId}
+                />
               }
             />
 

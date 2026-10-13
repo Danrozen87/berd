@@ -2,11 +2,13 @@
   "actions": {
     "archive": "Archivar",
     "cancel": "Cancelar",
+    "changeSound": "Cambiar sonido",
     "clear": "Limpiar",
     "close": "Cerrar",
     "copy": "Copiar",
     "create": "Crear",
     "delete": "Eliminar",
+    "dismiss": "Descartar",
     "duplicate": "Duplicar",
     "edit": "Editar",
     "export": "Exportar",

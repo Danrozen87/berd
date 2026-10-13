@@ -88,6 +88,53 @@ describe("CompletionNotificationToast", () => {
     expect(onView).toHaveBeenCalledOnce();
   });
 
+  it("defaults to an 8 second duration when none is provided", () => {
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Review fixes finished",
+      outcome: "completed",
+      onView: vi.fn(),
+    });
+
+    expect(mocks.toast).toHaveBeenCalledWith(
+      "Review fixes finished",
+      expect.objectContaining({ duration: 8000 }),
+    );
+  });
+
+  it("converts a custom finite duration to milliseconds", () => {
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Review fixes finished",
+      outcome: "completed",
+      onView: vi.fn(),
+      durationSeconds: 30,
+    });
+
+    expect(mocks.toast).toHaveBeenCalledWith(
+      "Review fixes finished",
+      expect.objectContaining({ duration: 30000 }),
+    );
+  });
+
+  it("maps a never-dismiss duration to an infinite toast duration", () => {
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Review fixes finished",
+      outcome: "completed",
+      onView: vi.fn(),
+      durationSeconds: 0,
+    });
+
+    expect(mocks.toast).toHaveBeenCalledWith(
+      "Review fixes finished",
+      expect.objectContaining({ duration: Number.POSITIVE_INFINITY }),
+    );
+  });
+
   it("uses the shared Toaster-backed error toast for error responses", () => {
     const onView = vi.fn();
     mocks.toastError.mockReturnValue("error-toast-id");
@@ -158,5 +205,81 @@ describe("CompletionNotificationToast", () => {
     expect(mocks.toastDismiss).toHaveBeenCalledWith("completion-toast-id");
     expect(onChangeSound).toHaveBeenCalledOnce();
     expect(onView).not.toHaveBeenCalled();
+  });
+
+  it("renders every action with the provided localized labels", () => {
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Correcciones terminadas",
+      outcome: "completed",
+      onView: vi.fn(),
+      onChangeSound: vi.fn(),
+      durationSeconds: 0,
+      viewLabel: "Ver",
+      changeSoundLabel: "Cambiar sonido",
+      dismissLabel: "Descartar",
+    });
+
+    const options = mocks.toast.mock.calls[0]?.[1] as { action?: unknown };
+    expect(isValidElement(options.action)).toBe(true);
+    if (!isValidElement(options.action)) return;
+    const action = options.action as React.ReactElement<{
+      children: React.ReactElement<{ children: React.ReactNode }>[];
+    }>;
+    const labels = action.props.children.map((child) => child.props.children);
+    // The whole visible action group follows the active locale — no action
+    // may remain hardcoded English.
+    expect(labels).toEqual(["Descartar", "Cambiar sonido", "Ver"]);
+  });
+
+  it("adds an explicit dismiss action to persistent toasts that closes without navigating", () => {
+    const onView = vi.fn();
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Review fixes finished",
+      outcome: "completed",
+      onView,
+      durationSeconds: 0,
+      dismissLabel: "Dismiss",
+    });
+
+    const options = mocks.toast.mock.calls[0]?.[1] as { action?: unknown };
+    expect(isValidElement(options.action)).toBe(true);
+    if (!isValidElement(options.action)) return;
+
+    const action = options.action as React.ReactElement<{
+      children: React.ReactElement<{
+        onClick?: () => void;
+        children: React.ReactNode;
+      }>[];
+    }>;
+    expect(action.type).toBe(ToastActionGroup);
+    const [dismissAction, viewAction] = action.props.children;
+
+    expect(dismissAction.type).toBe(ToastActionButton);
+    expect(dismissAction.props.children).toBe("Dismiss");
+    expect(viewAction.props.children).toBe("View");
+
+    dismissAction.props.onClick?.();
+
+    expect(mocks.toastDismiss).toHaveBeenCalledWith("completion-toast-id");
+    expect(onView).not.toHaveBeenCalled();
+  });
+
+  it("does not add a dismiss action to timed toasts", () => {
+    mocks.toast.mockReturnValue("completion-toast-id");
+
+    showCompletionNotificationToast({
+      title: "Review fixes finished",
+      outcome: "completed",
+      onView: vi.fn(),
+      durationSeconds: 30,
+      dismissLabel: "Dismiss",
+    });
+
+    const options = mocks.toast.mock.calls[0]?.[1] as { action?: unknown };
+    expectDesignSystemToastAction(options.action);
   });
 });
