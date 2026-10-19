@@ -997,10 +997,14 @@ static NSArray<NSDictionary<NSString *, id> *> *BerdDiscoverVoices(
         NSString *name = [resource valueForKey:@"name"] ?: @"";
         if (!name.length || !language.length) continue;
         NSString *key = [NSString stringWithFormat:@"%@|%@", name, normalizedLanguage];
+        // sirittsd can report a voice as downloaded whose assets aren't on disk,
+        // and then speaks it in another voice.
+        NSString *content = [resource valueForKey:@"contentPath"];
         byKey[key] = @{
             @"name" : name,
             @"language" : language,
             @"sizeBytes" : [resource valueForKey:@"assetSize"] ?: @0,
+            @"content" : @(content.length && [NSFileManager.defaultManager fileExistsAtPath:content]),
         };
     }
     return [[byKey allValues] sortedArrayUsingComparator:
@@ -1142,7 +1146,9 @@ char *berd_siri_tts_catalog_json(const char *languageValue, char **errorOut) {
             NSString *key = [NSString stringWithFormat:@"%@|%@",
                 candidate[@"name"], normalizedLanguage];
             NSMutableDictionary *voice = [candidate mutableCopy];
-            voice[@"installed"] = installedSnapshot[key] ?: @NO;
+            [voice removeObjectForKey:@"content"];
+            voice[@"installed"] =
+                [installedSnapshot[key] boolValue] && [candidate[@"content"] boolValue] ? @YES : @NO;
             [result addObject:voice];
         }
         NSData *json = [NSJSONSerialization dataWithJSONObject:result options:0 error:&error];

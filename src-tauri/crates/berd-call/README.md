@@ -270,7 +270,9 @@ retries cleanup. This avoids reporting a failed install after the model has
 already been applied.
 
 `voices.list` returns `backend`, normalized `languageFilter`,
-`availableLanguages`, and exact voice records. `voices.download` returns the
+`availableLanguages`, and exact voice records. A voice is `installed` only when
+sirittsd reports it downloaded and its assets are on disk: sirittsd can claim
+a voice whose assets are missing, then silently speak it in another voice. `voices.download` returns the
 canonical voice, `installed: true`, and `availabilityWaitSeconds`; a missing
 exact catalog identity fails with `voice_not_found` before any native download
 request. macOS status and install results contain `supported`, `locale`,
