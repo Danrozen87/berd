@@ -57,8 +57,12 @@ Start a call with the same backend flags accepted by `session`:
 berd-call start --voice Aaron --language en-US --stream
 berd-call status
 berd-call speak --re 7 "I found the cause."
+berd-call speak --voice Nora "Sol here: the tests pass."
 berd-call stop
 ```
+
+`speak --voice` speaks one reply in another voice of the call's reply backend
+without changing the call's voice, so agents sharing a call can sound distinct.
 
 `start` stays in the foreground and owns the child session process. The control
 server listens only on `127.0.0.1:5222` by default; all four commands accept

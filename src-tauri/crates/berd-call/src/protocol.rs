@@ -52,6 +52,10 @@ pub enum SessionRequest {
         text: String,
         #[serde(default)]
         resolved_handoff_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
     },
     OutputReady {
         id: u64,
@@ -145,6 +149,7 @@ pub enum NotAdmittedReason {
     Cancelled,
     EmptyText,
     InvalidHandoff,
+    InvalidVoice,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -394,6 +399,8 @@ mod tests {
                 acknowledgement: Some(0),
                 text: "hi".into(),
                 resolved_handoff_ids: Vec::new(),
+                voice: None,
+                language: None,
             }
         );
         assert_eq!(

@@ -206,7 +206,7 @@ it never admits a replacement while old host audio may still be active.
 {"type":"set_spokesperson_settings","id":u64,"expected_revision":u64,"settings":TtsSettings}
 {"type":"set_input_during_tts","id":u64,"expected_revision":u64,"policy":"allow_barge_in"|"suppress_input"}
 {"type":"reset_input","id":u64}
-{"type":"prepare_speak","id":u64,"acknowledgement":u64|null,"text":string}
+{"type":"prepare_speak","id":u64,"acknowledgement":u64|null,"text":string,"resolved_handoff_ids":[string]?,"voice":string?,"language":string?}
 {"type":"output_ready","id":u64,"speech_id":u64}
 audio acknowledgements listed above
 {"type":"query_state","id":u64,"after":u64}
@@ -216,6 +216,10 @@ audio acknowledgements listed above
 ```
 
 Unknown fields are rejected. IDs are positive. Speak text is at most 16 KiB.
+`prepare_speak.voice` speaks that one utterance in another voice of the reply
+backend, keeping its other settings; `language` changes a Siri voice's locale
+too. A voice the backend doesn't offer, or a voice for a call whose replies
+are spoken by the Spokesperson, is `not_admitted(invalid_voice)`.
 The parent cannot author speaking state or finalized input; those are derived
 only from PCM by the child runtime.
 
@@ -348,7 +352,7 @@ cancellation and shutdown terminals.
 
 ```text
 {"type":"pending","id":u64,"utterances":[{"token":u64,"text":string}]}
-{"type":"not_admitted","id":u64,"reason":"paused"|"in_progress"|"cancelled"|"empty_text"}
+{"type":"not_admitted","id":u64,"reason":"paused"|"in_progress"|"cancelled"|"empty_text"|"invalid_handoff"|"invalid_voice"}
 {"type":"state","id":u64,"confirmed_token":u64,"utterances_after":[{"token":u64,"text":string}]}
 {"type":"cancel_result","id":u64,"outcome":"cancelled"|"stale","speech_id":u64|null}
 {"type":"speech_started","id":u64,"speech_id":u64}

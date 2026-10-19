@@ -58,12 +58,14 @@ const SPEAK_HELP: &str = r#"Speak through the active local voice call.
 
 Usage:
   berd-call speak [--port PORT] [--re CURSOR]
-    [--resolves HANDOFF_ID]... TEXT
+    [--resolves HANDOFF_ID]... [--voice NAME [--language BCP47]] TEXT
 
 Speech waits for admission. The session setting controls whether it also waits
 for delivery. Non-blocking sessions require --stream or --codex and emit speech_result
 rows only for interruptions, failures, or pending user input. Interrupted results include
-estimatedSpokenText, a best-effort prefix based on delivered audio."#;
+estimatedSpokenText, a best-effort prefix based on delivered audio. --voice speaks
+this text in another voice of the call's reply backend without changing its saved
+voice, so several agents can share one call in distinct voices."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 

@@ -2862,7 +2862,8 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
         "id":2,
         "acknowledgement":1,
         "text":"I checked the repository.",
-        "resolved_handoff_ids":["handoff-external-1"]
+        "resolved_handoff_ids":["handoff-external-1"],
+        "voice":"coral"
     }));
     let admitted = session.recv(Duration::from_secs(2));
     assert_eq!(admitted["type"], "admitted", "{admitted}");
@@ -2889,6 +2890,19 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
     assert_eq!(speech["input"], "I checked the repository.");
+    assert_eq!(speech["voice"], "coral");
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":3,
+        "acknowledgement":1,
+        "text":"Who am I?",
+        "voice":"nobody"
+    }));
+    let rejected = session.recv(Duration::from_secs(2));
+    assert_eq!(
+        rejected,
+        json!({"type":"not_admitted","id":3,"reason":"invalid_voice"})
+    );
 
     let (context, mentions, after) = context_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(context["type"], "conversation.item.create", "{context}");

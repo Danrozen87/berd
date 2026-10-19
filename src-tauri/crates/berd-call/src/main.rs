@@ -539,6 +539,8 @@ fn main() {
                 port,
                 acknowledgement,
                 resolved_handoff_ids,
+                voice,
+                language,
                 text,
             } = parse_or_exit(parse_speak_control_args(&args), &args);
             let response = host_control::request(
@@ -547,6 +549,8 @@ fn main() {
                     text,
                     acknowledgement,
                     resolved_handoff_ids,
+                    voice,
+                    language,
                 },
             )
             .unwrap_or_else(|error| operational_error("speak", error));
@@ -921,6 +925,8 @@ struct SpeakOptions {
     port: u16,
     acknowledgement: Option<u64>,
     resolved_handoff_ids: Vec<String>,
+    voice: Option<String>,
+    language: Option<String>,
     text: String,
 }
 
@@ -929,6 +935,7 @@ fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailur
     let mut port_seen = false;
     let mut acknowledgement = None;
     let mut resolved_handoff_ids = Vec::new();
+    let (mut voice, mut language) = (None, None);
     let mut text = None;
     let mut index = 2;
     while index < args.len() {
@@ -955,6 +962,23 @@ fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailur
                 index += 2;
             }
             "--re" => return Err("--re may be provided only once".into()),
+            flag @ ("--voice" | "--language") => {
+                let slot = if flag == "--voice" {
+                    &mut voice
+                } else {
+                    &mut language
+                };
+                if slot.is_some() {
+                    return Err(format!("{flag} may be provided only once").into());
+                }
+                *slot = Some(
+                    args.get(index + 1)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| format!("{flag} requires a value"))?
+                        .clone(),
+                );
+                index += 2;
+            }
             "--resolves" => {
                 let value = args
                     .get(index + 1)
@@ -984,10 +1008,15 @@ fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailur
     if text.len() > MAX_SPEAK_TEXT_BYTES {
         return Err("speak text is larger than 16 KiB".into());
     }
+    if language.is_some() && voice.is_none() {
+        return Err("--language requires --voice".into());
+    }
     Ok(SpeakOptions {
         port,
         acknowledgement,
         resolved_handoff_ids,
+        voice,
+        language,
         text,
     })
 }
@@ -1992,7 +2021,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
     let mut next_input_token = 1_u64;
     let mut pending_control = None;
     let mut processed_pcm = 0_u64;
-    let mut held: Option<PrepareRequest> = None;
+    let mut held: Option<HeldPrepare> = None;
     let mut active: Option<ActivePlayback> = None;
     let mut status_sound_runtime = StatusSoundRuntime::default();
 
@@ -2132,7 +2161,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     "session is shutting down",
                     &mut writer,
                 )?;
-                if let Some(held) = held.take() {
+                if let Some((held, _)) = held.take() {
                     write_message(
                         &mut writer,
                         &SessionMessage::NotAdmitted {
@@ -2366,11 +2395,18 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                 acknowledgement,
                 text,
                 resolved_handoff_ids: _,
+                voice,
+                language,
             }) => {
                 let request = PrepareRequest {
                     id,
                     acknowledgement,
                     text,
+                };
+                let Some(voice) =
+                    speak_voice(tts_slot.as_deref(), voice, language, id, &mut writer)?
+                else {
+                    continue;
                 };
                 if held.is_some() {
                     write_message(
@@ -2383,6 +2419,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                 } else {
                     process_prepare(
                         request,
+                        voice,
                         &mut core,
                         tts_slot.as_deref().expect("hello initialized TTS"),
                         input_during_tts_slot
@@ -2681,6 +2718,8 @@ struct PendingExpertPrepare {
     acknowledgement: Option<u64>,
     text: String,
     resolved_handoff_ids: Vec<String>,
+    /// The Expert's voice for this reply, when not its usual one.
+    voice: Option<TtsConfigurationLease>,
 }
 
 struct PendingSpokespersonSettingsUpdate {
@@ -2919,6 +2958,8 @@ struct LiveResponse {
     /// An Expert reply spoken in its own voice, with the handoffs it answers.
     /// It has no provider response; its whole text is played at once.
     reply: Option<Vec<String>>,
+    /// The voice it asked for, when not the Expert's usual one.
+    voice: Option<TtsConfigurationLease>,
     delivery: RealtimeAudioDelivery,
     pending_audio: VecDeque<Vec<f32>>,
     pending_frames: usize,
@@ -2937,6 +2978,7 @@ impl LiveResponse {
             speech_id,
             expert_text: None,
             reply: None,
+            voice: None,
             delivery: RealtimeAudioDelivery::default(),
             pending_audio: VecDeque::new(),
             pending_frames: 0,
@@ -4373,12 +4415,20 @@ fn run_expert_spokesperson_session(
                 acknowledgement,
                 text,
                 resolved_handoff_ids,
+                voice,
+                language,
             }) => {
+                let Some(voice) =
+                    speak_voice(reply_tts.as_deref(), voice, language, id, &mut writer)?
+                else {
+                    continue;
+                };
                 let request = PendingExpertPrepare {
                     id,
                     acknowledgement,
                     text,
                     resolved_handoff_ids,
+                    voice,
                 };
                 let routing = route_expert_prepare(
                     &mut turn_gate,
@@ -5153,6 +5203,7 @@ fn submit_expert_prepare(
                 let mut response = LiveResponse::new(Some(request.id), Some(speech_id));
                 response.expert_text = Some(message);
                 response.reply = Some(resolved_handoff_ids);
+                response.voice = request.voice;
                 response.audio_done = true;
                 response.finish_sent = true;
                 response.server_finished = true;
@@ -5334,7 +5385,13 @@ fn start_next_live_playback(
                 response.speech_id.expect("an Expert reply has a speech ID"),
                 response.prepare_id,
                 response.expert_text.clone().unwrap_or_default(),
-                Arc::clone(tts.lease()?.backend()),
+                Arc::clone(
+                    response
+                        .voice
+                        .clone()
+                        .map_or_else(|| tts.lease(), Ok)?
+                        .backend(),
+                ),
                 Arc::clone(audio_transport),
                 audio_control_tx.clone(),
                 reply_tx.clone(),
@@ -7079,20 +7136,55 @@ fn reject_tts_configuration_update(
     )
 }
 
+/// A held reply, with the voice it asked for.
+type HeldPrepare = (PrepareRequest, Option<TtsConfigurationLease>);
+
+/// The voice one reply asked for, or `None` after telling the host it can't
+/// have it.
+fn speak_voice(
+    slot: Option<&ConfiguredTtsSlot>,
+    voice: Option<String>,
+    language: Option<String>,
+    id: u64,
+    writer: &mut impl Write,
+) -> Result<Option<Option<TtsConfigurationLease>>, String> {
+    let Some(voice) = voice else {
+        return Ok(Some(None));
+    };
+    let lease = slot
+        .ok_or_else(|| "this call's replies have no voice of their own".to_string())
+        .and_then(|slot| slot.lease_voice(&voice, language.as_deref()));
+    match lease {
+        Ok(lease) => Ok(Some(Some(lease))),
+        Err(message) => {
+            eprintln!("berd-call: speech {id} can't use voice {voice}: {message}");
+            write_message(
+                writer,
+                &SessionMessage::NotAdmitted {
+                    id,
+                    reason: NotAdmittedReason::InvalidVoice,
+                },
+            )?;
+            Ok(None)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_prepare(
     request: PrepareRequest,
+    voice: Option<TtsConfigurationLease>,
     core: &mut SessionCore,
     tts_slot: &ConfiguredTtsSlot,
     input_during_tts_slot: &InputDuringTtsSlot,
     active: &mut Option<ActivePlayback>,
-    held: &mut Option<PrepareRequest>,
+    held: &mut Option<HeldPrepare>,
     writer: &mut impl Write,
 ) -> Result<(), String> {
     let id = request.id;
     match core.prepare(request.clone()) {
         PrepareOutcome::Hold => {
-            *held = Some(request);
+            *held = Some((request, voice));
         }
         PrepareOutcome::Pending(utterances) => {
             write_message(writer, &SessionMessage::Pending { id, utterances })?;
@@ -7105,7 +7197,7 @@ fn process_prepare(
             confirmed_token,
             text,
         } => {
-            let tts = tts_slot.lease()?;
+            let tts = voice.map_or_else(|| tts_slot.lease(), Ok)?;
             let input_during_tts = input_during_tts_slot.snapshot()?;
             *active = Some(ActivePlayback {
                 prepare_id: id,
@@ -7133,7 +7225,7 @@ fn process_prepare(
 }
 
 fn reevaluate_held(
-    held: &mut Option<PrepareRequest>,
+    held: &mut Option<HeldPrepare>,
     core: &mut SessionCore,
     tts_slot: Option<&ConfiguredTtsSlot>,
     input_during_tts_slot: Option<&InputDuringTtsSlot>,
@@ -7141,9 +7233,10 @@ fn reevaluate_held(
     writer: &mut impl Write,
 ) -> Result<(), String> {
     if !core.user_speaking() && !core.recognition_pending() && active.is_none() {
-        if let Some(pending_prepare) = held.take() {
+        if let Some((pending_prepare, voice)) = held.take() {
             process_prepare(
                 pending_prepare,
+                voice,
                 core,
                 tts_slot.expect("held prepare requires initialized TTS"),
                 input_during_tts_slot
@@ -7478,12 +7571,12 @@ fn handle_reset_input(
 
 fn handle_cancel(
     id: u64,
-    held: &mut Option<PrepareRequest>,
+    held: &mut Option<HeldPrepare>,
     core: &mut SessionCore,
     active: &mut Option<ActivePlayback>,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    if held.as_ref().is_some_and(|held| held.id == id) {
+    if held.as_ref().is_some_and(|(held, _)| held.id == id) {
         held.take();
         write_message(
             writer,
@@ -8257,6 +8350,7 @@ mod tests {
             acknowledgement: Some(1),
             text: "answer".into(),
             resolved_handoff_ids: Vec::new(),
+            voice: None,
         };
         assert!(matches!(
             gate.defer_if_busy(request, false, 1),
@@ -8296,6 +8390,7 @@ mod tests {
                     acknowledgement: Some(1),
                     text: "first".into(),
                     resolved_handoff_ids: Vec::new(),
+                    voice: None,
                 },
                 false,
                 1,
@@ -8309,6 +8404,7 @@ mod tests {
                     acknowledgement: Some(1),
                     text: "second".into(),
                     resolved_handoff_ids: Vec::new(),
+                    voice: None,
                 },
                 false,
                 1,
@@ -8339,6 +8435,7 @@ mod tests {
                 acknowledgement: Some(1),
                 text: "second".into(),
                 resolved_handoff_ids: Vec::new(),
+                voice: None,
             },
             expert_output_reserved(&directives, &HashSet::new(), None, &responses),
             false,
@@ -8865,6 +8962,7 @@ mod tests {
                     acknowledgement: Some(1),
                     text: "answer after the user".into(),
                     resolved_handoff_ids: Vec::new(),
+                    voice: None,
                 },
                 false,
                 1,
@@ -9287,6 +9385,35 @@ mod tests {
 
     fn test_tts_lease() -> TtsConfigurationLease {
         test_tts_slot().lease().unwrap()
+    }
+
+    #[test]
+    fn speech_in_another_voice_is_refused_when_the_voice_is_unavailable() {
+        let slot = test_tts_slot();
+        let mut writer = Vec::new();
+        assert!(speak_voice(Some(&slot), None, None, 1, &mut writer)
+            .unwrap()
+            .unwrap()
+            .is_none());
+        let coral = speak_voice(Some(&slot), Some("coral".into()), None, 2, &mut writer)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(coral.snapshot().settings.voice(), "coral");
+        assert!(writer.is_empty());
+        for (id, slot, voice) in [(3, Some(&slot), "nobody"), (4, None, "coral")] {
+            assert!(speak_voice(slot, Some(voice.into()), None, id, &mut writer)
+                .unwrap()
+                .is_none());
+        }
+        let refusals = String::from_utf8(writer).unwrap();
+        assert_eq!(
+            refusals.lines().collect::<Vec<_>>(),
+            [
+                r#"{"type":"not_admitted","id":3,"reason":"invalid_voice"}"#,
+                r#"{"type":"not_admitted","id":4,"reason":"invalid_voice"}"#,
+            ]
+        );
     }
 
     fn test_input_policy_slot() -> InputDuringTtsSlot {
@@ -11194,6 +11321,8 @@ mod tests {
             acknowledgement: None,
             text: "answer".into(),
             resolved_handoff_ids: vec!["  ".into()],
+            voice: None,
+            language: None,
         };
         assert_eq!(
             validate_request(empty).unwrap_err(),
@@ -11244,6 +11373,7 @@ mod tests {
                 acknowledgement: None,
                 text: "reply".into(),
             },
+            None,
             &mut core,
             &test_tts_slot(),
             &input_policy,
@@ -11289,6 +11419,7 @@ mod tests {
                 acknowledgement: None,
                 text: "old voice".into(),
             },
+            None,
             &mut core,
             &slot,
             &input_policy,
@@ -12377,6 +12508,10 @@ mod tests {
                 "5300",
                 "--re",
                 "17",
+                "--voice",
+                "Nora",
+                "--language",
+                "en-GB",
                 "hello",
             ]))
             .unwrap(),
@@ -12384,9 +12519,19 @@ mod tests {
                 port: 5300,
                 acknowledgement: Some(17),
                 resolved_handoff_ids: Vec::new(),
+                voice: Some("Nora".into()),
+                language: Some("en-GB".into()),
                 text: "hello".into(),
             }
         );
+        assert!(parse_speak_control_args(&args(&[
+            "berd-call",
+            "speak",
+            "--language",
+            "en-GB",
+            "hello"
+        ]))
+        .is_err());
         assert_eq!(
             parse_control_port(&args(&["berd-call", "status", "--port", "5301"])).unwrap(),
             5301

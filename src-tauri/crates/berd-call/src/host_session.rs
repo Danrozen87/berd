@@ -517,6 +517,8 @@ enum ControlCommand {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        voice: Option<String>,
+        language: Option<String>,
         non_blocking: bool,
         response: SyncSender<Result<Value, String>>,
     },
@@ -739,6 +741,8 @@ impl HostControl for SessionControl {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        voice: Option<String>,
+        language: Option<String>,
     ) -> Result<Value, String> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
@@ -746,6 +750,8 @@ impl HostControl for SessionControl {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                voice,
+                language,
                 non_blocking: self.non_blocking.load(Ordering::SeqCst),
                 response: tx,
             })
@@ -1092,6 +1098,8 @@ impl SessionActor {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                voice,
+                language,
                 non_blocking,
                 response,
             } => {
@@ -1104,6 +1112,8 @@ impl SessionActor {
                         text,
                         acknowledgement,
                         resolved_handoff_ids,
+                        voice,
+                        language,
                         non_blocking,
                         response,
                     });
@@ -1117,6 +1127,8 @@ impl SessionActor {
                         acknowledgement,
                         text: text.clone(),
                         resolved_handoff_ids,
+                        voice,
+                        language,
                     },
                 )?;
                 self.pending_speak = Some(PendingSpeak {
@@ -2661,6 +2673,7 @@ fn not_admitted_reason_name(reason: NotAdmittedReason) -> &'static str {
         NotAdmittedReason::Cancelled => "cancelled",
         NotAdmittedReason::EmptyText => "empty_text",
         NotAdmittedReason::InvalidHandoff => "invalid_handoff",
+        NotAdmittedReason::InvalidVoice => "invalid_voice",
     }
 }
 
@@ -3356,6 +3369,8 @@ mod tests {
                 text: "next".into(),
                 acknowledgement: Some(7),
                 resolved_handoff_ids: Vec::new(),
+                voice: None,
+                language: None,
                 non_blocking: true,
                 response: next_tx,
             })
