@@ -28,6 +28,7 @@ use crate::host_control::{self, ControlRequest};
 use crate::StartOptions;
 
 const RATES: [f32; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+const SPOKESPERSON_RATES: std::ops::RangeInclusive<f32> = 0.25..=1.5;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Runs the call on a worker thread while the main thread owns the menu bar.
@@ -64,6 +65,8 @@ pub(crate) enum MenuAction {
         language: Option<String>,
     },
     Rate(f32),
+    SpokespersonVoice(String),
+    SpokespersonRate(f32),
     Muted(bool),
     InputDuringTts(InputDuringTtsPolicy),
     Stop,
@@ -121,33 +124,8 @@ fn menu_model(state: &MenuState) -> Vec<MenuNode> {
     };
     let muted = status["muted"].as_bool().unwrap_or(false);
     let suppressing = input_policy(status) == Some(InputDuringTtsPolicy::SuppressInput);
-    let rate = status["session"]["tts"]["rate"].as_f64().unwrap_or(1.0) as f32;
-    let rates = RATES
-        .iter()
-        .filter(|&&option| rate_range(status).contains(&option))
-        .map(|&option| MenuNode {
-            checked: (option - rate).abs() < 0.01,
-            ..item(rate_title(option), Some(MenuAction::Rate(option)))
-        })
-        .collect();
-    let voice = status["session"]["tts"]["voice"]
-        .as_str()
-        .unwrap_or("Unknown");
-    let language = status["session"]["tts"]["language"].as_str();
-    let voices = state
-        .voices
-        .iter()
-        .map(|entry| MenuNode {
-            checked: entry.voice == voice && entry.language.as_deref() == language,
-            ..item(
-                entry.title.clone(),
-                Some(MenuAction::Voice {
-                    voice: entry.voice.clone(),
-                    language: entry.language.clone(),
-                }),
-            )
-        })
-        .collect();
+    let tts = &status["session"]["tts"];
+    let spokesperson = &status["session"]["spokesperson"];
     let mut nodes = vec![item(format!("Berd Call · {}", mode_name(status)), None)];
     for error in [&state.action_error, &state.catalog_error]
         .into_iter()
@@ -155,16 +133,31 @@ fn menu_model(state: &MenuState) -> Vec<MenuNode> {
     {
         nodes.push(item(format!("Control error: {error}"), None));
     }
+    nodes.push(SEPARATOR);
+    // Replies with their own voice put the Spokesperson's beside it.
+    let agents = if spokesperson.is_null() { "" } else { "Agent " };
+    nodes.extend(voice_menu(
+        agents,
+        tts,
+        &state.voices,
+        rate_range(status),
+        |entry| MenuAction::Voice {
+            voice: entry.voice.clone(),
+            language: entry.language.clone(),
+        },
+        MenuAction::Rate,
+    ));
+    if !spokesperson.is_null() {
+        nodes.extend(voice_menu(
+            "Spokesperson ",
+            spokesperson,
+            &available_voices("openai").unwrap_or_default(),
+            SPOKESPERSON_RATES,
+            |entry| MenuAction::SpokespersonVoice(entry.voice.clone()),
+            MenuAction::SpokespersonRate,
+        ));
+    }
     nodes.extend([
-        SEPARATOR,
-        MenuNode {
-            children: voices,
-            ..item(format!("Voice: {voice}"), None)
-        },
-        MenuNode {
-            children: rates,
-            ..item(format!("Speech Rate: {}", rate_title(rate)), None)
-        },
         MenuNode {
             checked: suppressing,
             ..item(
@@ -188,6 +181,43 @@ fn menu_model(state: &MenuState) -> Vec<MenuNode> {
     nodes
 }
 
+/// A voice's choices and speeds, titled with whose voice it is.
+fn voice_menu(
+    whose: &str,
+    tts: &Value,
+    voices: &[VoiceChoice],
+    range: std::ops::RangeInclusive<f32>,
+    choose: impl Fn(&VoiceChoice) -> MenuAction,
+    rate_action: impl Fn(f32) -> MenuAction,
+) -> [MenuNode; 2] {
+    let voice = tts["voice"].as_str().unwrap_or("Unknown");
+    let language = tts["language"].as_str();
+    let rate = tts["rate"].as_f64().unwrap_or(1.0) as f32;
+    [
+        MenuNode {
+            children: voices
+                .iter()
+                .map(|entry| MenuNode {
+                    checked: entry.voice == voice && entry.language.as_deref() == language,
+                    ..item(entry.title.clone(), Some(choose(entry)))
+                })
+                .collect(),
+            ..item(format!("{whose}Voice: {voice}"), None)
+        },
+        MenuNode {
+            children: RATES
+                .iter()
+                .filter(|option| range.contains(option))
+                .map(|&option| MenuNode {
+                    checked: (option - rate).abs() < 0.01,
+                    ..item(rate_title(option), Some(rate_action(option)))
+                })
+                .collect(),
+            ..item(format!("{whose}Speech Rate: {}", rate_title(rate)), None)
+        },
+    ]
+}
+
 /// Translates a menu action into the control request the CLI would send.
 pub(crate) fn control_request(action: &MenuAction) -> ControlRequest {
     match action {
@@ -196,6 +226,14 @@ pub(crate) fn control_request(action: &MenuAction) -> ControlRequest {
             language: language.clone(),
         },
         MenuAction::Rate(rate) => ControlRequest::Rate { rate: *rate },
+        MenuAction::SpokespersonVoice(voice) => ControlRequest::Spokesperson {
+            voice: Some(voice.clone()),
+            rate: None,
+        },
+        MenuAction::SpokespersonRate(rate) => ControlRequest::Spokesperson {
+            voice: None,
+            rate: Some(*rate),
+        },
         MenuAction::Muted(muted) => ControlRequest::Muted { muted: *muted },
         MenuAction::InputDuringTts(policy) => ControlRequest::InputDuringTts { policy: *policy },
         MenuAction::Stop => ControlRequest::Stop,
@@ -204,8 +242,8 @@ pub(crate) fn control_request(action: &MenuAction) -> ControlRequest {
 
 /// The rates `berd-call` accepts for the call's TTS backend and mode.
 fn rate_range(status: &Value) -> std::ops::RangeInclusive<f32> {
-    if mode_name(status) == "Expert-Spokesperson" {
-        return 0.25..=1.5;
+    if mode_name(status) == "Expert-Spokesperson" && status["session"]["spokesperson"].is_null() {
+        return SPOKESPERSON_RATES;
     }
     match status["session"]["tts"]["backend"].as_str() {
         Some("siri") => 0.5..=2.0,
@@ -546,7 +584,8 @@ fn action_domain(request: &ControlRequest) -> ActionDomain {
     match request {
         ControlRequest::TtsSettings { .. }
         | ControlRequest::Rate { .. }
-        | ControlRequest::Voice { .. } => ActionDomain::Tts,
+        | ControlRequest::Voice { .. }
+        | ControlRequest::Spokesperson { .. } => ActionDomain::Tts,
         ControlRequest::Muted { .. } => ActionDomain::Mute,
         ControlRequest::InputDuringTts { .. } => ActionDomain::InputDuringTts,
         ControlRequest::Stop => ActionDomain::Stop,
@@ -560,6 +599,7 @@ fn revisioned_tts_action(request: &ControlRequest) -> bool {
         ControlRequest::TtsSettings { .. }
             | ControlRequest::Rate { .. }
             | ControlRequest::Voice { .. }
+            | ControlRequest::Spokesperson { .. }
     )
 }
 
@@ -735,6 +775,41 @@ mod tests {
         ));
         assert_eq!(icon_symbol(Some(&status)), "mic.slash");
         find(&menu_model(&MenuState::default()), "End Call");
+    }
+
+    #[test]
+    fn replies_with_their_own_voice_put_the_spokespersons_beside_it() {
+        let mut status = status(false, "allow_barge_in", Some("expert-spokesperson"));
+        status["session"]["spokesperson"] = json!({"backend": "openai", "model": "gpt-realtime", "voice": "marin", "rate": 1.0, "revision": 1});
+        let nodes = menu_model(&MenuState {
+            status: Some(status),
+            ..MenuState::default()
+        });
+        let titles = |wanted: &str| -> Vec<String> {
+            find(&nodes, wanted)
+                .children
+                .iter()
+                .map(|node| node.title.clone())
+                .collect()
+        };
+        assert_eq!(
+            titles("Agent Speech Rate: 1.25×"),
+            ["0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×"]
+        );
+        assert_eq!(
+            titles("Spokesperson Speech Rate: 1×"),
+            ["0.5×", "0.75×", "1×", "1.25×", "1.5×"]
+        );
+        let cedar = find(&nodes, "Spokesperson Voice: marin")
+            .children
+            .iter()
+            .find(|node| node.title == "cedar")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(control_request(cedar.action.as_ref().unwrap())).unwrap(),
+            json!({"command": "spokesperson", "voice": "cedar", "rate": null})
+        );
+        find(&nodes, "Agent Voice: Aaron");
     }
 
     #[test]

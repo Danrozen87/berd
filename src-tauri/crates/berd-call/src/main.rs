@@ -36,8 +36,8 @@ use berd_call::openai_spokesperson::{
 };
 use berd_call::protocol::{
     CancelOutcome, DismissHandoffsOutcome, ExpertTurnOutcome, InputDuringTtsOutcome,
-    NotAdmittedReason, OutputReadyOutcome, SessionMessage, SessionRequest,
-    SpokespersonVoiceSnapshot, TtsSettingsOutcome, VoiceSessionSnapshot,
+    NotAdmittedReason, OutputReadyOutcome, SessionMessage, SessionRequest, TtsSettingsOutcome,
+    VoiceSessionSnapshot,
 };
 use berd_call::realtime_audio_delivery::RealtimeAudioDelivery;
 use berd_call::realtime_host_lifecycle::RealtimeSessionLossAction;
@@ -192,6 +192,9 @@ struct SessionConfig {
     /// In Expert-Spokesperson mode, speak the Expert's replies with `tts`
     /// rather than having the Spokesperson say them.
     expert_tts: bool,
+    /// The Spokesperson's own voice and speed when replies have theirs.
+    spokesperson_voice: Option<String>,
+    spokesperson_rate: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -862,6 +865,14 @@ fn parse_saved_start_args_at(args: &[String], path: PathBuf) -> Result<StartOpti
             .flat_map(|pair| pair.iter().cloned())
             .collect();
     }
+    // Calls whose replies don't have their own voice keep the Spokesperson's for later.
+    let spokesperson = saved.arguments.clone();
+    if !args
+        .windows(2)
+        .any(|pair| pair[0] == "--expert-voice" && pair[1] == "tts")
+    {
+        saved.arguments = saved_settings::without_spokesperson(&saved.arguments);
+    }
     let mut merged = args[..2].to_vec();
     merged.extend(saved_settings::merge_arguments(
         &saved.arguments,
@@ -897,7 +908,10 @@ fn parse_saved_start_args_at(args: &[String], path: PathBuf) -> Result<StartOpti
             }
         }
     }
-    saved.arguments = saved_settings::persistable_arguments(&options.session_arguments[1..]);
+    saved.arguments = saved_settings::merge_arguments(
+        &saved_settings::only_spokesperson(&spokesperson),
+        &saved_settings::persistable_arguments(&options.session_arguments[1..]),
+    );
     options.saved = Some((path, saved));
     Ok(options)
 }
@@ -1051,6 +1065,24 @@ fn parse_host_settings_args(
                     .clone(),
                 language: None,
             },
+            "--spokesperson-voice" => host_control::ControlRequest::Spokesperson {
+                voice: Some(
+                    args.get(index + 1)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or("--spokesperson-voice requires a name")?
+                        .clone(),
+                ),
+                rate: None,
+            },
+            "--spokesperson-rate" => host_control::ControlRequest::Spokesperson {
+                voice: None,
+                rate: Some(
+                    args.get(index + 1)
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|rate| rate.is_finite() && *rate > 0.0)
+                        .ok_or("--spokesperson-rate requires a positive number")?,
+                ),
+            },
             "--tts" => {
                 let value = args
                     .get(index + 1)
@@ -1082,7 +1114,7 @@ fn parse_host_settings_args(
 }
 
 const SETTINGS_CHOICE_ERROR: &str =
-    "provide exactly one of --non-blocking, --rate, --voice, --tts, --input-during-tts, --muted, or --restart";
+    "provide exactly one of --non-blocking, --rate, --voice, --spokesperson-voice, --spokesperson-rate, --tts, --input-during-tts, --muted, or --restart";
 
 fn parse_bool_setting(flag: &str, value: Option<&String>) -> Result<bool, String> {
     match value.map(String::as_str) {
@@ -2240,6 +2272,20 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     &mut writer,
                 )?;
             }
+            Input::Request(SessionRequest::SetSpokespersonSettings { id, .. }) => {
+                write_message(
+                    &mut writer,
+                    &SessionMessage::TtsSettingsResult {
+                        id,
+                        outcome: TtsSettingsOutcome::Rejected,
+                        snapshot: tts_slot
+                            .as_ref()
+                            .expect("hello initialized TTS")
+                            .snapshot()?,
+                        message: Some("a conventional call has no Spokesperson".into()),
+                    },
+                )?;
+            }
             Input::Request(SessionRequest::SetTtsSettings {
                 id,
                 expected_revision,
@@ -3140,17 +3186,16 @@ fn apply_spokesperson_startup_settings(
     session: &SessionConfig,
     spokesperson: &mut OpenAiSpokespersonConfig,
 ) -> Result<(), String> {
+    // Replies with their own voice leave the Spokesperson's speed to it.
     let rate = match &session.tts {
+        _ if session.expert_tts => session.spokesperson_rate.unwrap_or(spokesperson.speed()),
         TtsBackendConfig::OpenAi { rate }
         | TtsBackendConfig::Siri { rate, .. }
         | TtsBackendConfig::Pocket { rate, .. } => *rate,
     };
-    // A rate for the Expert's own voice need not suit the Spokesperson's.
-    let rate = if session.expert_tts {
-        rate.clamp(0.25, 1.5)
-    } else {
-        rate
-    };
+    if let Some(voice) = &session.spokesperson_voice {
+        spokesperson.session.voice = Some(voice.clone());
+    }
     if !(0.25..=1.5).contains(&rate) {
         return Err("Expert-Spokesperson rate must be between 0.25 and 1.5".into());
     }
@@ -4276,10 +4321,7 @@ fn run_expert_spokesperson_session(
                         None => tts.clone(),
                     },
                     input_during_tts: input_policy.snapshot()?,
-                    spokesperson: Some(SpokespersonVoiceSnapshot {
-                        model: spokesperson_config.model().into(),
-                        voice: spokesperson_config.voice().into(),
-                    }),
+                    spokesperson: reply_tts.is_some().then(|| tts.clone()),
                 };
                 let (created, events) =
                     OpenAiSpokespersonRuntime::spawn_observed(spokesperson_config.clone())?;
@@ -4814,11 +4856,18 @@ fn run_expert_spokesperson_session(
                     });
                 }
             }
-            Input::Request(SessionRequest::SetTtsSettings {
-                id,
-                expected_revision,
-                settings,
-            }) => {
+            Input::Request(
+                SessionRequest::SetTtsSettings {
+                    id,
+                    expected_revision,
+                    settings,
+                }
+                | SessionRequest::SetSpokespersonSettings {
+                    id,
+                    expected_revision,
+                    settings,
+                },
+            ) => {
                 let request = PendingSpokespersonSettingsUpdate {
                     id,
                     base_revision: expected_revision,
@@ -5739,6 +5788,8 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut mode = SessionMode::Conventional;
     let mut endpoints = SessionEndpointOverrides::default();
     let mut expert_tts = false;
+    let mut spokesperson_voice = None;
+    let mut spokesperson_rate = None;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -5781,6 +5832,14 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     _ => return Err("--expert-voice must be tts or spokesperson".into()),
                 }
             }
+            "--spokesperson-voice" => spokesperson_voice = Some(value.clone()),
+            "--spokesperson-rate" => {
+                spokesperson_rate = Some(
+                    value
+                        .parse::<f32>()
+                        .map_err(|_| "--spokesperson-rate must be a number".to_string())?,
+                )
+            }
             "--pcm-output-fd" => {}
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
@@ -5793,6 +5852,20 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     }
     if expert_tts && mode != SessionMode::ExpertSpokesperson {
         return Err("--expert-voice requires --mode expert-spokesperson".into());
+    }
+    if (spokesperson_voice.is_some() || spokesperson_rate.is_some()) && !expert_tts {
+        return Err(
+            "--spokesperson-voice and --spokesperson-rate require --expert-voice tts".into(),
+        );
+    }
+    if let Some(voice) = &spokesperson_voice {
+        if !berd_call::openai_realtime_protocol::OPENAI_REALTIME_VOICE_IDS.contains(&voice.as_str())
+        {
+            return Err(format!("OpenAI has no realtime voice named {voice}").into());
+        }
+    }
+    if spokesperson_rate.is_some_and(|rate| !(0.25..=1.5).contains(&rate)) {
+        return Err("--spokesperson-rate must be between 0.25 and 1.5".into());
     }
     if mode == SessionMode::ExpertSpokesperson
         && (endpoints.stt.is_some() || endpoints.tts.is_some() && !expert_tts)
@@ -5811,6 +5884,8 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         mode,
         endpoints,
         expert_tts,
+        spokesperson_voice,
+        spokesperson_rate,
     })
 }
 
@@ -7700,6 +7775,7 @@ fn validate_request(request: SessionRequest) -> Result<SessionRequest, String> {
         | SessionRequest::SetInputMuted { id, .. }
         | SessionRequest::SetConversationStatus { id, .. }
         | SessionRequest::SetTtsSettings { id, .. }
+        | SessionRequest::SetSpokespersonSettings { id, .. }
         | SessionRequest::SetInputDuringTts { id, .. }
         | SessionRequest::ResetInput { id }
         | SessionRequest::PrepareSpeak { id, .. }
@@ -7768,6 +7844,10 @@ fn validate_request(request: SessionRequest) -> Result<SessionRequest, String> {
             return Err("speech id must be positive".into())
         }
         SessionRequest::SetTtsSettings {
+            expected_revision: 0,
+            ..
+        }
+        | SessionRequest::SetSpokespersonSettings {
             expected_revision: 0,
             ..
         } => return Err("expected TTS revision must be positive".into()),
@@ -10047,6 +10127,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
 
@@ -10058,6 +10140,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
     }
@@ -10135,6 +10219,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -10191,6 +10277,8 @@ mod tests {
             mode: SessionMode::ExpertSpokesperson,
             endpoints: SessionEndpointOverrides::default(),
             expert_tts: false,
+            spokesperson_voice: None,
+            spokesperson_rate: None,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -10256,7 +10344,35 @@ mod tests {
             semantic_transcript: Vec::new(),
         };
         apply_spokesperson_startup_settings(&own, &mut realtime).unwrap();
-        assert_eq!(realtime.speed(), 1.5);
+        // The replies' rate is theirs, not the Spokesperson's.
+        assert_eq!(realtime.speed(), 1.0);
+        let chosen = expert(&[
+            "--tts-backend",
+            "openai",
+            "--expert-voice",
+            "tts",
+            "--spokesperson-voice",
+            "cedar",
+            "--spokesperson-rate",
+            "1.25",
+        ])
+        .unwrap();
+        apply_spokesperson_startup_settings(&chosen, &mut realtime).unwrap();
+        assert_eq!((realtime.voice(), realtime.speed()), ("cedar", 1.25));
+        for (extra, error) in [
+            (&["--spokesperson-voice", "cedar"][..], "--expert-voice tts"),
+            (
+                &["--expert-voice", "tts", "--spokesperson-voice", "nobody"],
+                "no realtime voice named nobody",
+            ),
+            (
+                &["--expert-voice", "tts", "--spokesperson-rate", "2"],
+                "between 0.25 and 1.5",
+            ),
+        ] {
+            let all = [&["--tts-backend", "openai"][..], extra].concat();
+            assert!(expert(&all).unwrap_err().contains(error), "{extra:?}");
+        }
         let read_aloud = expert(&["--tts-backend", "openai", "--rate", "2.0"]).unwrap();
         assert!(apply_spokesperson_startup_settings(&read_aloud, &mut realtime).is_err());
         assert!(expert(&["--expert-voice", "loud"])
@@ -10385,6 +10501,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -10447,6 +10565,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -10892,6 +11012,8 @@ mod tests {
                 mode: SessionMode::Conventional,
                 endpoints: SessionEndpointOverrides::default(),
                 expert_tts: false,
+                spokesperson_voice: None,
+                spokesperson_rate: None,
             }
         );
     }
@@ -11950,6 +12072,23 @@ mod tests {
     }
 
     #[test]
+    fn spokesperson_settings_name_its_voice_or_rate() {
+        let parse = |flag: &str, value: &str| {
+            parse_host_settings_args(&args(&["berd-call", "settings", flag, value]))
+                .map(|(_, request)| request)
+        };
+        assert!(matches!(
+            parse("--spokesperson-voice", "cedar").unwrap(),
+            host_control::ControlRequest::Spokesperson { voice: Some(voice), rate: None } if voice == "cedar"
+        ));
+        assert!(matches!(
+            parse("--spokesperson-rate", "1.25").unwrap(),
+            host_control::ControlRequest::Spokesperson { voice: None, rate: Some(rate) } if rate == 1.25
+        ));
+        assert!(parse("--spokesperson-rate", "fast").is_err());
+    }
+
+    #[test]
     fn settings_rate_changes_only_the_speech_rate() {
         let (_, request) =
             parse_host_settings_args(&args(&["berd-call", "settings", "--rate", "1.5"])).unwrap();
@@ -11957,6 +12096,51 @@ mod tests {
         assert!(
             parse_host_settings_args(&args(&["berd-call", "settings", "--rate", "fast"])).is_err()
         );
+    }
+
+    #[test]
+    fn saved_spokesperson_voice_waits_for_calls_whose_replies_have_their_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let chosen = args(&[
+            "--spokesperson-voice",
+            "cedar",
+            "--spokesperson-rate",
+            "1.25",
+        ]);
+        saved_settings::save(
+            &path,
+            &saved_settings::SavedSettings {
+                arguments: [
+                    args(&["--voice", "Aaron", "--language", "en-US"]),
+                    chosen.clone(),
+                ]
+                .concat(),
+                ..saved_settings::SavedSettings::default()
+            },
+        )
+        .unwrap();
+        let start = |extra: &[&str]| {
+            parse_saved_start_args_at(
+                &args(&[&["berd-call", "start"], extra].concat()),
+                path.clone(),
+            )
+            .unwrap()
+        };
+        let conventional = start(&[]);
+        assert!(!conventional
+            .session_arguments
+            .iter()
+            .any(|flag| flag.starts_with("--spokesperson")));
+        assert!(conventional.saved.unwrap().1.arguments.starts_with(&chosen));
+        let own = start(&["--mode", "expert-spokesperson", "--expert-voice", "tts"]);
+        assert!(own
+            .session_arguments
+            .ends_with(&args(&["--expert-voice", "tts"])));
+        assert!(own
+            .session_arguments
+            .windows(2)
+            .any(|pair| pair == ["--spokesperson-voice", "cedar"]));
     }
 
     #[test]

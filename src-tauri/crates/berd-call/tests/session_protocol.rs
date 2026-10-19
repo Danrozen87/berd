@@ -2720,6 +2720,73 @@ fn spawn_speech_server() -> (String, mpsc::Receiver<Value>) {
 }
 
 #[test]
+fn expert_voice_keeps_a_separate_spokesperson_voice_control() {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (old_stream, _) = listener.accept().await.unwrap();
+                let mut old = accept_async(old_stream).await.unwrap();
+                let initial = receive_realtime_json(&mut old).await;
+                assert_eq!(initial["session"]["audio"]["output"]["voice"], "cedar");
+                assert_eq!(initial["session"]["audio"]["output"]["speed"], 1.25);
+                acknowledge_realtime_session(&mut old, &initial).await;
+
+                let (candidate_stream, _) = listener.accept().await.unwrap();
+                let mut candidate = accept_async(candidate_stream).await.unwrap();
+                let replacement = receive_realtime_json(&mut candidate).await;
+                assert_eq!(
+                    replacement["session"]["audio"]["output"]["voice"],
+                    "new-voice"
+                );
+                assert_eq!(replacement["session"]["audio"]["output"]["speed"], 1.25);
+                acknowledge_realtime_session(&mut candidate, &replacement).await;
+                while receive_realtime_json(&mut old).await["type"] != "input_audio_buffer.clear" {}
+                send_realtime_json(&mut old, json!({"type":"input_audio_buffer.cleared"})).await;
+                while candidate.next().await.is_some() {}
+            });
+    });
+    let endpoint = endpoint_rx.recv().unwrap();
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint,
+        &[
+            "--expert-voice",
+            "tts",
+            "--tts-url",
+            &speech_url,
+            "--spokesperson-voice",
+            "cedar",
+            "--spokesperson-rate",
+            "1.25",
+        ],
+    );
+    assert_eq!(session.ready["session"]["tts"]["backend"], "openai");
+    assert_eq!(session.ready["session"]["spokesperson"]["voice"], "cedar");
+    session.send(json!({
+        "type":"set_spokesperson_settings",
+        "id":2,
+        "expected_revision":1,
+        "settings":{"backend":"openai","model":"test-model","voice":"new-voice","rate":1.25}
+    }));
+    let applied = session.recv(Duration::from_secs(3));
+    assert_eq!(applied["type"], "tts_settings_result", "{applied}");
+    assert_eq!(applied["id"], 2);
+    assert_eq!(applied["outcome"], "applied", "{applied}");
+    assert_eq!(applied["snapshot"]["revision"], 2);
+    assert_eq!(applied["snapshot"]["voice"], "new-voice");
+    session.shutdown();
+    server.join().unwrap();
+}
+
+#[test]
 fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard() {
     let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
@@ -2782,7 +2849,7 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
     assert_eq!(session.ready["session"]["tts"]["backend"], "openai");
     assert_eq!(
         session.ready["session"]["spokesperson"],
-        json!({"model":"test-model","voice":"old-voice"})
+        json!({"revision":1,"backend":"openai","model":"test-model","voice":"old-voice","rate":1.0})
     );
     assert_eq!(session.recv(Duration::from_secs(2))["origin"], "handoff");
     assert_eq!(

@@ -99,6 +99,8 @@ fn validate_arguments(arguments: &[String]) -> Result<(), String> {
                     | "--rate"
                     | "--model-dir"
                     | "--stt-model-dir"
+                    | "--spokesperson-voice"
+                    | "--spokesperson-rate"
             )
         })
     {
@@ -134,6 +136,32 @@ pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
                 "--realtime-url" | "--stt-url" | "--tts-url" | "--expert-voice"
             )
         })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+fn spokesperson_flag(pair: &[String]) -> bool {
+    matches!(
+        pair[0].as_str(),
+        "--spokesperson-voice" | "--spokesperson-rate"
+    )
+}
+
+/// Leaves out the Spokesperson's own voice, which only calls whose replies have theirs take.
+pub(crate) fn without_spokesperson(arguments: &[String]) -> Vec<String> {
+    arguments
+        .chunks_exact(2)
+        .filter(|pair| !spokesperson_flag(pair))
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn only_spokesperson(arguments: &[String]) -> Vec<String> {
+    arguments
+        .chunks_exact(2)
+        .filter(|pair| spokesperson_flag(pair))
         .flatten()
         .cloned()
         .collect()

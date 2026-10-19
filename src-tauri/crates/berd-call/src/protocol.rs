@@ -32,6 +32,12 @@ pub enum SessionRequest {
         expected_revision: u64,
         settings: TtsSettings,
     },
+    /// Changes the Spokesperson's voice in a session whose replies have their own.
+    SetSpokespersonSettings {
+        id: u64,
+        expected_revision: u64,
+        settings: TtsSettings,
+    },
     SetInputDuringTts {
         id: u64,
         expected_revision: u64,
@@ -161,15 +167,9 @@ pub struct VoiceSessionSnapshot {
     /// Spokesperson's own voice when it reads them.
     pub tts: TtsConfigurationSnapshot,
     pub input_during_tts: InputDuringTtsSnapshot,
-    /// The Spokesperson's voice, in Expert-Spokesperson sessions.
+    /// The Spokesperson's voice, when replies have their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spokesperson: Option<SpokespersonVoiceSnapshot>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct SpokespersonVoiceSnapshot {
-    pub model: String,
-    pub voice: String,
+    pub spokesperson: Option<TtsConfigurationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -413,14 +413,18 @@ mod tests {
                         revision: 1,
                         policy: InputDuringTtsPolicy::AllowBargeIn,
                     },
-                    spokesperson: Some(SpokespersonVoiceSnapshot {
-                        model: "gpt-realtime".into(),
-                        voice: "cedar".into(),
+                    spokesperson: Some(TtsConfigurationSnapshot {
+                        revision: 1,
+                        settings: TtsSettings::OpenAi {
+                            model: "gpt-realtime".into(),
+                            voice: "cedar".into(),
+                            rate: 1.0,
+                        },
                     }),
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"model":"gpt-realtime","voice":"cedar"}}}"#
+            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(

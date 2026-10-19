@@ -72,10 +72,12 @@ OpenAI snapshots contain `model`, `voice`, and `rate`; Siri contains `voice`,
 and `rate`. Credentials, endpoints, and bundle paths never appear on stdout.
 Detailed backend errors are diagnostics on stderr only; protocol rejection and
 fatal messages are sanitized at the stdout boundary.
-In Expert-Spokesperson sessions, `session.spokesperson` holds the realtime
-`model` and `voice`. `session.tts` describes the voice that speaks the Expert's
-replies: the configured TTS backend with `--expert-voice tts`, otherwise the
-Spokesperson's own voice, and `set_tts_settings` changes that voice. A reply in
+`session.tts` describes the voice that speaks replies, and `set_tts_settings`
+changes it: in Expert-Spokesperson sessions, that is the configured TTS backend
+with `--expert-voice tts` and otherwise the Spokesperson's own voice. With
+`--expert-voice tts`, `session.spokesperson` is the Spokesperson's own OpenAI
+snapshot, with its own revision, and `set_spokesperson_settings` changes it the
+way `set_tts_settings` changes the Spokesperson's voice in other sessions. A reply in
 the Expert's own voice reports the same `admitted`, `speech_completed`,
 `speech_interrupted`, and `speech_failed` lifecycle as a conventional reply.
 `session.input_during_tts` is the authoritative effective assistant-input
@@ -201,6 +203,7 @@ it never admits a replacement while old host audio may still be active.
 {"type":"set_input_muted","id":u64,"active":bool}
 {"type":"set_conversation_status","id":u64,"status":"working"|"waiting","settings":StatusSoundSettings}
 {"type":"set_tts_settings","id":u64,"expected_revision":u64,"settings":TtsSettings}
+{"type":"set_spokesperson_settings","id":u64,"expected_revision":u64,"settings":TtsSettings}
 {"type":"set_input_during_tts","id":u64,"expected_revision":u64,"policy":"allow_barge_in"|"suppress_input"}
 {"type":"reset_input","id":u64}
 {"type":"prepare_speak","id":u64,"acknowledgement":u64|null,"text":string}

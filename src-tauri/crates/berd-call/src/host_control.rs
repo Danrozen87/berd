@@ -34,6 +34,7 @@ pub(crate) trait HostControl: Send + Sync + 'static {
     fn set_tts(&self, settings: berd_call::TtsSettings) -> Result<Value, String>;
     fn set_rate(&self, rate: f32) -> Result<Value, String>;
     fn set_voice(&self, voice: String, language: Option<String>) -> Result<Value, String>;
+    fn set_spokesperson(&self, voice: Option<String>, rate: Option<f32>) -> Result<Value, String>;
     fn set_input_during_tts(
         &self,
         policy: berd_call::input::InputDuringTtsPolicy,
@@ -129,6 +130,11 @@ pub(crate) enum ControlRequest {
         voice: String,
         language: Option<String>,
     },
+    /// The Spokesperson's voice or speed, when replies have their own.
+    Spokesperson {
+        voice: Option<String>,
+        rate: Option<f32>,
+    },
     InputDuringTts {
         policy: berd_call::input::InputDuringTtsPolicy,
     },
@@ -187,6 +193,7 @@ pub(crate) fn begin_request(port: u16, request: ControlRequest) -> Result<Pendin
             | ControlRequest::TtsSettings { .. }
             | ControlRequest::Rate { .. }
             | ControlRequest::Voice { .. }
+            | ControlRequest::Spokesperson { .. }
             | ControlRequest::Restart { .. }
     ) {
         None
@@ -232,6 +239,9 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                 ControlRequest::TtsSettings { settings } => control.set_tts(settings),
                 ControlRequest::Rate { rate } => control.set_rate(rate),
                 ControlRequest::Voice { voice, language } => control.set_voice(voice, language),
+                ControlRequest::Spokesperson { voice, rate } => {
+                    control.set_spokesperson(voice, rate)
+                }
                 ControlRequest::NonBlocking { enabled } => control.set_non_blocking(enabled),
                 ControlRequest::InputDuringTts { policy } => control.set_input_during_tts(policy),
                 ControlRequest::Muted { muted } => control.set_muted(muted),
@@ -348,6 +358,13 @@ mod tests {
         }
         fn set_voice(&self, voice: String, language: Option<String>) -> Result<Value, String> {
             Ok(json!({"voice": voice, "language": language}))
+        }
+        fn set_spokesperson(
+            &self,
+            voice: Option<String>,
+            rate: Option<f32>,
+        ) -> Result<Value, String> {
+            Ok(json!({"spokesperson": {"voice": voice, "rate": rate}}))
         }
         fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
             Ok(json!({"nonBlocking": enabled}))

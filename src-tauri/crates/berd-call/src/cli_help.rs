@@ -71,12 +71,17 @@ Usage:
   berd-call settings [--port PORT] --non-blocking true|false
   berd-call settings [--port PORT] --rate FLOAT
   berd-call settings [--port PORT] --voice NAME [--language BCP47]
+  berd-call settings [--port PORT] --spokesperson-voice NAME
+  berd-call settings [--port PORT] --spokesperson-rate FLOAT
   berd-call settings [--port PORT] --tts JSON
   berd-call settings [--port PORT] --input-during-tts allow|suppress
   berd-call settings [--port PORT] --muted true|false
   berd-call settings [--port PORT] --restart [session options]
 
-The setting applies to subsequent speak calls. Non-blocking delivery requires
+The setting applies to subsequent speak calls. In a call started with
+--expert-voice tts, --voice and --rate change the agents' voice, and
+--spokesperson-voice and --spokesperson-rate change the Spokesperson's (an
+OpenAI realtime voice, 0.25 to 1.5). Non-blocking delivery requires
 a call started with --stream or --codex. Successful delivery produces no notification."#;
 
 const STATUS_HELP: &str = r#"Inspect the active local voice call.
@@ -114,6 +119,7 @@ Each form also accepts:
     [--rate FLOAT]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH]
     [--mode conventional|expert-spokesperson] [--expert-voice tts|spokesperson]
+    [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
 
 The host owns microphone capture, audio playback, transcript delivery, and
@@ -123,7 +129,8 @@ and default to OpenAI when no environment override is set.
 
 In expert-spokesperson mode, --expert-voice tts speaks the Expert's replies
 through the configured TTS backend, in its own voice beside the Spokesperson's,
-instead of having the Spokesperson read them aloud."#;
+instead of having the Spokesperson read them aloud. --spokesperson-voice and
+--spokesperson-rate then choose the Spokesperson's own voice and speed."#;
 
 const SYNTHESIZE_HELP: &str = r#"Render text through a configured TTS backend into a new WAV file.
 

@@ -508,6 +508,11 @@ enum ControlCommand {
         expected_revision: u64,
         response: SyncSender<Result<Value, String>>,
     },
+    SpokespersonSettings {
+        settings: berd_call::TtsSettings,
+        expected_revision: u64,
+        response: SyncSender<Result<Value, String>>,
+    },
     Speak {
         text: String,
         acknowledgement: Option<u64>,
@@ -644,6 +649,38 @@ impl HostControl for SessionControl {
         })
     }
 
+    fn set_spokesperson(&self, voice: Option<String>, rate: Option<f32>) -> Result<Value, String> {
+        let (mut settings, expected_revision) = {
+            let session = self
+                .ready
+                .session
+                .lock()
+                .map_err(|_| "session settings lock failed")?;
+            let spokesperson = session
+                .spokesperson
+                .as_ref()
+                .ok_or("this call has no separate Spokesperson voice; use --voice and --rate")?;
+            (spokesperson.settings.clone(), spokesperson.revision)
+        };
+        if let (
+            Some(voice),
+            berd_call::TtsSettings::OpenAi {
+                voice: selected, ..
+            },
+        ) = (voice, &mut settings)
+        {
+            *selected = voice;
+        }
+        if let Some(rate) = rate {
+            settings = settings.with_rate(rate);
+        }
+        self.request(|response| ControlCommand::SpokespersonSettings {
+            settings,
+            expected_revision,
+            response,
+        })
+    }
+
     fn set_input_during_tts(&self, policy: InputDuringTtsPolicy) -> Result<Value, String> {
         let expected_revision = self
             .ready
@@ -752,6 +789,7 @@ enum AudioCommand {
 enum SavedPreference {
     SessionStart,
     Tts,
+    Spokesperson,
     InputPolicy,
 }
 
@@ -767,6 +805,8 @@ struct SessionActor {
     next_id: u64,
     pending_speak: Option<PendingSpeak>,
     pending_settings: std::collections::HashMap<u64, SyncSender<Result<Value, String>>>,
+    // Settings requests answered with the Spokesperson's voice rather than the call's.
+    spokesperson_settings: HashSet<u64>,
     waiting_speaks: VecDeque<ControlCommand>,
     session: Arc<Mutex<VoiceSessionSnapshot>>,
     transcript: Arc<Transcript>,
@@ -831,6 +871,7 @@ impl SessionActor {
             next_id: 2,
             pending_speak: None,
             pending_settings: std::collections::HashMap::new(),
+            spokesperson_settings: HashSet::new(),
             waiting_speaks: VecDeque::new(),
             session,
             transcript,
@@ -1030,6 +1071,23 @@ impl SessionActor {
                 )?;
                 self.pending_settings.insert(id, response);
             }
+            ControlCommand::SpokespersonSettings {
+                settings,
+                expected_revision,
+                response,
+            } => {
+                let id = self.next_id();
+                send_request(
+                    &self.writer,
+                    &SessionRequest::SetSpokespersonSettings {
+                        id,
+                        expected_revision,
+                        settings,
+                    },
+                )?;
+                self.spokesperson_settings.insert(id);
+                self.pending_settings.insert(id, response);
+            }
             ControlCommand::Speak {
                 text,
                 acknowledgement,
@@ -1151,13 +1209,23 @@ impl SessionActor {
                 snapshot,
                 message,
             } => {
+                let spokesperson = self.spokesperson_settings.remove(&id);
                 if let Ok(mut session) = self.session.lock() {
-                    if snapshot.revision >= session.tts.revision {
-                        session.tts = snapshot.clone();
+                    let voice = if spokesperson {
+                        session.spokesperson.as_mut()
+                    } else {
+                        Some(&mut session.tts)
+                    };
+                    if let Some(voice) = voice.filter(|voice| snapshot.revision >= voice.revision) {
+                        *voice = snapshot.clone();
                     }
                 }
                 if outcome == berd_call::protocol::TtsSettingsOutcome::Applied {
-                    self.persist_settings(SavedPreference::Tts);
+                    self.persist_settings(if spokesperson {
+                        SavedPreference::Spokesperson
+                    } else {
+                        SavedPreference::Tts
+                    });
                 }
                 if let Some(response) = self.pending_settings.remove(&id) {
                     let _ = response.send(Ok(
@@ -1388,6 +1456,26 @@ impl SessionActor {
         let Ok(session) = self.session.lock() else {
             return;
         };
+        if let SavedPreference::Spokesperson = changed {
+            let Some(spokesperson) = &session.spokesperson else {
+                return;
+            };
+            let replacement = vec![
+                "--spokesperson-voice".to_string(),
+                spokesperson.settings.voice().to_string(),
+                "--spokesperson-rate".to_string(),
+                spokesperson.settings.rate().to_string(),
+            ];
+            saved.arguments =
+                crate::saved_settings::merge_arguments(&saved.arguments, &replacement);
+            if let Err(error) = crate::saved_settings::update(path, |latest| {
+                latest.arguments =
+                    crate::saved_settings::merge_arguments(&latest.arguments, &replacement)
+            }) {
+                eprintln!("berd-call: live settings applied but could not be saved: {error}");
+            }
+            return;
+        }
         saved.tts = Some(session.tts.settings.clone());
         let settings = &session.tts.settings;
         let pocket_model_dir = saved
@@ -1435,6 +1523,7 @@ impl SessionActor {
                 latest.tts = saved.tts.clone();
             }
             SavedPreference::InputPolicy => latest.input_policy = saved.input_policy,
+            SavedPreference::Spokesperson => unreachable!("saved above"),
         }) {
             eprintln!("berd-call: live settings applied but could not be saved: {error}");
         }
@@ -3683,6 +3772,79 @@ mod tests {
         drop(second);
         first_child.wait().unwrap();
         second_child.wait().unwrap();
+    }
+
+    #[test]
+    fn spokesperson_results_change_and_save_only_its_voice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events, receiver) = mpsc::sync_channel(1);
+        let (_commands, commands) = mpsc::sync_channel(1);
+        let (audio, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, receiver, commands, audio);
+        let openai = |voice: &str, revision| berd_call::TtsConfigurationSnapshot {
+            revision,
+            settings: berd_call::TtsSettings::OpenAi {
+                model: "gpt-realtime".into(),
+                voice: voice.into(),
+                rate: 1.25,
+            },
+        };
+        actor.session.lock().unwrap().spokesperson = Some(openai("marin", 1));
+        actor.saved = Some((
+            path.clone(),
+            crate::saved_settings::SavedSettings {
+                arguments: ["--voice", "Aaron", "--language", "en-US"]
+                    .map(str::to_string)
+                    .to_vec(),
+                ..crate::saved_settings::SavedSettings::default()
+            },
+        ));
+        let (response, result) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::SpokespersonSettings {
+                settings: openai("cedar", 1).settings,
+                expected_revision: 1,
+                response,
+            })
+            .unwrap();
+        let id = *actor.spokesperson_settings.iter().next().unwrap();
+        actor
+            .handle_event(SessionMessage::TtsSettingsResult {
+                id,
+                outcome: berd_call::protocol::TtsSettingsOutcome::Applied,
+                snapshot: openai("cedar", 2),
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(result.recv().unwrap().unwrap()["outcome"], "applied");
+        let session = actor.session.lock().unwrap().clone();
+        assert_eq!(session.spokesperson, Some(openai("cedar", 2)));
+        assert_eq!(session.tts, test_snapshot().tts);
+        let saved = crate::saved_settings::load(&path).unwrap();
+        assert_eq!(saved.tts, None);
+        assert_eq!(
+            saved.arguments,
+            [
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+                "--spokesperson-voice",
+                "cedar",
+                "--spokesperson-rate",
+                "1.25"
+            ]
+            .map(str::to_string)
+        );
+        drop(actor);
+        child.wait().unwrap();
     }
 
     #[test]
