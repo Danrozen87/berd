@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -145,7 +145,7 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
 /// Where live transcript records go: nowhere, stdout TSV, or a Codex task.
 pub(crate) enum Transcript {
     Silent,
-    Stdout,
+    Stdout { live: bool },
     Codex(CodexRelay),
 }
 
@@ -153,7 +153,7 @@ impl Transcript {
     fn for_options(options: &StartOptions) -> Result<Self, String> {
         Ok(match options.transcript {
             TranscriptDestination::None => Self::Silent,
-            TranscriptDestination::Stdout => Self::Stdout,
+            TranscriptDestination::Stdout { live } => Self::Stdout { live },
             TranscriptDestination::Codex => {
                 let target = CodexTarget::from_environment()?;
                 let executable = std::env::current_exe().map_err(|error| {
@@ -174,7 +174,7 @@ impl Transcript {
 
     fn start(&self) -> Result<(), String> {
         match self {
-            Self::Stdout => print_flushed("cursor\trole\ttext"),
+            Self::Stdout { .. } => print_flushed("cursor\trole\ttext"),
             Self::Codex(_) => {
                 println!("Berd Call is delivering transcripts to this Codex task.");
                 Ok(())
@@ -192,7 +192,7 @@ impl Transcript {
     ) -> Result<(), String> {
         match self {
             Self::Silent => Ok(()),
-            Self::Stdout => print_flushed(&format!(
+            Self::Stdout { .. } => print_flushed(&format!(
                 "{}\t{role}\t{}",
                 cursor.unwrap_or_default(),
                 stream_text(text)
@@ -213,7 +213,7 @@ impl Transcript {
     fn finish(&self, text: &str) {
         match self {
             Self::Silent => {}
-            Self::Stdout => {
+            Self::Stdout { .. } => {
                 let _ = self.record(None, "lifecycle", None, text);
             }
             Self::Codex(relay) => relay.finish(Some(CodexRecord {
@@ -771,6 +771,10 @@ struct SessionActor {
     session: Arc<Mutex<VoiceSessionSnapshot>>,
     transcript: Arc<Transcript>,
     expert_spokesperson: bool,
+    // User rows already streamed when transcribed, left out of the Expert batch.
+    transcribed: HashSet<u64>,
+    // Rows a handoffs stream or Codex task gets only when the Spokesperson hands off.
+    held: Vec<RealtimeExpertDeliveryEvent>,
     stopping: bool,
     restart: Option<PendingRestart>,
     muted: Arc<AtomicBool>,
@@ -831,6 +835,8 @@ impl SessionActor {
             session,
             transcript,
             expert_spokesperson,
+            transcribed: HashSet::new(),
+            held: Vec::new(),
             stopping: false,
             restart: None,
             muted: Arc::new(AtomicBool::new(false)),
@@ -1191,8 +1197,27 @@ impl SessionActor {
                 text,
                 origin,
             } if !self.expert_spokesperson => self.stream_live_event(token, origin, &text)?,
-            SessionMessage::ExpertDelivery { events, .. } if self.expert_spokesperson => {
-                self.stream_expert_delivery(&events)?
+            // Only a live stream shows the conversation as it happens.
+            SessionMessage::UserTranscribed { token, text }
+                if self.expert_spokesperson
+                    && matches!(*self.transcript, Transcript::Stdout { live: true }) =>
+            {
+                self.transcript.record(Some(token), "user", None, &text)?;
+                self.transcribed.insert(token);
+            }
+            SessionMessage::SpokespersonGenerated { text }
+                if self.expert_spokesperson
+                    && matches!(*self.transcript, Transcript::Stdout { live: true }) =>
+            {
+                self.transcript
+                    .record(None, "spokesperson_generated", None, &text)?
+            }
+            SessionMessage::ExpertDelivery {
+                events,
+                handoff_ids,
+                ..
+            } if self.expert_spokesperson => {
+                self.stream_expert_delivery(events, !handoff_ids.is_empty())?
             }
             SessionMessage::Pending { id, utterances } if self.pending_prepare_id() == Some(id) => {
                 self.respond_speak(Ok(json!({"spoke":false,"utterances":utterances})));
@@ -1306,8 +1331,21 @@ impl SessionActor {
         self.transcript.record(Some(token), role, None, text)
     }
 
-    fn stream_expert_delivery(&self, events: &[RealtimeExpertDeliveryEvent]) -> Result<(), String> {
-        for event in events {
+    fn stream_expert_delivery(
+        &mut self,
+        events: Vec<RealtimeExpertDeliveryEvent>,
+        handoff: bool,
+    ) -> Result<(), String> {
+        self.held.extend(events);
+        if !handoff
+            && matches!(
+                *self.transcript,
+                Transcript::Stdout { live: false } | Transcript::Codex(_)
+            )
+        {
+            return Ok(());
+        }
+        for event in unstreamed(&std::mem::take(&mut self.held), &mut self.transcribed) {
             self.transcript.record(
                 Some(event.cursor),
                 expert_delivery_role_name(event.role),
@@ -2537,6 +2575,16 @@ fn not_admitted_reason_name(reason: NotAdmittedReason) -> &'static str {
     }
 }
 
+/// The batch's events not already streamed as they happened.
+fn unstreamed<'a>(
+    events: &'a [RealtimeExpertDeliveryEvent],
+    transcribed: &'a mut HashSet<u64>,
+) -> impl Iterator<Item = &'a RealtimeExpertDeliveryEvent> {
+    events.iter().filter(move |event| {
+        !(event.role == RealtimeExpertDeliveryRole::User && transcribed.remove(&event.cursor))
+    })
+}
+
 fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
     match role {
         RealtimeExpertDeliveryRole::User => "user",
@@ -2550,6 +2598,64 @@ fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_batches_leave_out_user_rows_already_streamed() {
+        let event = |cursor, role| RealtimeExpertDeliveryEvent {
+            cursor,
+            role,
+            text: format!("event {cursor}"),
+            handoff_id: None,
+        };
+        let events = [
+            event(1, RealtimeExpertDeliveryRole::User),
+            event(2, RealtimeExpertDeliveryRole::User),
+            event(3, RealtimeExpertDeliveryRole::Spokesperson),
+        ];
+        let mut transcribed = HashSet::from([1, 3]);
+        let cursors: Vec<_> = unstreamed(&events, &mut transcribed)
+            .map(|event| event.cursor)
+            .collect();
+        assert_eq!(cursors, [2, 3]);
+        assert_eq!(transcribed, HashSet::from([3]));
+    }
+
+    #[test]
+    fn handoffs_stream_holds_rows_until_a_handoff() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_event_tx, events) = mpsc::sync_channel(1);
+        let (_command_tx, commands) = mpsc::sync_channel(1);
+        let (audio, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio);
+        let event = |cursor, role| RealtimeExpertDeliveryEvent {
+            cursor,
+            role,
+            text: format!("event {cursor}"),
+            handoff_id: None,
+        };
+        actor
+            .stream_expert_delivery(
+                vec![
+                    event(1, RealtimeExpertDeliveryRole::User),
+                    event(2, RealtimeExpertDeliveryRole::Spokesperson),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(actor.held.len(), 2);
+        actor
+            .stream_expert_delivery(vec![event(3, RealtimeExpertDeliveryRole::Handoff)], true)
+            .unwrap();
+        assert!(actor.held.is_empty());
+        drop(actor);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn microphone_teardown_reports_a_blocked_forwarder() {
@@ -3205,7 +3311,7 @@ mod tests {
             commands,
             audio_commands,
             session,
-            Arc::new(Transcript::Stdout),
+            Arc::new(Transcript::Stdout { live: false }),
             false,
         )
     }

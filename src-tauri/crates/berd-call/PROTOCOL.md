@@ -281,6 +281,21 @@ Expert-Spokesperson sessions use `origin` to distinguish user transcripts,
 Spokesperson transcripts, and handoffs. User finals interrupt reserved or playing
 assistant output only after storage and emission. Final text is at most 64 KiB.
 
+Expert-Spokesperson sessions also emit two previews for hosts that show the
+conversation as it happens:
+
+```text
+{"type":"user_transcribed","token":u64,"text":string}
+{"type":"spokesperson_generated","text":string}
+```
+
+`user_transcribed` follows a user final's `live_event` with its token and plain
+text. `spokesperson_generated` carries a reply's whole text once the provider
+finishes generating it, before playback, and only after no user speech is still
+being transcribed. A reply already spoken or cut off by then gets none. The
+Spokesperson transcript recorded after playback stays authoritative. Neither
+message changes Expert delivery.
+
 ## Confirmation and admission
 
 `acknowledgement` is a request-local causal cutoff. `null` uses the stored

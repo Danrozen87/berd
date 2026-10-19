@@ -732,7 +732,11 @@ fn request_bundled_app_update(app_path: &Path) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TranscriptDestination {
     None,
-    Stdout,
+    /// `live` streams an Expert-Spokesperson call as it happens; otherwise
+    /// its rows wait for the next handoff.
+    Stdout {
+        live: bool,
+    },
     Codex,
 }
 
@@ -777,12 +781,17 @@ fn parse_start_args(args: &[String]) -> Result<StartOptions, ParseFailure> {
                 if transcript != TranscriptDestination::None {
                     return Err("choose one of --stream or --codex for transcript delivery".into());
                 }
-                transcript = if flag == "--stream" {
-                    TranscriptDestination::Stdout
-                } else {
-                    TranscriptDestination::Codex
-                };
                 index += 1;
+                transcript = if flag == "--codex" {
+                    TranscriptDestination::Codex
+                } else {
+                    let mode = args.get(index).map(String::as_str);
+                    let live = mode == Some("live");
+                    if matches!(mode, Some("live" | "handoffs")) {
+                        index += 1;
+                    }
+                    TranscriptDestination::Stdout { live }
+                };
             }
             "--no-menu-bar" if menu_bar => {
                 menu_bar = false;
@@ -3153,6 +3162,8 @@ fn run_expert_spokesperson_session(
     let mut waiting_responses = VecDeque::<String>::new();
     let mut active: Option<LivePlayback> = None;
     let mut turn_gate = ExpertTurnGate::new(spokesperson_renew_after());
+    // Generated replies waiting to be shown until the words they answer are.
+    let mut generated = Vec::<String>::new();
     let mut session_tts: Option<berd_call::TtsConfigurationSnapshot> = None;
     let mut input_during_tts_slot: Option<InputDuringTtsSlot> = None;
     let mut input_muted = false;
@@ -3363,6 +3374,12 @@ fn run_expert_spokesperson_session(
                     }
                     SpokespersonEvent::UserTurnDiscarded { item_id } => {
                         turn_gate.discard_user_turn(&item_id);
+                        show_generated_replies(
+                            &mut generated,
+                            &responses,
+                            &turn_gate,
+                            &mut writer,
+                        )?;
                     }
                     SpokespersonEvent::UserFinal { item_id, text } => {
                         turn_gate.resolve_user_final(&item_id);
@@ -3372,7 +3389,20 @@ fn run_expert_spokesperson_session(
                             LiveSideEvent::UserTranscript { text: text.clone() },
                             &mut writer,
                         )?;
+                        write_message(
+                            &mut writer,
+                            &SessionMessage::UserTranscribed {
+                                token: emitted_live_token,
+                                text: text.clone(),
+                            },
+                        )?;
                         core.record_user_turn(text);
+                        show_generated_replies(
+                            &mut generated,
+                            &responses,
+                            &turn_gate,
+                            &mut writer,
+                        )?;
                     }
                     SpokespersonEvent::ResponseStarted { response_id } => {
                         turn_gate.response_started(&response_id, responses.len())?;
@@ -3431,7 +3461,19 @@ fn run_expert_spokesperson_session(
                                     response.playback_complete = true;
                                 }
                             }
+                            if status == SpokespersonResponseStatus::Completed
+                                && response.delivery.has_transcript()
+                                && !response.playback_complete
+                            {
+                                generated.push(response_id.clone());
+                            }
                         }
+                        show_generated_replies(
+                            &mut generated,
+                            &responses,
+                            &turn_gate,
+                            &mut writer,
+                        )?;
                         publish_live_response_if_complete(
                             &response_id,
                             &mut responses,
@@ -5145,6 +5187,34 @@ fn publish_live_response_if_complete(
         },
         writer,
     )?;
+    Ok(())
+}
+
+/// Shows each generated reply before it is spoken, once no user words are
+/// still being transcribed, so a live transcript reads in order. A reply
+/// already spoken or cut off is left to its authoritative transcript.
+fn show_generated_replies(
+    generated: &mut Vec<String>,
+    responses: &HashMap<String, LiveResponse>,
+    turn_gate: &ExpertTurnGate,
+    writer: &mut impl Write,
+) -> Result<(), String> {
+    if turn_gate.lifecycle.transcribing() {
+        return Ok(());
+    }
+    for response_id in generated.drain(..) {
+        if let Some(response) = responses
+            .get(&response_id)
+            .filter(|response| !response.playback_complete && !response.interrupted)
+        {
+            write_message(
+                writer,
+                &SessionMessage::SpokespersonGenerated {
+                    text: response.delivery.transcript(),
+                },
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -8061,6 +8131,40 @@ mod tests {
         assert_eq!(emitted.len(), 2);
         assert_eq!(emitted[0]["type"], "live_event");
         assert_eq!(emitted[1]["type"], "expert_delivery");
+    }
+
+    #[test]
+    fn generated_replies_wait_for_the_words_they_answer_and_are_shown_once() {
+        let reply = |text: &str| {
+            let mut response = LiveResponse::new(None, None);
+            response
+                .delivery
+                .replace_transcript("assistant", 0, 0, text.into())
+                .unwrap();
+            response
+        };
+        let mut spoken = reply("Already spoken.");
+        spoken.playback_complete = true;
+        let responses = HashMap::from([
+            ("response-a".into(), reply("Twelve.")),
+            ("response-b".into(), spoken),
+        ]);
+        let mut turn_gate = ExpertTurnGate::new(Duration::from_secs(60));
+        turn_gate.begin_user_speaking("user-1".into());
+        turn_gate.finish_user_speaking();
+        let mut generated = vec!["response-a".to_string(), "response-b".to_string()];
+        let mut output = Vec::new();
+
+        show_generated_replies(&mut generated, &responses, &turn_gate, &mut output).unwrap();
+        assert!(output.is_empty());
+
+        turn_gate.resolve_user_final("user-1");
+        show_generated_replies(&mut generated, &responses, &turn_gate, &mut output).unwrap();
+        show_generated_replies(&mut generated, &responses, &turn_gate, &mut output).unwrap();
+        let emitted = messages(&output);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["type"], "spokesperson_generated");
+        assert_eq!(emitted[0]["text"], "Twelve.");
     }
 
     #[test]
@@ -11355,7 +11459,10 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.port, 5300);
-        assert_eq!(parsed.transcript, TranscriptDestination::Stdout);
+        assert_eq!(
+            parsed.transcript,
+            TranscriptDestination::Stdout { live: false }
+        );
         assert!(!parsed.expert_spokesperson);
         assert_eq!(
             parsed.session_arguments,
@@ -11385,6 +11492,18 @@ mod tests {
         let parsed = start(&["--codex", "--non-blocking"]).unwrap();
         assert_eq!(parsed.transcript, TranscriptDestination::Codex);
         assert!(parsed.non_blocking);
+        for (flags, live) in [
+            (&["--stream"][..], false),
+            (&["--stream", "handoffs"], false),
+            (&["--stream", "live", "--non-blocking"], true),
+        ] {
+            let parsed = start(flags).unwrap();
+            assert_eq!(parsed.transcript, TranscriptDestination::Stdout { live });
+            assert_eq!(
+                parsed.session_arguments[1..],
+                ["--voice", "Aaron", "--language", "en-US"]
+            );
+        }
         assert!(start(&["--codex", "--stream"]).is_err());
         assert!(start(&["--codex", "--codex"]).is_err());
         assert!(start(&["--non-blocking"]).is_err());

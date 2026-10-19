@@ -235,6 +235,18 @@ pub enum SessionMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         origin: Option<UtteranceOrigin>,
     },
+    /// The user's words as soon as they are transcribed, for hosts that show
+    /// the conversation as it happens. `live_event` stays authoritative.
+    UserTranscribed {
+        token: u64,
+        text: String,
+    },
+    /// The Spokesperson's whole reply once it is generated, before it is
+    /// spoken. The transcript recorded after playback stays authoritative and
+    /// says how much was heard when the user cut it off.
+    SpokespersonGenerated {
+        text: String,
+    },
     /// A crate-selected batch that is ready to wake the external Expert.
     /// `live_event` remains the authoritative transcript projection; this
     /// message alone controls when the host schedules an Expert turn.
