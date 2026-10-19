@@ -72,6 +72,12 @@ OpenAI snapshots contain `model`, `voice`, and `rate`; Siri contains `voice`,
 and `rate`. Credentials, endpoints, and bundle paths never appear on stdout.
 Detailed backend errors are diagnostics on stderr only; protocol rejection and
 fatal messages are sanitized at the stdout boundary.
+In Expert-Spokesperson sessions, `session.spokesperson` holds the realtime
+`model` and `voice`. `session.tts` describes the voice that speaks the Expert's
+replies: the configured TTS backend with `--expert-voice tts`, otherwise the
+Spokesperson's own voice, and `set_tts_settings` changes that voice. A reply in
+the Expert's own voice reports the same `admitted`, `speech_completed`,
+`speech_interrupted`, and `speech_failed` lifecycle as a conventional reply.
 `session.input_during_tts` is the authoritative effective assistant-input
 policy and has its own revision. Status-sound settings are per-update parameters,
 not session snapshot configuration. The runtime owns cue cadence and playback; it

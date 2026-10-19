@@ -32,6 +32,7 @@ struct ExpertSpokespersonTestSession {
     output: mpsc::Receiver<Value>,
     stderr: mpsc::Receiver<String>,
     audio_host: Option<std::thread::JoinHandle<()>>,
+    ready: Value,
 }
 
 struct AudioCancellationGate {
@@ -55,6 +56,28 @@ impl ExpertSpokespersonTestSession {
         played_ready: Option<mpsc::SyncSender<()>>,
         cancellation_gate: Option<AudioCancellationGate>,
     ) -> Self {
+        Self::launch(
+            endpoint,
+            renew_after_ms,
+            played_frame_limit,
+            played_ready,
+            cancellation_gate,
+            &[],
+        )
+    }
+
+    fn start_with_args(endpoint: String, args: &[&str]) -> Self {
+        Self::launch(endpoint, None, None, None, None, args)
+    }
+
+    fn launch(
+        endpoint: String,
+        renew_after_ms: Option<u64>,
+        played_frame_limit: Option<u64>,
+        played_ready: Option<mpsc::SyncSender<()>>,
+        cancellation_gate: Option<AudioCancellationGate>,
+        args: &[&str],
+    ) -> Self {
         let (mut command, _pcm, audio_host) = session_command();
         if let Some(renew_after_ms) = renew_after_ms {
             command.env(
@@ -72,6 +95,7 @@ impl ExpertSpokespersonTestSession {
                     "--realtime-url",
                     &endpoint,
                 ])
+                .args(args)
                 .env("OPENAI_API_KEY", "test-key")
                 .env("OPENAI_REALTIME_ENDPOINT", "ws://127.0.0.1:1/unused")
                 .env("OPENAI_REALTIME_MODEL", "test-model")
@@ -99,11 +123,13 @@ impl ExpertSpokespersonTestSession {
             output,
             stderr,
             audio_host: Some(audio_host),
+            ready: Value::Null,
         };
         session.send(json!({
             "type":"hello","id":1,"input_during_tts":"allow_barge_in"
         }));
-        assert_eq!(session.recv(Duration::from_secs(2))["type"], "ready");
+        session.ready = session.recv(Duration::from_secs(2));
+        assert_eq!(session.ready["type"], "ready");
         session
     }
 
@@ -2653,4 +2679,163 @@ fn siri_remote_output_supports_consecutive_turns_and_cancellation() {
     assert!(child_process.wait().unwrap().success());
     reader.join().unwrap();
     audio_host.join().unwrap();
+}
+
+/// Serves OpenAI speech requests with a little silence, reporting each request body.
+fn spawn_speech_server() -> (String, mpsc::Receiver<Value>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/audio/speech", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let head = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0_u8; length];
+            stream.read_exact(&mut body).unwrap();
+            let _ = sender.send(serde_json::from_slice(&body).unwrap());
+            let audio = vec![1_u8; 4_800];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                audio.len()
+            )
+            .unwrap();
+            stream.write_all(&audio).unwrap();
+        }
+    });
+    (url, receiver)
+}
+
+#[test]
+fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard() {
+    let (speech_url, speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (context_tx, context_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                send_realtime_json(
+                    &mut socket,
+                    json!({
+                        "type":"response.function_call_arguments.done",
+                        "response_id":"response-handoff",
+                        "call_id":"handoff-reply",
+                        "name":"handoff",
+                        "arguments":"{\"message\":\"inspect the repository\"}"
+                    }),
+                )
+                .await;
+                let mut mentions = Vec::new();
+                let context = loop {
+                    let next = receive_realtime_json(&mut socket).await;
+                    let text = next.to_string();
+                    if text.contains("in its own voice") {
+                        break next;
+                    }
+                    if text.contains("I checked the repository.") {
+                        mentions.push(next);
+                    }
+                };
+                let after = tokio::time::timeout(Duration::from_millis(300), async {
+                    loop {
+                        let next = receive_realtime_json(&mut socket).await;
+                        if next["type"] == "response.create" {
+                            break next;
+                        }
+                    }
+                })
+                .await
+                .ok();
+                context_tx.send((context, mentions, after)).unwrap();
+                while socket.next().await.is_some() {}
+            });
+    });
+    let endpoint = endpoint_rx.recv().unwrap();
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint,
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    assert_eq!(session.ready["session"]["tts"]["backend"], "openai");
+    assert_eq!(
+        session.ready["session"]["spokesperson"],
+        json!({"model":"test-model","voice":"old-voice"})
+    );
+    assert_eq!(session.recv(Duration::from_secs(2))["origin"], "handoff");
+    assert_eq!(
+        session.recv(Duration::from_secs(2))["handoff_ids"],
+        json!(["handoff-external-1"])
+    );
+
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":1,
+        "text":"I checked the repository.",
+        "resolved_handoff_ids":["handoff-external-1"]
+    }));
+    let admitted = session.recv(Duration::from_secs(2));
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    session.send(json!({
+        "type":"output_ready",
+        "id":2,
+        "speech_id":admitted["speech_id"]
+    }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("the Expert's reply did not complete");
+        let message = session.recv(remaining);
+        assert_ne!(message["type"], "fatal", "{message}");
+        assert_ne!(message["type"], "speech_failed", "{message}");
+        if message["type"] == "speech_completed" {
+            assert_eq!(message["id"], 2);
+            assert_eq!(message["speech_id"], admitted["speech_id"]);
+            break;
+        }
+    }
+    let speech = speech_requests
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(speech["input"], "I checked the repository.");
+
+    let (context, mentions, after) = context_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(context["type"], "conversation.item.create", "{context}");
+    assert!(context.to_string().contains(
+        "The Expert said this to the user in its own voice:\\nI checked the repository."
+    ));
+    assert!(
+        mentions.is_empty(),
+        "the Spokesperson was asked to say it: {mentions:?}"
+    );
+    assert!(
+        after.is_none(),
+        "the context note started a response: {after:?}"
+    );
+    session.shutdown();
+    server.join().unwrap();
 }

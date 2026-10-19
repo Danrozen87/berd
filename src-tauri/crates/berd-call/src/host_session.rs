@@ -3283,6 +3283,7 @@ mod tests {
 
     fn test_snapshot() -> VoiceSessionSnapshot {
         VoiceSessionSnapshot {
+            spokesperson: None,
             tts: berd_call::TtsConfigurationSnapshot {
                 revision: 1,
                 settings: berd_call::TtsSettings::Siri {

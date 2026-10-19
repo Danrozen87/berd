@@ -1783,6 +1783,16 @@ impl RealtimeExpertSpokespersonSession {
         Ok(())
     }
 
+    /// Leaves handoffs open for another reply once the one meant to answer
+    /// them went unheard.
+    pub fn release_handoffs(&mut self, handoff_ids: &[String]) {
+        for handoff_id in handoff_ids {
+            if let Some(handoff) = self.open_handoffs.get_mut(handoff_id) {
+                handoff.resolving = false;
+            }
+        }
+    }
+
     pub fn dismiss_handoffs(&mut self, handoff_ids: &[String]) -> Result<(), String> {
         let unknown = self.unknown_handoff_ids(handoff_ids);
         if !unknown.is_empty() {

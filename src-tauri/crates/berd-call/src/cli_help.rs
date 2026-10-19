@@ -113,13 +113,17 @@ Usage:
 Each form also accepts:
     [--rate FLOAT]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH]
-    [--mode conventional|expert-spokesperson]
+    [--mode conventional|expert-spokesperson] [--expert-voice tts|spokesperson]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
 contracts. Endpoint URL flags override only the matching service for this call
-and default to OpenAI when no environment override is set."#;
+and default to OpenAI when no environment override is set.
+
+In expert-spokesperson mode, --expert-voice tts speaks the Expert's replies
+through the configured TTS backend, in its own voice beside the Spokesperson's,
+instead of having the Spokesperson read them aloud."#;
 
 const SYNTHESIZE_HELP: &str = r#"Render text through a configured TTS backend into a new WAV file.
 

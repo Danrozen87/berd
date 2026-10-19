@@ -157,8 +157,19 @@ pub enum OutputReadyOutcome {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct VoiceSessionSnapshot {
+    /// The voice that speaks replies: the conventional backend, or the
+    /// Spokesperson's own voice when it reads them.
     pub tts: TtsConfigurationSnapshot,
     pub input_during_tts: InputDuringTtsSnapshot,
+    /// The Spokesperson's voice, in Expert-Spokesperson sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spokesperson: Option<SpokespersonVoiceSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SpokespersonVoiceSnapshot {
+    pub model: String,
+    pub voice: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -402,10 +413,14 @@ mod tests {
                         revision: 1,
                         policy: InputDuringTtsPolicy::AllowBargeIn,
                     },
+                    spokesperson: Some(SpokespersonVoiceSnapshot {
+                        model: "gpt-realtime".into(),
+                        voice: "cedar".into(),
+                    }),
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#
+            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"model":"gpt-realtime","voice":"cedar"}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(

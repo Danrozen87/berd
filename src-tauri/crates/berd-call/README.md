@@ -142,11 +142,14 @@ berd-call session --tts-backend pocket --model-dir /path/to/native-voice-v2 --vo
 berd-call session --stt-backend parakeet --stt-model-dir /path/to/parakeet
 berd-call session --stt-backend openai
 berd-call session --tts-backend openai --mode expert-spokesperson --realtime-url ws://127.0.0.1:18870/v1/realtime
+berd-call session --voice Aaron --language en-US --mode expert-spokesperson --expert-voice tts
 berd-call session --tts-backend openai --tts-url https://proxy.example/v1/audio/speech
 berd-call session --stt-backend openai --stt-url wss://proxy.example/v1/realtime?intent=transcription
 ```
 
-The three URL flags take full endpoints and override only their matching service for that call. Expert–Spokesperson uses `--realtime-url` for both input and output; `--stt-url` and `--tts-url` apply only to conventional mode. Without an override, each service uses its OpenAI endpoint (or its existing environment override). `OPENAI_API_KEY` supplies the CLI credential; the desktop app stores keys separately by endpoint URL in Keychain.
+By default the Spokesperson reads the Expert's replies aloud in its own voice. With `--expert-voice tts`, the Expert speaks for itself: berd-call plays each reply through the configured TTS backend, taking turns with the Spokesperson's audio, and your speech interrupts either of them. Afterwards the Spokesperson gets a silent note of what you heard, so it can follow up without repeating it. A reply settles the handoffs it answers once you hear any of it. Its rate applies to the Expert's voice, and the Spokesperson's speed is that rate limited to 0.25–1.5. `status` and `settings --tts` describe and change the Expert's voice; the Spokesperson's model and voice appear as `session.spokesperson`. Saved settings don't keep `--expert-voice`, so pass it on each `start`.
+
+The three URL flags take full endpoints and override only their matching service for that call. Expert–Spokesperson uses `--realtime-url` for both input and output; `--stt-url` applies only to conventional mode, and `--tts-url` also applies to the Expert's own voice. Without an override, each service uses its OpenAI endpoint (or its existing environment override). `OPENAI_API_KEY` supplies the CLI credential; the desktop app stores keys separately by endpoint URL in Keychain.
 
 The default Siri backend still requires an exact installed voice name and
 language. Missing or unavailable Siri voice configuration and an unavailable
