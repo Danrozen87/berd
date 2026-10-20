@@ -1591,6 +1591,34 @@ fn expert_spokesperson_voice_change_swaps_atomically_and_flushes_gated_pcm_once(
 
 #[test]
 fn user_activity_during_voice_cutover_rolls_back_then_retries_once_idle() {
+    retries_a_voice_change_the_user_overtook(
+        &[],
+        json!({
+            "type":"set_tts_settings",
+            "id":2,
+            "expected_revision":1,
+            "settings":{"backend":"openai","model":"test-model","voice":"new-voice","rate":1.0}
+        }),
+    );
+}
+
+#[test]
+fn a_spokesperson_rate_change_the_user_overtook_is_retried_beside_the_agents_voice() {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    retries_a_voice_change_the_user_overtook(
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
+        json!({
+            "type":"set_spokesperson_settings",
+            "id":2,
+            "expected_revision":1,
+            "settings":{"backend":"openai","model":"test-model","voice":"old-voice","rate":1.5}
+        }),
+    );
+}
+
+/// Starts a call with `args`, makes the Spokesperson change in `request`, and speaks while its session is being built: the change rolls back, then lands once the call is idle.
+fn retries_a_voice_change_the_user_overtook(args: &[&str], request: Value) {
+    let output = request["settings"].clone();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (clear_seen_tx, clear_seen_rx) = mpsc::sync_channel(1);
     let (release_activity_tx, release_activity_rx) = mpsc::sync_channel(1);
@@ -1669,7 +1697,8 @@ fn user_activity_during_voice_cutover_rolls_back_then_retries_once_idle() {
                 let (retry_stream, _) = listener.accept().await.unwrap();
                 let mut retry = accept_async(retry_stream).await.unwrap();
                 let retry_update = receive_realtime_json(&mut retry).await;
-                assert_eq!(retry_update["session"]["audio"]["output"]["voice"], "new-voice");
+                assert_eq!(retry_update["session"]["audio"]["output"]["voice"], output["voice"]);
+                assert_eq!(retry_update["session"]["audio"]["output"]["speed"], output["rate"]);
                 acknowledge_realtime_session(&mut retry, &retry_update).await;
                 let seeds = tokio::spawn(async move {
                     while let Some(Ok(Message::Text(text))) = retry.next().await {
@@ -1691,13 +1720,8 @@ fn user_activity_during_voice_cutover_rolls_back_then_retries_once_idle() {
     });
     let endpoint = endpoint_rx.recv().unwrap();
 
-    let mut session = ExpertSpokespersonTestSession::start(endpoint);
-    session.send(json!({
-            "type":"set_tts_settings",
-            "id":2,
-            "expected_revision":1,
-            "settings":{"backend":"openai","model":"test-model","voice":"new-voice","rate":1.0}
-    }));
+    let mut session = ExpertSpokespersonTestSession::start_with_args(endpoint, args);
+    session.send(request.clone());
     clear_seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     session.send_pcm(0.25);
     session.flush();
@@ -1716,13 +1740,164 @@ fn user_activity_during_voice_cutover_rolls_back_then_retries_once_idle() {
             assert!(saw_user, "{message}");
             assert_eq!(message["outcome"], "applied", "{message}");
             assert_eq!(message["snapshot"]["revision"], 2);
-            assert_eq!(message["snapshot"]["voice"], "new-voice");
+            assert_eq!(message["snapshot"]["voice"], request["settings"]["voice"]);
+            assert_eq!(message["snapshot"]["rate"], request["settings"]["rate"]);
             applied = true;
         }
     }
     rollback_seen_rx
         .recv_timeout(Duration::from_secs(2))
         .unwrap();
+    session.shutdown();
+    server.join().unwrap();
+}
+
+type RealtimeSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// Accepts the realtime session a Spokesperson voice or speed change builds, checks it asks for `voice` at `speed`, and lets the call move to it from `current`.
+async fn cut_over(
+    listener: &TcpListener,
+    current: &mut RealtimeSocket,
+    voice: &str,
+    speed: f64,
+) -> RealtimeSocket {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut candidate = accept_async(stream).await.unwrap();
+    let update = receive_realtime_json(&mut candidate).await;
+    assert_eq!(update["session"]["audio"]["output"]["voice"], voice);
+    assert_eq!(update["session"]["audio"]["output"]["speed"], speed);
+    acknowledge_realtime_session(&mut candidate, &update).await;
+    while receive_realtime_json(current).await["type"] != "input_audio_buffer.clear" {}
+    send_realtime_json(current, json!({"type":"input_audio_buffer.cleared"})).await;
+    candidate
+}
+
+/// Serves a call whose Spokesperson changes speed, then voice, and is then muted.
+fn serve_spokesperson_changes() -> (String, std::thread::JoinHandle<()>) {
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut first = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut first).await;
+                assert_eq!(initial["session"]["audio"]["output"]["voice"], "old-voice");
+                acknowledge_realtime_session(&mut first, &initial).await;
+                let mut faster = cut_over(&listener, &mut first, "old-voice", 1.5).await;
+                let mut voiced = cut_over(&listener, &mut faster, "new-voice", 1.5).await;
+                // Muting clears what the Spokesperson has heard.
+                let clear = loop {
+                    let request = receive_realtime_json(&mut voiced).await;
+                    if request["type"] == "input_audio_buffer.clear" {
+                        break request;
+                    }
+                };
+                assert!(clear["event_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("berd-reset-"));
+                send_realtime_json(&mut voiced, json!({"type":"input_audio_buffer.cleared"})).await;
+                while voiced.next().await.is_some() {}
+                drop((first, faster));
+            });
+    });
+    (endpoint_rx.recv().unwrap(), server)
+}
+
+/// Sends a settings change on a live call and returns its result.
+fn change(session: &mut ExpertSpokespersonTestSession, request: Value) -> Value {
+    session.send(request);
+    session.recv(Duration::from_secs(3))
+}
+
+/// Changes the Spokesperson's speed, then its voice, with `change_type`, then the input policy and mute, checking each lands.
+fn change_spokesperson_and_input(session: &mut ExpertSpokespersonTestSession, change_type: &str) {
+    for (id, voice, revision) in [(2, "old-voice", 2), (3, "new-voice", 3)] {
+        let result = change(
+            session,
+            json!({
+                "type":change_type,
+                "id":id,
+                "expected_revision":revision - 1,
+                "settings":{"backend":"openai","model":"test-model","voice":voice,"rate":1.5}
+            }),
+        );
+        assert_eq!(result["type"], "tts_settings_result", "{result}");
+        assert_eq!(result["outcome"], "applied", "{result}");
+        assert_eq!(result["snapshot"]["revision"], revision);
+        assert_eq!(result["snapshot"]["voice"], voice);
+        assert_eq!(result["snapshot"]["rate"], 1.5);
+    }
+    let policy = change(
+        session,
+        json!({"type":"set_input_during_tts","id":4,"expected_revision":1,"policy":"suppress_input"}),
+    );
+    assert_eq!(policy["type"], "input_during_tts_result", "{policy}");
+    assert_eq!(policy["outcome"], "applied");
+    assert_eq!(
+        policy["snapshot"],
+        json!({"revision":2,"policy":"suppress_input"})
+    );
+    for (id, active) in [(5, true), (6, false)] {
+        let muted = change(
+            session,
+            json!({"type":"set_input_muted","id":id,"active":active}),
+        );
+        assert_eq!(
+            muted,
+            json!({"type":"input_mute_applied","id":id,"active":active})
+        );
+    }
+}
+
+#[test]
+fn every_setting_changes_in_a_live_call_with_one_voice() {
+    let (endpoint, server) = serve_spokesperson_changes();
+    let mut session = ExpertSpokespersonTestSession::start(endpoint);
+    assert!(session.ready["session"]["spokesperson"].is_null());
+    change_spokesperson_and_input(&mut session, "set_tts_settings");
+    session.shutdown();
+    server.join().unwrap();
+}
+
+#[test]
+fn every_setting_changes_in_a_live_call_with_separate_voices() {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    let (endpoint, server) = serve_spokesperson_changes();
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint,
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
+    );
+    let model = session.ready["session"]["tts"]["model"].clone();
+    assert_eq!(
+        session.ready["session"]["spokesperson"]["voice"],
+        "old-voice"
+    );
+    // The agent's own voice, then its speed, change without touching the Spokesperson's session.
+    for (id, voice, rate, revision) in [(7, "cedar", 1.0, 2), (8, "cedar", 1.5, 3)] {
+        let result = change(
+            &mut session,
+            json!({
+                "type":"set_tts_settings",
+                "id":id,
+                "expected_revision":revision - 1,
+                "settings":{"backend":"openai","model":model,"voice":voice,"rate":rate}
+            }),
+        );
+        assert_eq!(result["type"], "tts_settings_result", "{result}");
+        assert_eq!(result["outcome"], "applied", "{result}");
+        assert_eq!(result["snapshot"]["revision"], revision);
+        assert_eq!(result["snapshot"]["voice"], voice);
+        assert_eq!(result["snapshot"]["rate"], rate);
+    }
+    change_spokesperson_and_input(&mut session, "set_spokesperson_settings");
     session.shutdown();
     server.join().unwrap();
 }
