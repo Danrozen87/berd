@@ -3317,7 +3317,8 @@ fn interrupt_expert_reply(interruption: ReplyInterruption) -> (Value, usize) {
             release,
             at_drain: true,
         }),
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        false,
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     let text = "I checked the repository and found three failing tests in the parser.";
     session.send(json!({"type":"prepare_speak","id":2,"acknowledgement":null,"text":text}));
