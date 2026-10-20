@@ -2978,6 +2978,8 @@ struct LiveResponse {
     reply: Option<Vec<String>>,
     /// The voice it asked for, when not the Expert's usual one.
     voice: Option<TtsConfigurationLease>,
+    /// Whether the parent has accepted the reply's output, so it may play.
+    output_ready: bool,
     delivery: RealtimeAudioDelivery,
     pending_audio: VecDeque<Vec<f32>>,
     pending_frames: usize,
@@ -2997,6 +2999,7 @@ impl LiveResponse {
             expert_text: None,
             reply: None,
             voice: None,
+            output_ready: false,
             delivery: RealtimeAudioDelivery::default(),
             pending_audio: VecDeque::new(),
             pending_frames: 0,
@@ -4245,7 +4248,6 @@ fn run_expert_spokesperson_session(
                     &mut directive_speeches,
                     reply_tts.is_some(),
                     &mut responses,
-                    &mut waiting_responses,
                     &mut next_speech_id,
                     &mut writer,
                 )?;
@@ -4486,7 +4488,6 @@ fn run_expert_spokesperson_session(
                         &mut directive_speeches,
                         reply_tts.is_some(),
                         &mut responses,
-                        &mut waiting_responses,
                         &mut next_speech_id,
                         &mut writer,
                     )?,
@@ -4501,12 +4502,24 @@ fn run_expert_spokesperson_session(
                 }
             }
             Input::Request(SessionRequest::OutputReady { id, speech_id }) => {
-                let valid = directive_speeches
-                    .get(&id)
-                    .is_some_and(|directive| directive.speech_id == speech_id)
-                    || responses.values().any(|response| {
-                        response.prepare_id == Some(id) && response.speech_id == Some(speech_id)
-                    });
+                let matches = |response: &LiveResponse| {
+                    response.prepare_id == Some(id) && response.speech_id == Some(speech_id)
+                };
+                let reply = responses.iter_mut().find(|(_, response)| {
+                    response.reply.is_some() && !response.output_ready && matches(response)
+                });
+                let valid = if let Some((response_id, response)) = reply {
+                    response.output_ready = true;
+                    waiting_responses.push_back(response_id.clone());
+                    true
+                } else {
+                    directive_speeches
+                        .get(&id)
+                        .is_some_and(|directive| directive.speech_id == speech_id)
+                        || responses
+                            .values()
+                            .any(|response| response.reply.is_none() && matches(response))
+                };
                 write_message(
                     &mut writer,
                     &SessionMessage::OutputReadyResult {
@@ -5191,7 +5204,6 @@ fn submit_expert_prepare(
     directive_speeches: &mut HashMap<u64, DirectiveSpeech>,
     expert_tts: bool,
     responses: &mut HashMap<String, LiveResponse>,
-    waiting_responses: &mut VecDeque<String>,
     next_speech_id: &mut u64,
     writer: &mut impl Write,
 ) -> Result<(), String> {
@@ -5233,7 +5245,8 @@ fn submit_expert_prepare(
             let resolved_handoff_ids = request.resolved_handoff_ids;
             core.mark_handoffs_resolving(&resolved_handoff_ids)?;
             if expert_tts {
-                // Played in turn with the Spokesperson's responses, without one of its own.
+                // Played in turn with the Spokesperson's responses, without one of its own,
+                // once the parent is ready for its output.
                 let response_id = format!("expert-reply-{speech_id}");
                 let mut response = LiveResponse::new(Some(request.id), Some(speech_id));
                 response.expert_text = Some(message);
@@ -5242,8 +5255,7 @@ fn submit_expert_prepare(
                 response.audio_done = true;
                 response.finish_sent = true;
                 response.server_finished = true;
-                responses.insert(response_id.clone(), response);
-                waiting_responses.push_back(response_id);
+                responses.insert(response_id, response);
             } else {
                 directive_speeches.insert(
                     request.id,

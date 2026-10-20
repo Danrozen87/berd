@@ -3092,3 +3092,71 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
     session.shutdown();
     server.join().unwrap();
 }
+
+#[test]
+fn expert_voice_reply_waits_for_output_ready_before_playing() {
+    let (speech_url, speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                while socket.next().await.is_some() {}
+            });
+    });
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint_rx.recv().unwrap(),
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":null,
+        "text":"I checked the repository."
+    }));
+    let admitted = session.recv(Duration::from_secs(2));
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    let speech_id = admitted["speech_id"].as_u64().unwrap();
+    if let Ok(message) = session.output.recv_timeout(Duration::from_millis(500)) {
+        panic!("the reply went on before output_ready: {message}");
+    }
+    assert!(
+        speech_requests.try_recv().is_err(),
+        "the reply was synthesized before output_ready"
+    );
+    for (id, speech_id) in [(2, speech_id + 1), (3, speech_id)] {
+        session.send(json!({"type":"output_ready","id":id,"speech_id":speech_id}));
+        assert_eq!(
+            session.recv(Duration::from_secs(2)),
+            json!({"type":"output_ready_result","id":id,"speech_id":speech_id,"outcome":"stale"})
+        );
+    }
+    session.send(json!({"type":"output_ready","id":2,"speech_id":speech_id}));
+    assert_eq!(
+        session.recv(Duration::from_secs(2)),
+        json!({"type":"output_ready_result","id":2,"speech_id":speech_id,"outcome":"accepted"})
+    );
+    let mut started = false;
+    loop {
+        let message = session.recv(Duration::from_secs(3));
+        match message["type"].as_str() {
+            Some("speech_started") => started = true,
+            Some("speech_completed") => break,
+            _ => panic!("unexpected message: {message}"),
+        }
+    }
+    assert!(started);
+    session.send(json!({"type":"output_ready","id":2,"speech_id":speech_id}));
+    assert_eq!(session.recv(Duration::from_secs(2))["outcome"], "stale");
+    session.shutdown();
+}
