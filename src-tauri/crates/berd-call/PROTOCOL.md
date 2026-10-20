@@ -263,6 +263,11 @@ linearization point. A speech reservation holds a configuration lease: speech
 admitted before the response retains its old backend/settings, while later
 admission receives the new revision. Pocket's public model identifier cannot be
 changed without selecting and validating another bundle at process startup.
+In a `berd-call start` realtime call, a Spokesperson voice or rate change that
+the conversation overtakes while its new session is being built is not
+rejected: the candidate is discarded and the change is tried again, with the
+conversation as it then stands, once the call is idle. Its one result comes
+when it finally applies or fails.
 
 `set_input_during_tts` changes the policy for later admissions. Its expected
 revision must be positive. The correlated result is always authoritative:

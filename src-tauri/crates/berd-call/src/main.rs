@@ -2794,6 +2794,32 @@ fn rollback_spokesperson_voice_update(
     }
 }
 
+fn is_settings_update(pending: &Option<VoiceUpdateTransaction>) -> bool {
+    pending
+        .as_ref()
+        .is_some_and(|update| matches!(update.purpose(), VoiceUpdatePurpose::Settings))
+}
+
+/// Puts back a settings change the conversation overtook while its session
+/// was being built, to be tried again, with the conversation as it then
+/// stands, once the call is idle.
+fn requeue_spokesperson_voice_update(
+    pending: &mut Option<VoiceUpdateTransaction>,
+    old_runtime: &OpenAiSpokespersonRuntime,
+    queue: &mut VoiceUpdateQueue<PendingSpokespersonSettingsUpdate>,
+) -> Result<(), String> {
+    let update = pending.take().expect("matched settings update");
+    let request = PendingSpokespersonSettingsUpdate {
+        id: update.id,
+        base_revision: update.base_revision,
+        settings: update.settings.clone(),
+    };
+    update.abort(old_runtime)?;
+    queue
+        .try_enqueue(false, request)
+        .map_err(|_| "a Spokesperson settings update was already queued".to_string())
+}
+
 fn activate_spokesperson_voice_update(
     pending: &mut Option<VoiceUpdateTransaction>,
     runtime: &mut Option<OpenAiSpokespersonRuntime>,
@@ -3417,6 +3443,15 @@ fn run_expert_spokesperson_session(
                     )?;
                     turn_gate.lifecycle.session_started(Instant::now());
                 }
+                VoiceUpdateAction::Reject(_)
+                    if !safe && is_settings_update(&pending_voice_update) =>
+                {
+                    requeue_spokesperson_voice_update(
+                        &mut pending_voice_update,
+                        runtime.as_ref().expect("initialized runtime"),
+                        &mut queued_tts_settings,
+                    )?;
+                }
                 VoiceUpdateAction::Reject(message) => {
                     let expiry_cause = pending_voice_update.as_ref().and_then(|update| {
                         if let VoiceUpdatePurpose::SessionRecovery { cause } = update.purpose() {
@@ -3845,8 +3880,8 @@ fn run_expert_spokesperson_session(
                         }
                     }
                     SpokespersonEvent::InputCutoverFinished { request_id, result } => {
-                        let action = pending_voice_update.as_ref().map_or(
-                            VoiceBarrierAction::Ignore,
+                        let (action, safe) = pending_voice_update.as_ref().map_or(
+                            (VoiceBarrierAction::Ignore, true),
                             |update| {
                                 let work = spokesperson_host_work(
                                     &turn_gate,
@@ -3863,12 +3898,13 @@ fn run_expert_spokesperson_session(
                                     &turn_gate,
                                     work,
                                 );
-                                match update.next_action(Instant::now(), safe) {
+                                let action = match update.next_action(Instant::now(), safe) {
                                     VoiceUpdateAction::Reject(message) => {
                                         VoiceBarrierAction::Reject(message)
                                     }
                                     _ => update.finish_barrier(request_id, result, safe),
-                                }
+                                };
+                                (action, safe)
                             },
                         );
                         if action == VoiceBarrierAction::Activate {
@@ -3881,6 +3917,15 @@ fn run_expert_spokesperson_session(
                                 &mut writer,
                             )?;
                             turn_gate.lifecycle.session_started(Instant::now());
+                        } else if matches!(action, VoiceBarrierAction::Reject(_))
+                            && !safe
+                            && is_settings_update(&pending_voice_update)
+                        {
+                            requeue_spokesperson_voice_update(
+                                &mut pending_voice_update,
+                                runtime.as_ref().expect("initialized runtime"),
+                                &mut queued_tts_settings,
+                            )?;
                         } else if let VoiceBarrierAction::Reject(message) = action {
                             rollback_spokesperson_voice_update(
                                 &mut pending_voice_update,
