@@ -1435,9 +1435,7 @@ impl SessionActor {
         handoff: bool,
     ) -> Result<(), String> {
         self.held.extend(events);
-        if !handoff
-            && matches!(*self.transcript, Transcript::Stdout { live: false })
-        {
+        if !handoff && matches!(*self.transcript, Transcript::Stdout { live: false }) {
             return Ok(());
         }
         for event in unstreamed(&std::mem::take(&mut self.held), &mut self.transcribed) {
