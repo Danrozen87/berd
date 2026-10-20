@@ -3094,7 +3094,12 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
 }
 
 #[test]
-fn a_relayed_reply_is_said_by_the_spokesperson_and_answers_every_handoff() {
+fn a_message_to_the_spokesperson_is_said_by_it_and_answers_every_handoff() {
+    message_the_spokesperson(false);
+    message_the_spokesperson(true);
+}
+
+fn message_the_spokesperson(expert_voice: bool) {
     let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (relay_tx, relay_rx) = mpsc::sync_channel(1);
@@ -3141,9 +3146,10 @@ fn a_relayed_reply_is_said_by_the_spokesperson_and_answers_every_handoff() {
             });
     });
     let endpoint = endpoint_rx.recv().unwrap();
+    let own = ["--expert-voice", "tts", "--tts-url", &speech_url];
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint,
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        if expert_voice { &own } else { &[] },
     );
     loop {
         session.send(json!({"type":"query_state","id":1,"after":0}));

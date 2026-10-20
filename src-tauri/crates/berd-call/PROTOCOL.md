@@ -223,8 +223,9 @@ are spoken by the Spokesperson, is `not_admitted(invalid_voice)`. In a call
 whose replies have their own voice, a reply is admitted however stale its
 `acknowledgement`, never `pending`, and answers every open handoff once
 admitted, so `resolved_handoff_ids` is ignored. With `relay: true` (what
-`berd-call message-spokesperson` sends), the Spokesperson says such a reply instead, as it would in a call without its own
-voice, and it reports the same lifecycle. Open handoffs there don't hold
+`berd-call message-spokesperson` sends), the Spokesperson says the reply in any
+Expert-Spokesperson call, on those same terms, with the same lifecycle. Open
+handoffs in a call whose replies have their own voice don't hold
 back a renewal or recovery of the Spokesperson's session; the replacement is
 told what they asked.
 The parent cannot author speaking state or finalized input; those are derived
