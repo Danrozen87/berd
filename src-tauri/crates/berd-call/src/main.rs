@@ -3162,17 +3162,16 @@ fn spokesperson_pcm_allowed(
 }
 
 /// Input controls waiting on the provider to clear its input buffer, so microphone audio keeps flowing meanwhile.
-/// Controls answer in order once no clear is outstanding; one that needs a clear while another is outstanding gets the next.
+/// Each clear goes out where its control arrived; controls answer in order once no clear is outstanding.
 #[derive(Default)]
 struct InputResets {
-    clearing: Option<Receiver<Result<(), String>>>,
-    again: bool,
+    clearing: VecDeque<Receiver<Result<(), String>>>,
     replies: Vec<SessionMessage>,
 }
 
 impl InputResets {
     fn idle(&self) -> bool {
-        self.clearing.is_none()
+        self.clearing.is_empty()
     }
 
     fn apply(
@@ -3182,38 +3181,26 @@ impl InputResets {
         reset_input: impl FnOnce() -> Result<Receiver<Result<(), String>>, String>,
         writer: &mut impl Write,
     ) -> Result<(), String> {
-        if self.idle() {
-            if !clear {
-                return write_message(writer, &reply);
-            }
-            self.clearing = Some(reset_input()?);
-        } else {
-            self.again |= clear;
+        if clear {
+            self.clearing.push_back(reset_input()?);
+        } else if self.idle() {
+            return write_message(writer, &reply);
         }
         self.replies.push(reply);
         Ok(())
     }
 
-    fn poll(
-        &mut self,
-        reset_input: impl FnOnce() -> Result<Receiver<Result<(), String>>, String>,
-        writer: &mut impl Write,
-    ) -> Result<(), String> {
-        let Some(clearing) = &self.clearing else {
-            return Ok(());
-        };
-        match clearing.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err("Spokesperson runtime is closed".into())
+    fn poll(&mut self, writer: &mut impl Write) -> Result<(), String> {
+        while let Some(clearing) = self.clearing.front() {
+            match clearing.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("Spokesperson runtime is closed".into())
+                }
+                Ok(result) => result?,
             }
-            Ok(result) => result?,
+            self.clearing.pop_front();
         }
-        if std::mem::take(&mut self.again) {
-            self.clearing = Some(reset_input()?);
-            return Ok(());
-        }
-        self.clearing = None;
         self.replies
             .drain(..)
             .try_for_each(|reply| write_message(writer, &reply))
@@ -3419,10 +3406,7 @@ fn run_expert_spokesperson_session(
 
     loop {
         if initialized {
-            input_resets.poll(
-                || runtime.as_ref().expect("initialized runtime").reset_input(),
-                &mut writer,
-            )?;
+            input_resets.poll(&mut writer)?;
             let work = spokesperson_host_work(
                 &turn_gate,
                 active.as_ref(),
@@ -9099,17 +9083,15 @@ mod tests {
                 &mut output,
             )
             .unwrap();
-        resets.poll(reset_input, &mut output).unwrap();
-        assert_eq!(clears.borrow().len(), 1);
-        assert!(output.is_empty());
-
-        // The reset asked for during the first clear needs a clear of its own.
-        clears.borrow()[0].send(Ok(())).unwrap();
-        resets.poll(reset_input, &mut output).unwrap();
+        // The reset asked for during the first clear gets a clear of its own, at once.
+        resets.poll(&mut output).unwrap();
         assert_eq!(clears.borrow().len(), 2);
         assert!(output.is_empty());
+        clears.borrow()[0].send(Ok(())).unwrap();
+        resets.poll(&mut output).unwrap();
+        assert!(output.is_empty());
         clears.borrow()[1].send(Ok(())).unwrap();
-        resets.poll(reset_input, &mut output).unwrap();
+        resets.poll(&mut output).unwrap();
         assert!(resets.idle());
         assert_eq!(
             messages(&output),
@@ -9150,7 +9132,7 @@ mod tests {
             .send(Err("provider refused".into()))
             .unwrap();
         assert_eq!(
-            resets.poll(reset_input, &mut output).unwrap_err(),
+            resets.poll(&mut output).unwrap_err(),
             "provider refused"
         );
     }
