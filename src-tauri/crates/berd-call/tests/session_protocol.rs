@@ -2769,8 +2769,7 @@ fn expert_voice_keeps_a_separate_spokesperson_voice_control() {
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint,
         &[
-            "--expert-voice",
-            "tts",
+            "--allow-direct-agent-speech",
             "--tts-url",
             &speech_url,
             "--spokesperson-voice",
@@ -3016,7 +3015,7 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
     let endpoint = endpoint_rx.recv().unwrap();
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint,
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     assert_eq!(session.ready["session"]["tts"]["backend"], "openai");
     assert_eq!(
@@ -3146,7 +3145,7 @@ fn message_the_spokesperson(expert_voice: bool) {
             });
     });
     let endpoint = endpoint_rx.recv().unwrap();
-    let own = ["--expert-voice", "tts", "--tts-url", &speech_url];
+    let own = ["--allow-direct-agent-speech", "--tts-url", &speech_url];
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint,
         if expert_voice { &own } else { &[] },
@@ -3206,7 +3205,7 @@ fn message_the_spokesperson(expert_voice: bool) {
 }
 
 #[test]
-fn expert_voice_handoffs_survive_provider_expiry_and_any_late_reply_answers_them() {
+fn expert_voice_handoffs_survive_provider_expiry_and_a_current_reply_answers_them() {
     let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (note_tx, note_rx) = mpsc::sync_channel(1);
@@ -3280,7 +3279,7 @@ fn expert_voice_handoffs_survive_provider_expiry_and_any_late_reply_answers_them
     let endpoint = endpoint_rx.recv().unwrap();
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint,
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     let note = note_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
@@ -3288,11 +3287,27 @@ fn expert_voice_handoffs_survive_provider_expiry_and_any_late_reply_answers_them
         "{note}"
     );
 
-    // A reply written before everything since, naming no handoff, is still spoken.
+    // A reply written before everything since waits for it, and once it
+    // acknowledges the latest, naming no handoff, it answers them all.
     session.send(json!({
         "type":"prepare_speak",
         "id":2,
         "acknowledgement":0,
+        "text":"I checked the repository."
+    }));
+    let pending = loop {
+        let message = session.recv(Duration::from_secs(2));
+        assert_ne!(message["type"], "fatal", "{message}");
+        if message["id"] == 2 {
+            break message;
+        }
+    };
+    assert_eq!(pending["type"], "pending", "{pending}");
+    let latest = pending["utterances"].as_array().unwrap().last().unwrap()["token"].clone();
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":latest,
         "text":"I checked the repository."
     }));
     let admitted = loop {

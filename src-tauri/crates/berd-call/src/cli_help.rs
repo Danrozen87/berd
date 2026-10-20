@@ -66,9 +66,11 @@ for delivery. Non-blocking sessions require --stream or --codex and emit speech_
 rows only for interruptions, failures, or pending user input. Interrupted results include
 estimatedSpokenText, a best-effort prefix based on delivered audio. --voice speaks
 this text in another voice of the call's reply backend without changing its saved
-voice, so several agents can share one call in distinct voices. In a call with
---expert-voice tts, every reply is spoken however stale --re is, and answers
-every open handoff, so --resolves is ignored."#;
+voice, so several agents can share one call in distinct voices. An
+Expert-Spokesperson call refuses speak unless started with
+--allow-direct-agent-speech; otherwise use message-spokesperson. With it, a
+reply acknowledging the latest input is spoken in the Expert's own voice and
+answers every open handoff, so --resolves is ignored."#;
 
 const MESSAGE_SPOKESPERSON_HELP: &str = r#"Message the Spokesperson of the active realtime call.
 
@@ -76,7 +78,7 @@ Usage:
   berd-call message-spokesperson [--port PORT] TEXT
 
 The Spokesperson tells the user in its own voice, even in a call with
---expert-voice tts, where `speak` uses the Expert's. It is admitted however much
+--allow-direct-agent-speech, where `speak` uses the Expert's. It is admitted however much
 the user has said since, answers every open handoff, and reports the same result
 as `speak`."#;
 
@@ -94,7 +96,7 @@ Usage:
   berd-call settings [--port PORT] --restart [session options]
 
 The setting applies to subsequent speak calls. In a call started with
---expert-voice tts, --voice and --rate change the agents' voice, and
+--allow-direct-agent-speech, --voice and --rate change the agents' voice, and
 --spokesperson-voice and --spokesperson-rate change the Spokesperson's (an
 OpenAI realtime voice, 0.25 to 1.5). Non-blocking delivery requires
 a call started with --stream or --codex. Successful delivery produces no notification."#;
@@ -133,7 +135,7 @@ Usage:
 Each form also accepts:
     [--rate FLOAT]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH]
-    [--mode conventional|expert-spokesperson] [--expert-voice tts|spokesperson]
+    [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
 
@@ -142,9 +144,9 @@ agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
 contracts. Endpoint URL flags override only the matching service for this call
 and default to OpenAI when no environment override is set.
 
-In expert-spokesperson mode, --expert-voice tts speaks the Expert's replies
-through the configured TTS backend, in its own voice beside the Spokesperson's,
-instead of having the Spokesperson read them aloud. --spokesperson-voice and
+In expert-spokesperson mode, the Expert speaks through the Spokesperson.
+--allow-direct-agent-speech also lets it speak to the user itself, through the
+configured TTS backend, in its own voice beside the Spokesperson's. --spokesperson-voice and
 --spokesperson-rate then choose the Spokesperson's own voice and speed."#;
 
 const SYNTHESIZE_HELP: &str = r#"Render text through a configured TTS backend into a new WAV file.
