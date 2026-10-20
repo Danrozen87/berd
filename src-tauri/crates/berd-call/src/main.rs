@@ -5209,6 +5209,9 @@ fn finish_expert_reply(
     Ok(())
 }
 
+/// The Spokesperson's audio gathered before each reply plays, 300 ms at 24 kHz: OpenAI sends it about as fast as it plays, so this covers a delta that comes late.
+const SPOKESPERSON_AUDIO_LEAD_FRAMES: usize = 7_200;
+
 fn spawn_live_playback(
     response_id: String,
     speech_id: u64,
@@ -5218,16 +5221,19 @@ fn spawn_live_playback(
     completed: mpsc::Sender<LivePlaybackResult>,
 ) -> Result<LivePlayback, String> {
     let active = Arc::new(AtomicBool::new(true));
-    let output = Arc::new(RemotePcmAudioOutput::new(
-        speech_id,
-        TtsPcmSpec {
-            sample_rate: 24_000,
-            playback_rate: 1.0,
-        },
-        transport,
-        Arc::clone(&active),
-        control,
-    )?);
+    let output = Arc::new(
+        RemotePcmAudioOutput::new(
+            speech_id,
+            TtsPcmSpec {
+                sample_rate: 24_000,
+                playback_rate: 1.0,
+            },
+            transport,
+            Arc::clone(&active),
+            control,
+        )?
+        .streaming_after(SPOKESPERSON_AUDIO_LEAD_FRAMES),
+    );
     let (sender, receiver) = mpsc::sync_channel::<LivePlaybackInput>(64);
     let worker_output = Arc::clone(&output);
     let worker_response_id = response_id.clone();
