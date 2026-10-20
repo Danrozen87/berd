@@ -823,9 +823,8 @@ fn parse_start_args(args: &[String]) -> Result<StartOptions, ParseFailure> {
                 transcript = if flag == "--codex" {
                     TranscriptDestination::Codex
                 } else {
-                    let mode = args.get(index).map(String::as_str);
-                    let live = mode == Some("live");
-                    if matches!(mode, Some("live" | "handoffs")) {
+                    let live = args.get(index).map(String::as_str) == Some("live");
+                    if live {
                         index += 1;
                     }
                     TranscriptDestination::Stdout { live }
@@ -12436,7 +12435,6 @@ mod tests {
         assert!(parsed.non_blocking);
         for (flags, live) in [
             (&["--stream"][..], false),
-            (&["--stream", "handoffs"], false),
             (&["--stream", "live", "--non-blocking"], true),
         ] {
             let parsed = start(flags).unwrap();

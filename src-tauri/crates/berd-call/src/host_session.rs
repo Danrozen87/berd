@@ -834,8 +834,6 @@ struct SessionActor {
     expert_spokesperson: bool,
     // User rows already streamed when transcribed, left out of the Expert batch.
     transcribed: HashSet<u64>,
-    // Rows a handoffs stream or Codex task gets only when the Spokesperson hands off.
-    held: Vec<RealtimeExpertDeliveryEvent>,
     stopping: bool,
     restart: Option<PendingRestart>,
     muted: Arc<AtomicBool>,
@@ -898,7 +896,6 @@ impl SessionActor {
             transcript,
             expert_spokesperson,
             transcribed: HashSet::new(),
-            held: Vec::new(),
             stopping: false,
             restart: None,
             muted: Arc::new(AtomicBool::new(false)),
@@ -1310,12 +1307,8 @@ impl SessionActor {
                 self.transcript
                     .record(None, "spokesperson_generated", None, &text)?
             }
-            SessionMessage::ExpertDelivery {
-                events,
-                handoff_ids,
-                ..
-            } if self.expert_spokesperson => {
-                self.stream_expert_delivery(events, !handoff_ids.is_empty())?
+            SessionMessage::ExpertDelivery { events, .. } if self.expert_spokesperson => {
+                self.stream_expert_delivery(&events)?
             }
             SessionMessage::Pending { id, utterances } if self.pending_prepare_id() == Some(id) => {
                 self.respond_speak(Ok(json!({"spoke":false,"utterances":utterances})));
@@ -1431,14 +1424,9 @@ impl SessionActor {
 
     fn stream_expert_delivery(
         &mut self,
-        events: Vec<RealtimeExpertDeliveryEvent>,
-        handoff: bool,
+        events: &[RealtimeExpertDeliveryEvent],
     ) -> Result<(), String> {
-        self.held.extend(events);
-        if !handoff && matches!(*self.transcript, Transcript::Stdout { live: false }) {
-            return Ok(());
-        }
-        for event in unstreamed(&std::mem::take(&mut self.held), &mut self.transcribed) {
+        for event in unstreamed(events, &mut self.transcribed) {
             self.transcript.record(
                 Some(event.cursor),
                 expert_delivery_role_name(event.role),
@@ -2733,43 +2721,6 @@ mod tests {
             .collect();
         assert_eq!(cursors, [2, 3]);
         assert_eq!(transcribed, HashSet::from([3]));
-    }
-
-    #[test]
-    fn handoffs_stream_holds_rows_until_a_handoff() {
-        let mut child = Command::new("/bin/cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
-        let (_event_tx, events) = mpsc::sync_channel(1);
-        let (_command_tx, commands) = mpsc::sync_channel(1);
-        let (audio, _audio_rx) = mpsc::sync_channel(1);
-        let mut actor = test_actor(writer, events, commands, audio);
-        let event = |cursor, role| RealtimeExpertDeliveryEvent {
-            cursor,
-            role,
-            text: format!("event {cursor}"),
-            handoff_id: None,
-        };
-        actor
-            .stream_expert_delivery(
-                vec![
-                    event(1, RealtimeExpertDeliveryRole::User),
-                    event(2, RealtimeExpertDeliveryRole::Spokesperson),
-                ],
-                false,
-            )
-            .unwrap();
-        assert_eq!(actor.held.len(), 2);
-        actor
-            .stream_expert_delivery(vec![event(3, RealtimeExpertDeliveryRole::Handoff)], true)
-            .unwrap();
-        assert!(actor.held.is_empty());
-        drop(actor);
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[test]

@@ -34,18 +34,17 @@ Run `berd-call help <command>` for command-specific usage."#;
 const START_HELP: &str = r#"Run a local voice call backed by the shared session runtime.
 
 Usage:
-  berd-call start [--port PORT] [--stream [handoffs|live] | --codex] [--non-blocking]
+  berd-call start [--port PORT] [--stream [live] | --codex] [--non-blocking]
     [--no-menu-bar]
     --voice NAME --language BCP47 [session options]
 
 The foreground process owns the default microphone and audio output. Session
 options are the same as `berd-call session`, except the PCM descriptor is owned
 internally. `--stream` prints cursor, role, and text as TSV. In
-Expert-Spokesperson mode it prints nothing until the Spokesperson hands off,
-then everything since the last handoff; `--stream live` prints each row as it
-happens. `--codex` delivers a batch to the calling Codex task after every
-Spokesperson reply and at each handoff, as Berd's Expert hears the call
-(requires CODEX_THREAD_ID). A
+Expert-Spokesperson mode it prints a batch after every Spokesperson reply and
+at each handoff, as Berd's Expert hears the call; `--stream live` prints each
+row as it happens. `--codex` delivers the same batches as `--stream` to the
+calling Codex task (requires CODEX_THREAD_ID). A
 menu-bar item controls speech rate, input muting, and ending the call; pass
 `--no-menu-bar` to omit it.
 
