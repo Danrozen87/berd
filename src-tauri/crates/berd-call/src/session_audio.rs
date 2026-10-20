@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -190,6 +190,8 @@ pub struct RemotePcmAudioOutput {
     operation_timeout: Duration,
     minimum_accepted_runway_frames: u64,
     pending_samples: Mutex<Vec<f32>>,
+    /// Frames to gather before streaming each write as it comes, or `None` to send whole chunks.
+    stream_after: Option<AtomicUsize>,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -236,6 +238,7 @@ impl RemotePcmAudioOutput {
             operation_timeout,
             minimum_accepted_runway_frames: accepted_audio_runway_frames(spec),
             pending_samples: Mutex::new(Vec::with_capacity(MAX_AUDIO_CHUNK_FRAMES)),
+            stream_after: None,
             state: Mutex::new(State {
                 phase: Phase::New,
                 begin_accepted: false,
@@ -255,6 +258,12 @@ impl RemotePcmAudioOutput {
             }),
             changed: Condvar::new(),
         })
+    }
+
+    /// Holds back the first `frames` of audio, then sends each write at once, for a source that arrives about as fast as it plays: what is held covers its late arrivals.
+    pub fn streaming_after(mut self, frames: usize) -> Self {
+        self.stream_after = Some(AtomicUsize::new(frames));
+        self
     }
 
     pub fn start(&self) -> Result<(), String> {
@@ -860,11 +869,18 @@ impl PcmAudioOutput for RemotePcmAudioOutput {
                 .lock()
                 .expect("remote pending PCM lock");
             pending.extend_from_slice(samples);
-            let complete_len = pending.len() / MAX_AUDIO_CHUNK_FRAMES * MAX_AUDIO_CHUNK_FRAMES;
-            let tail = pending.split_off(complete_len);
+            let ready = match &self.stream_after {
+                None => pending.len() / MAX_AUDIO_CHUNK_FRAMES * MAX_AUDIO_CHUNK_FRAMES,
+                Some(held) if pending.len() >= held.load(Ordering::SeqCst) => {
+                    held.store(0, Ordering::SeqCst);
+                    pending.len()
+                }
+                Some(_) => 0,
+            };
+            let tail = pending.split_off(ready);
             std::mem::replace(&mut *pending, tail)
         };
-        for chunk in complete_samples.chunks_exact(MAX_AUDIO_CHUNK_FRAMES) {
+        for chunk in complete_samples.chunks(MAX_AUDIO_CHUNK_FRAMES) {
             self.write_chunk(chunk)?;
         }
         Ok(())
@@ -921,6 +937,7 @@ mod tests {
     use std::io::Read;
     use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::thread;
 
@@ -1577,6 +1594,116 @@ mod tests {
             .handle_ack(AudioHostAck::ChunkAccepted { sequence: 1 })
             .unwrap();
         worker.join().unwrap().unwrap();
+    }
+
+    fn remote(stream_after: Option<usize>) -> (Arc<RemotePcmAudioOutput>, UnixStream) {
+        let (child, host) = UnixStream::pair().unwrap();
+        let transport = unsafe { AudioPipeTransport::from_raw_fd(child.into_raw_fd()) }.unwrap();
+        let spec = TtsPcmSpec {
+            sample_rate: 24_000,
+            playback_rate: 1.0,
+        };
+        let output = RemotePcmAudioOutput::new(
+            7,
+            spec,
+            Arc::new(transport),
+            Arc::new(AtomicBool::new(true)),
+            mpsc::channel().0,
+        )
+        .unwrap();
+        (
+            Arc::new(match stream_after {
+                Some(frames) => output.streaming_after(frames),
+                None => output,
+            }),
+            host,
+        )
+    }
+
+    /// The longest silence, in milliseconds, between the first sound and the last that a host playing in real time hears from `output`, as each of `deltas` (its frames, and the millisecond it arrives) is written to it.
+    fn longest_gap(
+        (output, mut host): (Arc<RemotePcmAudioOutput>, UnixStream),
+        deltas: &[(usize, u64)],
+    ) -> f64 {
+        start(&output, &mut host);
+        let now = Arc::new(AtomicU64::new(0));
+        let arrivals = Arc::new(Mutex::new(Vec::<(u64, usize)>::new()));
+        let player = {
+            let (output, now, arrivals) =
+                (Arc::clone(&output), Arc::clone(&now), Arc::clone(&arrivals));
+            thread::spawn(move || loop {
+                let (kind, payload) = read_record(&mut host);
+                if kind == AUDIO_END_KIND {
+                    return;
+                }
+                assert_eq!(kind, AUDIO_CHUNK_KIND);
+                arrivals
+                    .lock()
+                    .unwrap()
+                    .push((now.load(Ordering::SeqCst), (payload.len() - 16) / 4));
+                let sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+                output
+                    .handle_ack(AudioHostAck::ChunkAccepted { sequence })
+                    .unwrap();
+            })
+        };
+        // When each chunk the host was sent starts and stops playing, and its frames.
+        let played = || {
+            let arrivals = arrivals.lock().unwrap();
+            arrivals
+                .iter()
+                .scan(0.0, |end: &mut f64, &(at, frames)| {
+                    let start = end.max(at as f64);
+                    *end = start + frames as f64 / 24.0;
+                    Some((start, *end, frames as u64))
+                })
+                .collect::<Vec<_>>()
+        };
+        for &(frames, at) in deltas {
+            now.store(at, Ordering::SeqCst);
+            let done = played()
+                .iter()
+                .filter(|(_, end, _)| *end <= at as f64)
+                .map(|(_, _, frames)| frames)
+                .sum();
+            if done > output.played_frames() {
+                output
+                    .handle_ack(AudioHostAck::Played {
+                        played_frames: done,
+                    })
+                    .unwrap();
+            }
+            output.write(&vec![0.25; frames]).unwrap();
+        }
+        output.finish_writes().unwrap();
+        player.join().unwrap();
+        played()
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].1)
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn streaming_after_a_lead_plays_a_realtime_source_through_a_stall() {
+        // A reply arriving as fast as it plays, in 100 ms deltas, two of them held up until 950 ms.
+        let deltas: Vec<_> = (0..20)
+            .map(|index| {
+                (
+                    2400,
+                    if index == 8 || index == 9 {
+                        950
+                    } else {
+                        index * 100
+                    },
+                )
+            })
+            .collect();
+        let chunked = longest_gap(remote(None), &deltas);
+        assert!(
+            chunked > 100.0,
+            "whole chunks fell silent for only {chunked} ms"
+        );
+        assert_eq!(longest_gap(remote(Some(7200)), &deltas), 0.0);
     }
 
     #[test]
