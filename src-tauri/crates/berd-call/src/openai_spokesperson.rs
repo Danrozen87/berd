@@ -500,7 +500,8 @@ async fn run_inner(
     let mut cancellation_events = HashMap::<String, String>::new();
     let mut pending_truncations = HashMap::<(String, u64), PendingTruncation>::new();
     let mut pending_input_cutover: Option<PendingInputCutover> = None;
-    let mut pending_input_reset: Option<PendingInputReset> = None;
+    // Clears in the order sent; the provider confirms them in that order.
+    let mut pending_input_resets = VecDeque::<PendingInputReset>::new();
     let mut started_input_items = HashSet::<String>::new();
     let mut committed_input_items = HashSet::<String>::new();
     let mut seed_turns = VecDeque::from(std::mem::take(&mut config.semantic_transcript));
@@ -536,7 +537,7 @@ async fn run_inner(
         let cutover_deadline = pending_input_cutover
             .as_ref()
             .map(|cutover| cutover.deadline);
-        let reset_deadline = pending_input_reset.as_ref().map(|reset| reset.deadline);
+        let reset_deadline = pending_input_resets.front().map(|reset| reset.deadline);
         tokio::select! {
             _ = async {
                 match shutdown_not_before {
@@ -561,11 +562,11 @@ async fn run_inner(
                     None => std::future::pending().await,
                 }
             }, if reset_deadline.is_some() => {
-                if pending_input_reset
-                    .as_ref()
+                if pending_input_resets
+                    .front()
                     .is_some_and(|reset| tokio::time::Instant::now() >= reset.deadline)
                 {
-                    let reset = pending_input_reset.take().expect("expired input reset");
+                    let reset = pending_input_resets.pop_front().expect("expired input reset");
                     let _ = reset.completed.send(Err("Spokesperson input reset timed out".into()));
                     return Err("Spokesperson input reset timed out; provider input state is indeterminate".into());
                 }
@@ -615,7 +616,7 @@ async fn run_inner(
                         })).await?;
                     }
                     Some(SpokespersonCommand::ResetInput { completed }) => {
-                        if pending_input_cutover.is_some() || pending_input_reset.is_some() {
+                        if pending_input_cutover.is_some() {
                             let _ = completed.send(Err(
                                 "another Spokesperson input clear is in progress".into(),
                             ));
@@ -627,7 +628,7 @@ async fn run_inner(
                                 "event_id": event_id,
                                 "type": "input_audio_buffer.clear",
                             })).await?;
-                            pending_input_reset = Some(PendingInputReset {
+                            pending_input_resets.push_back(PendingInputReset {
                                 event_id,
                                 deadline: tokio::time::Instant::now() + CONTROL_ACK_TIMEOUT,
                                 completed,
@@ -648,7 +649,7 @@ async fn run_inner(
                         }
                     }
                     Some(SpokespersonCommand::BeginInputCutover { request_id }) => {
-                        if pending_input_cutover.is_some() || pending_input_reset.is_some() {
+                        if pending_input_cutover.is_some() || !pending_input_resets.is_empty() {
                             return Err("Spokesperson input cutover was requested twice".into());
                         }
                         let event_id = format!("berd-cutover-{next_control_event_id}");
@@ -929,7 +930,7 @@ async fn run_inner(
                                 &committed_input_items,
                                 events,
                             )?;
-                        } else if let Some(reset) = pending_input_reset.take() {
+                        } else if let Some(reset) = pending_input_resets.pop_front() {
                             let _ = reset.completed.send(Ok(()));
                         }
                     }
@@ -1042,11 +1043,9 @@ async fn run_inner(
                     }
                     "error" => {
                         let message = value.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("OpenAI Realtime failed").to_string();
-                        if pending_input_reset.as_ref().is_some_and(|reset| {
-                            value.pointer("/error/event_id").and_then(|value| value.as_str())
-                                == Some(reset.event_id.as_str())
-                        }) {
-                            let reset = pending_input_reset.take().expect("matched input reset");
+                        let event_id = value.pointer("/error/event_id").and_then(|value| value.as_str());
+                        if let Some(index) = pending_input_resets.iter().position(|reset| Some(reset.event_id.as_str()) == event_id) {
+                            let reset = pending_input_resets.remove(index).expect("matched input reset");
                             let _ = reset.completed.send(Err(message));
                         } else if pending_input_cutover.as_ref().is_some_and(|cutover| {
                             value.pointer("/error/event_id").and_then(|value| value.as_str())
@@ -1986,6 +1985,50 @@ mod tests {
         let mut expected = vec![append.clone(); 2 * FRAMES];
         expected.insert(FRAMES, json!("input_audio_buffer.clear"));
         assert_eq!(server.await.unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn input_resets_sent_together_are_each_answered_in_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(stream, require_test_authorization)
+                .await
+                .unwrap();
+            let update = receive_json(&mut socket).await;
+            acknowledge_initial_session(&mut socket, &update, "test-model").await;
+            let first = receive_json(&mut socket).await;
+            let second = receive_json(&mut socket).await;
+            assert_eq!(first["type"], "input_audio_buffer.clear");
+            assert_eq!(second["type"], "input_audio_buffer.clear");
+            send_json(
+                &mut socket,
+                json!({"type":"error","error":{"message":"refused","event_id":second["event_id"]}}),
+            )
+            .await;
+            send_json(&mut socket, json!({"type":"input_audio_buffer.cleared"})).await;
+            let _ = socket.next().await;
+        });
+        let (runtime, events) =
+            OpenAiSpokespersonRuntime::spawn(test_config(endpoint, "test-voice", 1.0, Vec::new()))
+                .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SpokespersonEvent::Ready
+        ));
+        let first = runtime.reset_input().unwrap();
+        let second = runtime.reset_input().unwrap();
+        let wait = |reset: std::sync::mpsc::Receiver<Result<(), String>>| {
+            reset.recv_timeout(Duration::from_secs(2)).unwrap()
+        };
+        let (first, second) = tokio::task::spawn_blocking(move || (wait(first), wait(second)))
+            .await
+            .unwrap();
+        assert_eq!(first, Ok(()));
+        assert_eq!(second, Err("refused".into()));
+        runtime.finish().unwrap();
+        server.await.unwrap();
     }
 
     #[test]
