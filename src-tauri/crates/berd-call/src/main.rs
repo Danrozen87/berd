@@ -3161,30 +3161,63 @@ fn spokesperson_pcm_allowed(
             && input_policy.policy == berd_call::input::InputDuringTtsPolicy::SuppressInput)
 }
 
-fn set_spokesperson_input_muted(
-    id: u64,
-    muted: bool,
-    input_muted: &mut bool,
-    mut reset_input: impl FnMut() -> Result<(), String>,
-    writer: &mut impl Write,
-) -> Result<(), String> {
-    *input_muted = muted;
-    if muted {
-        reset_input()?;
-    }
-    write_message(
-        writer,
-        &SessionMessage::InputMuteApplied { id, active: muted },
-    )
+/// Input controls waiting on the provider to clear its input buffer, so microphone audio keeps flowing meanwhile.
+/// Controls answer in order once no clear is outstanding; one that needs a clear while another is outstanding gets the next.
+#[derive(Default)]
+struct InputResets {
+    clearing: Option<Receiver<Result<(), String>>>,
+    again: bool,
+    replies: Vec<SessionMessage>,
 }
 
-fn reset_spokesperson_input(
-    id: u64,
-    mut reset_input: impl FnMut() -> Result<(), String>,
-    writer: &mut impl Write,
-) -> Result<(), String> {
-    reset_input()?;
-    write_message(writer, &SessionMessage::InputResetApplied { id })
+impl InputResets {
+    fn idle(&self) -> bool {
+        self.clearing.is_none()
+    }
+
+    fn apply(
+        &mut self,
+        reply: SessionMessage,
+        clear: bool,
+        reset_input: impl FnOnce() -> Result<Receiver<Result<(), String>>, String>,
+        writer: &mut impl Write,
+    ) -> Result<(), String> {
+        if self.idle() {
+            if !clear {
+                return write_message(writer, &reply);
+            }
+            self.clearing = Some(reset_input()?);
+        } else {
+            self.again |= clear;
+        }
+        self.replies.push(reply);
+        Ok(())
+    }
+
+    fn poll(
+        &mut self,
+        reset_input: impl FnOnce() -> Result<Receiver<Result<(), String>>, String>,
+        writer: &mut impl Write,
+    ) -> Result<(), String> {
+        let Some(clearing) = &self.clearing else {
+            return Ok(());
+        };
+        match clearing.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("Spokesperson runtime is closed".into())
+            }
+            Ok(result) => result?,
+        }
+        if std::mem::take(&mut self.again) {
+            self.clearing = Some(reset_input()?);
+            return Ok(());
+        }
+        self.clearing = None;
+        self.replies
+            .drain(..)
+            .try_for_each(|reply| write_message(writer, &reply))
+    }
 }
 
 fn set_spokesperson_input_policy(
@@ -3377,12 +3410,17 @@ fn run_expert_spokesperson_session(
     let mut session_tts: Option<berd_call::TtsConfigurationSnapshot> = None;
     let mut input_during_tts_slot: Option<InputDuringTtsSlot> = None;
     let mut input_muted = false;
+    let mut input_resets = InputResets::default();
     let mut queued_tts_settings = VoiceUpdateQueue::<PendingSpokespersonSettingsUpdate>::default();
     let mut pending_voice_update: Option<VoiceUpdateTransaction> = None;
     let mut status_sound_runtime = StatusSoundRuntime::default();
 
     loop {
         if initialized {
+            input_resets.poll(
+                || runtime.as_ref().expect("initialized runtime").reset_input(),
+                &mut writer,
+            )?;
             let work = spokesperson_host_work(
                 &turn_gate,
                 active.as_ref(),
@@ -3415,7 +3453,11 @@ fn run_expert_spokesperson_session(
                 )?);
             }
         }
-        if let Some(update) = pending_voice_update.as_ref() {
+        // A voice change waits for input resets, which clear the same provider input buffer it does.
+        if let Some(update) = pending_voice_update
+            .as_ref()
+            .filter(|_| input_resets.idle())
+        {
             let work = spokesperson_host_work(
                 &turn_gate,
                 active.as_ref(),
@@ -4965,10 +5007,10 @@ fn run_expert_spokesperson_session(
                         &mut writer,
                     )?;
                 }
-                set_spokesperson_input_muted(
-                    id,
+                input_muted = muted;
+                input_resets.apply(
+                    SessionMessage::InputMuteApplied { id, active: muted },
                     muted,
-                    &mut input_muted,
                     || runtime.as_ref().expect("initialized runtime").reset_input(),
                     &mut writer,
                 )?;
@@ -4983,8 +5025,9 @@ fn run_expert_spokesperson_session(
                         &mut writer,
                     )?;
                 }
-                reset_spokesperson_input(
-                    id,
+                input_resets.apply(
+                    SessionMessage::InputResetApplied { id },
+                    true,
                     || runtime.as_ref().expect("initialized runtime").reset_input(),
                     &mut writer,
                 )?;
@@ -9013,31 +9056,104 @@ mod tests {
     }
 
     #[test]
-    fn spokesperson_input_controls_are_nonfatal_revisioned_and_gate_pcm() {
-        let mut muted = false;
-        let mut reset_count = 0;
+    fn input_controls_answer_in_order_once_the_provider_has_cleared_their_input() {
+        let clears = std::cell::RefCell::new(Vec::new());
+        let reset_input = || {
+            let (completed, result) = mpsc::sync_channel(1);
+            clears.borrow_mut().push(completed);
+            Ok(result)
+        };
+        let mut resets = InputResets::default();
         let mut output = Vec::new();
-        set_spokesperson_input_muted(
-            1,
-            true,
-            &mut muted,
-            || {
-                reset_count += 1;
-                Ok(())
-            },
-            &mut output,
-        )
-        .unwrap();
-        reset_spokesperson_input(
-            2,
-            || {
-                reset_count += 1;
-                Ok(())
-            },
-            &mut output,
-        )
-        .unwrap();
+        resets
+            .apply(
+                SessionMessage::InputMuteApplied {
+                    id: 1,
+                    active: true,
+                },
+                true,
+                reset_input,
+                &mut output,
+            )
+            .unwrap();
+        resets
+            .apply(
+                SessionMessage::InputResetApplied { id: 2 },
+                true,
+                reset_input,
+                &mut output,
+            )
+            .unwrap();
+        resets
+            .apply(
+                SessionMessage::InputMuteApplied {
+                    id: 3,
+                    active: false,
+                },
+                false,
+                reset_input,
+                &mut output,
+            )
+            .unwrap();
+        resets.poll(reset_input, &mut output).unwrap();
+        assert_eq!(clears.borrow().len(), 1);
+        assert!(output.is_empty());
 
+        // The reset asked for during the first clear needs a clear of its own.
+        clears.borrow()[0].send(Ok(())).unwrap();
+        resets.poll(reset_input, &mut output).unwrap();
+        assert_eq!(clears.borrow().len(), 2);
+        assert!(output.is_empty());
+        clears.borrow()[1].send(Ok(())).unwrap();
+        resets.poll(reset_input, &mut output).unwrap();
+        assert!(resets.idle());
+        assert_eq!(
+            messages(&output),
+            [
+                json!({"type":"input_mute_applied","id":1,"active":true}),
+                json!({"type":"input_reset_applied","id":2}),
+                json!({"type":"input_mute_applied","id":3,"active":false}),
+            ]
+        );
+
+        output.clear();
+        resets
+            .apply(
+                SessionMessage::InputMuteApplied {
+                    id: 4,
+                    active: false,
+                },
+                false,
+                reset_input,
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(clears.borrow().len(), 2);
+        assert_eq!(
+            messages(&output),
+            [json!({"type":"input_mute_applied","id":4,"active":false})]
+        );
+
+        resets
+            .apply(
+                SessionMessage::InputResetApplied { id: 5 },
+                true,
+                reset_input,
+                &mut output,
+            )
+            .unwrap();
+        clears.borrow()[2]
+            .send(Err("provider refused".into()))
+            .unwrap();
+        assert_eq!(
+            resets.poll(reset_input, &mut output).unwrap_err(),
+            "provider refused"
+        );
+    }
+
+    #[test]
+    fn spokesperson_input_policy_is_nonfatal_revisioned_and_gates_pcm() {
+        let mut output = Vec::new();
         let slot = InputDuringTtsSlot::new(InputDuringTtsPolicy::AllowBargeIn);
         set_spokesperson_input_policy(
             3,
@@ -9050,8 +9166,6 @@ mod tests {
         set_spokesperson_input_policy(4, 1, InputDuringTtsPolicy::AllowBargeIn, &slot, &mut output)
             .unwrap();
 
-        assert!(muted);
-        assert_eq!(reset_count, 2);
         assert!(!spokesperson_pcm_allowed(
             false,
             true,
@@ -9068,15 +9182,10 @@ mod tests {
             slot.snapshot().unwrap()
         ));
         let messages = messages(&output);
-        assert_eq!(
-            messages[0],
-            json!({"type":"input_mute_applied","id":1,"active":true})
-        );
-        assert_eq!(messages[1], json!({"type":"input_reset_applied","id":2}));
-        assert_eq!(messages[2]["outcome"], "applied");
-        assert_eq!(messages[2]["snapshot"]["revision"], 2);
-        assert_eq!(messages[3]["outcome"], "rejected");
-        assert_eq!(messages[3]["snapshot"]["revision"], 2);
+        assert_eq!(messages[0]["outcome"], "applied");
+        assert_eq!(messages[0]["snapshot"]["revision"], 2);
+        assert_eq!(messages[1]["outcome"], "rejected");
+        assert_eq!(messages[1]["snapshot"]["revision"], 2);
     }
 
     #[test]

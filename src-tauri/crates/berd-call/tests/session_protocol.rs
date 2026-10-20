@@ -2217,6 +2217,71 @@ fn voice_cutover_pcm_overflow_rolls_back_every_frame_to_the_old_runtime() {
     server.join().unwrap();
 }
 
+/// The host resets input whenever it restarts the microphone, as when the output device changes, and keeps sending audio while the provider confirms.
+#[test]
+fn microphone_audio_keeps_flowing_while_the_provider_confirms_an_input_reset() {
+    const FRAMES: usize = 40;
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (clear_seen_tx, clear_seen_rx) = mpsc::sync_channel(1);
+    let (appended_tx, appended_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let update = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &update).await;
+                let clear = receive_realtime_json(&mut socket).await;
+                assert_eq!(clear["type"], "input_audio_buffer.clear");
+                clear_seen_tx.send(()).unwrap();
+                // Longer than the session can buffer microphone audio.
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                send_realtime_json(&mut socket, json!({"type":"input_audio_buffer.cleared"})).await;
+                let mut appended = 0;
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["type"] == "input_audio_buffer.append"
+                        && BASE64
+                            .decode(message["audio"].as_str().unwrap())
+                            .unwrap()
+                            .iter()
+                            .any(|sample| *sample != 0)
+                    {
+                        appended += 1;
+                    }
+                }
+                appended_tx.send(appended).unwrap();
+            });
+    });
+    let endpoint = endpoint_rx.recv().unwrap();
+    let mut session = ExpertSpokespersonTestSession::start(endpoint);
+    session.send(json!({"type":"reset_input","id":3}));
+    clear_seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    for _ in 0..FRAMES {
+        session.send_pcm(0.25);
+        session.flush();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        session.recv(Duration::from_secs(3)),
+        json!({"type":"input_reset_applied","id":3})
+    );
+    let messages = session.shutdown_and_collect();
+    assert!(
+        messages.iter().all(|message| message["type"] != "fatal"),
+        "{messages:?}"
+    );
+    server.join().unwrap();
+    assert_eq!(appended_rx.recv().unwrap(), FRAMES);
+}
+
 #[test]
 fn reset_input_during_voice_cutover_rolls_back_then_clears_the_old_runtime() {
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
