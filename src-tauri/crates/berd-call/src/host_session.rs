@@ -519,6 +519,7 @@ enum ControlCommand {
         resolved_handoff_ids: Vec<String>,
         voice: Option<String>,
         language: Option<String>,
+        relay: bool,
         non_blocking: bool,
         response: SyncSender<Result<Value, String>>,
     },
@@ -743,6 +744,7 @@ impl HostControl for SessionControl {
         resolved_handoff_ids: Vec<String>,
         voice: Option<String>,
         language: Option<String>,
+        relay: bool,
     ) -> Result<Value, String> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
@@ -752,6 +754,7 @@ impl HostControl for SessionControl {
                 resolved_handoff_ids,
                 voice,
                 language,
+                relay,
                 non_blocking: self.non_blocking.load(Ordering::SeqCst),
                 response: tx,
             })
@@ -1100,6 +1103,7 @@ impl SessionActor {
                 resolved_handoff_ids,
                 voice,
                 language,
+                relay,
                 non_blocking,
                 response,
             } => {
@@ -1114,6 +1118,7 @@ impl SessionActor {
                         resolved_handoff_ids,
                         voice,
                         language,
+                        relay,
                         non_blocking,
                         response,
                     });
@@ -1129,6 +1134,7 @@ impl SessionActor {
                         resolved_handoff_ids,
                         voice,
                         language,
+                        relay,
                     },
                 )?;
                 self.pending_speak = Some(PendingSpeak {
@@ -3371,6 +3377,7 @@ mod tests {
                 resolved_handoff_ids: Vec::new(),
                 voice: None,
                 language: None,
+                relay: false,
                 non_blocking: true,
                 response: next_tx,
             })

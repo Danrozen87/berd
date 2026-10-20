@@ -561,10 +561,28 @@ fn main() {
                     resolved_handoff_ids,
                     voice,
                     language,
+                    relay: false,
                 },
             )
             .unwrap_or_else(|error| operational_error("speak", error));
             print_pretty_json(&response).unwrap_or_else(|error| operational_error("speak", error));
+        }
+        Some("message-spokesperson") => {
+            let (port, text) = parse_or_exit(parse_message_spokesperson_args(&args), &args);
+            let response = host_control::request(
+                port,
+                host_control::ControlRequest::Speak {
+                    text,
+                    acknowledgement: None,
+                    resolved_handoff_ids: Vec::new(),
+                    voice: None,
+                    language: None,
+                    relay: true,
+                },
+            )
+            .unwrap_or_else(|error| operational_error("message-spokesperson", error));
+            print_pretty_json(&response)
+                .unwrap_or_else(|error| operational_error("message-spokesperson", error));
         }
         Some("status") => {
             let port = parse_or_exit(parse_control_port(&args), &args);
@@ -1029,6 +1047,18 @@ fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailur
         language,
         text,
     })
+}
+
+/// `message-spokesperson` takes only a port and the text.
+fn parse_message_spokesperson_args(args: &[String]) -> Result<(u16, String), ParseFailure> {
+    let options = parse_speak_control_args(args)?;
+    if options.acknowledgement.is_some()
+        || !options.resolved_handoff_ids.is_empty()
+        || options.voice.is_some()
+    {
+        return Err("message-spokesperson accepts only --port PORT and TEXT".into());
+    }
+    Ok((options.port, options.text))
 }
 
 fn parse_host_settings_args(
@@ -2417,6 +2447,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                 resolved_handoff_ids: _,
                 voice,
                 language,
+                relay: _,
             }) => {
                 let request = PrepareRequest {
                     id,
@@ -2740,6 +2771,8 @@ struct PendingExpertPrepare {
     resolved_handoff_ids: Vec<String>,
     /// The Expert's voice for this reply, when not its usual one.
     voice: Option<TtsConfigurationLease>,
+    /// The Spokesperson says it, even when the Expert has its own voice.
+    relay: bool,
 }
 
 struct PendingSpokespersonSettingsUpdate {
@@ -3229,8 +3262,8 @@ fn spokesperson_voice_update_is_safe(
     gate: &ExpertTurnGate,
     work: RealtimeHostWork,
 ) -> bool {
-    // A reply in the Expert's own voice waits for the replacement, and adds
-    // nothing to what it was given.
+    // When the Expert has its own voice, a held reply waits for the
+    // replacement, and adds nothing to what it was given.
     let work = RealtimeHostWork {
         pending_expert_prepare: work.pending_expert_prepare && !expert_tts,
         ..work
@@ -4471,6 +4504,7 @@ fn run_expert_spokesperson_session(
                 resolved_handoff_ids,
                 voice,
                 language,
+                relay,
             }) => {
                 let Some(voice) =
                     speak_voice(reply_tts.as_deref(), voice, language, id, &mut writer)?
@@ -4483,6 +4517,7 @@ fn run_expert_spokesperson_session(
                     text,
                     resolved_handoff_ids,
                     voice,
+                    relay,
                 };
                 let routing = route_expert_prepare(
                     &mut turn_gate,
@@ -5202,8 +5237,8 @@ fn submit_expert_prepare(
     next_speech_id: &mut u64,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    // A reply in the Expert's own voice answers every open handoff, so the
-    // ones it names don't matter.
+    // When the Expert has its own voice, any reply answers every open
+    // handoff, so the ones it names don't matter.
     if !expert_tts
         && !core
             .unknown_handoff_ids(&request.resolved_handoff_ids)
@@ -5245,7 +5280,7 @@ fn submit_expert_prepare(
             let speech_id = *next_speech_id;
             *next_speech_id += 1;
             core.record_expert_turn(message.clone());
-            if expert_tts {
+            if expert_tts && !request.relay {
                 // Played in turn with the Spokesperson's responses, without one of its own,
                 // once the parent is ready for its output.
                 let response_id = format!("expert-reply-{speech_id}");
@@ -5258,7 +5293,12 @@ fn submit_expert_prepare(
                 response.server_finished = true;
                 responses.insert(response_id, response);
             } else {
-                let resolved_handoff_ids = request.resolved_handoff_ids;
+                // A relayed reply already answered every handoff when admitted.
+                let resolved_handoff_ids = if expert_tts {
+                    Vec::new()
+                } else {
+                    request.resolved_handoff_ids
+                };
                 core.mark_handoffs_resolving(&resolved_handoff_ids)?;
                 directive_speeches.insert(
                     request.id,
@@ -8506,6 +8546,7 @@ mod tests {
             text: "answer".into(),
             resolved_handoff_ids: Vec::new(),
             voice: None,
+            relay: false,
         };
         assert!(matches!(
             gate.defer_if_busy(request, false, 1),
@@ -8546,6 +8587,7 @@ mod tests {
                     text: "first".into(),
                     resolved_handoff_ids: Vec::new(),
                     voice: None,
+                    relay: false,
                 },
                 false,
                 1,
@@ -8560,6 +8602,7 @@ mod tests {
                     text: "second".into(),
                     resolved_handoff_ids: Vec::new(),
                     voice: None,
+                    relay: false,
                 },
                 false,
                 1,
@@ -8591,6 +8634,7 @@ mod tests {
                 text: "second".into(),
                 resolved_handoff_ids: Vec::new(),
                 voice: None,
+                relay: false,
             },
             expert_output_reserved(&directives, &HashSet::new(), None, &responses),
             false,
@@ -9118,6 +9162,7 @@ mod tests {
                     text: "answer after the user".into(),
                     resolved_handoff_ids: Vec::new(),
                     voice: None,
+                    relay: false,
                 },
                 false,
                 1,
@@ -11551,6 +11596,7 @@ mod tests {
             resolved_handoff_ids: vec!["  ".into()],
             voice: None,
             language: None,
+            relay: false,
         };
         assert_eq!(
             validate_request(empty).unwrap_err(),
@@ -12752,6 +12798,25 @@ mod tests {
                 text: "hello".into(),
             }
         );
+        assert_eq!(
+            parse_message_spokesperson_args(&args(&[
+                "berd-call",
+                "message-spokesperson",
+                "--port",
+                "5300",
+                "Tell them it's fixed."
+            ]))
+            .unwrap(),
+            (5300, "Tell them it's fixed.".into())
+        );
+        assert!(parse_message_spokesperson_args(&args(&[
+            "berd-call",
+            "message-spokesperson",
+            "--voice",
+            "Nora",
+            "hello"
+        ]))
+        .is_err());
         assert!(parse_speak_control_args(&args(&[
             "berd-call",
             "speak",

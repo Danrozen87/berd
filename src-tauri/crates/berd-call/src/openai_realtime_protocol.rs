@@ -1587,9 +1587,10 @@ impl RealtimeExpertSpokespersonSession {
         })
     }
 
-    /// Prepares an Expert reply spoken in its own voice: it is admitted
-    /// however much was said since it was written, and answers every open
-    /// handoff.
+    /// Prepares an Expert reply in a call where the Expert has its own voice,
+    /// whether it speaks the reply or the Spokesperson relays it: it is
+    /// admitted however much was said since it was written, and answers
+    /// every open handoff.
     pub fn prepare_expert_reply(&mut self, message: String) -> ExpertDirectiveOutcome {
         let outcome = self.conversation.prepare_directive(ExpertDirective {
             acknowledgement: Some(self.conversation.delivered_token()),
