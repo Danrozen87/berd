@@ -2699,7 +2699,7 @@ type LivePlaybackResult = Result<(String, u64), (String, u64, String)>;
 enum ReplyOutcome {
     Completed,
     Interrupted { spoken_through_utf8: u64 },
-    Failed(String),
+    Failed(PlaybackFailure),
 }
 
 type ReplyResult = (String, u64, ReplyOutcome);
@@ -4141,6 +4141,7 @@ fn run_expert_spokesperson_session(
                 .prepare_id
                 .expect("an Expert reply has a prepare ID");
             let text = response.expert_text.take().unwrap_or_default();
+            let mut output_quiescent = true;
             let (message, heard) = match outcome {
                 ReplyOutcome::Completed => (
                     SessionMessage::SpeechCompleted { id, speech_id },
@@ -4156,14 +4157,17 @@ fn run_expert_spokesperson_session(
                     },
                     usize::try_from(spoken_through_utf8).unwrap_or(text.len()),
                 ),
-                ReplyOutcome::Failed(message) => (
-                    SessionMessage::SpeechFailed {
-                        id,
-                        speech_id,
-                        message,
-                    },
-                    0,
-                ),
+                ReplyOutcome::Failed(failure) => {
+                    output_quiescent = failure.output_quiescent;
+                    (
+                        SessionMessage::SpeechFailed {
+                            id,
+                            speech_id,
+                            message: failure.message,
+                        },
+                        0,
+                    )
+                }
             };
             let heard = (0..=heard.min(text.len()))
                 .rev()
@@ -4172,6 +4176,9 @@ fn run_expert_spokesperson_session(
             let interrupted = heard < text.len();
             if response.claim_speech_terminal() {
                 write_message(&mut writer, &message)?;
+            }
+            if !output_quiescent {
+                return Err("remote PCM output did not reach a quiescent terminal".into());
             }
             finish_expert_reply(
                 &mut core,
@@ -4995,7 +5002,7 @@ fn spawn_reply_playback(
                 spoken_through_utf8: u64::try_from(estimated_spoken_through_utf8(&text, &delivery))
                     .expect("speech text is bounded well below u64"),
             },
-            Err(failure) => ReplyOutcome::Failed(failure.message),
+            Err(failure) => ReplyOutcome::Failed(failure),
         };
         let _ = completed.send((worker_response_id, speech_id, outcome));
     });

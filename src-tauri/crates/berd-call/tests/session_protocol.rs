@@ -38,6 +38,8 @@ struct ExpertSpokespersonTestSession {
 struct AudioCancellationGate {
     observed: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
+    /// Hold the drain instead, as a hung host would, without reading anything after it.
+    at_drain: bool,
 }
 
 impl ExpertSpokespersonTestSession {
@@ -391,6 +393,11 @@ fn spawn_audio_host_with_played_limit(
                     let frames = u64::from_le_bytes(payload[16..24].try_into().unwrap());
                     assert_eq!(current, Some((speech_id, sequence, frames)));
                     current = None;
+                    if let Some(gate) = cancellation_gate.take_if(|gate| gate.at_drain) {
+                        let _ = gate.observed.send(());
+                        let _ = gate.release.recv();
+                        return;
+                    }
                     json!({"type":"audio_drained","speech_id":speech_id,"sequence":sequence,"played_frames":frames})
                 }
                 4 => {
@@ -949,6 +956,7 @@ fn autonomous_spokesperson_cancel_is_correlated_before_audio_cancellation_and_th
         Some(AudioCancellationGate {
             observed: cancel_observed_tx,
             release: release_cancel_rx,
+            at_drain: false,
         }),
     );
     let started = loop {
@@ -2784,6 +2792,75 @@ fn expert_voice_keeps_a_separate_spokesperson_voice_control() {
     assert_eq!(applied["snapshot"]["voice"], "new-voice");
     session.shutdown();
     server.join().unwrap();
+}
+
+#[test]
+fn expert_voice_reply_whose_audio_never_settles_ends_the_session() {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                while socket.next().await.is_some() {}
+            });
+    });
+    let (observed, cancel_observed) = mpsc::sync_channel(1);
+    let (release_cancel, release) = mpsc::sync_channel(1);
+    // The host never confirms the drain, nor the cancellation that follows it.
+    let mut session = ExpertSpokespersonTestSession::launch(
+        endpoint_rx.recv().unwrap(),
+        None,
+        None,
+        None,
+        Some(AudioCancellationGate {
+            observed,
+            release,
+            at_drain: true,
+        }),
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":null,
+        "text":"I checked the repository."
+    }));
+    let admitted = session.recv(Duration::from_secs(2));
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    session.send(json!({"type":"output_ready","id":2,"speech_id":admitted["speech_id"]}));
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut messages = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_else(|| panic!("the session went on: {messages:?}"));
+        match session.output.recv_timeout(remaining) {
+            Ok(message) => messages.push(message),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("the session went on: {messages:?}"),
+        }
+    }
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["type"] == "speech_failed" && message["id"] == 2),
+        "the reply did not fail: {messages:?}"
+    );
+    let status = session.child.0.as_mut().unwrap().wait().unwrap();
+    assert!(!status.success());
+    cancel_observed.try_recv().unwrap();
+    release_cancel.send(()).unwrap();
 }
 
 #[test]
