@@ -9753,6 +9753,7 @@ mod tests {
                 resolved_handoff_ids: Vec::new(),
                 voice: Some(voice.into()),
                 language: None,
+                relay: false,
             })
         };
         let next = || {
