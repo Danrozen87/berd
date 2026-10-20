@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -39,22 +40,25 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
     let port = options.port;
     thread::Builder::new()
         .name("berd-call-session".into())
-        .spawn(move || {
-            let code = match crate::host_session::run(options) {
-                Ok(()) => 0,
-                Err(error) => {
-                    eprintln!("berd-call start failed: {error}");
-                    1
-                }
-            };
-            std::process::exit(code);
-        })
+        .spawn(move || std::process::exit(exit_code(|| crate::host_session::run(options))))
         .map_err(|error| format!("could not start the voice call: {error}"))?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let _menu_bar = MenuBar::install(mtm, port);
     app.run();
     Ok(())
+}
+
+/// The call's exit status, so that even a panic ends the process rather than leaving the menu bar without its call.
+fn exit_code(run: impl FnOnce() -> Result<(), String>) -> i32 {
+    match panic::catch_unwind(AssertUnwindSafe(run)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            eprintln!("berd-call start failed: {error}");
+            1
+        }
+        Err(_) => 101,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,6 +583,11 @@ fn begin_menu_action(
             });
         }
         Err(error) => {
+            // Nothing is listening, so nothing else can end this call.
+            if domain == ActionDomain::Stop {
+                eprintln!("berd-call: {error}; ending the call here");
+                std::process::exit(1);
+            }
             let _ = results.send((generation, domain, Err(error.clone())));
             if let Ok(mut state) = state.lock() {
                 state.action_error = Some(error);
@@ -652,6 +661,81 @@ fn apply_catalog_result(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Runs `test` again in a child process with `BERD_CALL_MENU_CHILD` set, returning its exit status, or `None` if it was
+    /// still running after five seconds.
+    fn child_exit(test: &str) -> Option<i32> {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("menu_bar::tests::{test}"),
+                "--test-threads=1",
+            ])
+            .env("BERD_CALL_MENU_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.code();
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        None
+    }
+
+    fn in_child() -> bool {
+        std::env::var_os("BERD_CALL_MENU_CHILD").is_some()
+    }
+
+    #[test]
+    fn a_call_that_panics_ends_its_process_with_a_failure() {
+        if in_child() {
+            // As in `run`: the call's worker ends the process while the main thread stays busy with the menu bar.
+            thread::spawn(|| std::process::exit(exit_code(|| panic!("session worker panicked"))));
+            loop {
+                thread::park();
+            }
+        }
+        assert_eq!(
+            child_exit("a_call_that_panics_ends_its_process_with_a_failure"),
+            Some(101)
+        );
+        assert_eq!(exit_code(|| Err("no microphone".into())), 1);
+        assert_eq!(exit_code(|| Ok(())), 0);
+    }
+
+    #[test]
+    fn end_call_ends_its_process_when_the_control_port_is_gone() {
+        if in_child() {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let (results, _completed) = mpsc::channel();
+            let state = Mutex::new(MenuState::default());
+            begin_menu_action(
+                port,
+                ControlRequest::Stop,
+                1,
+                ActionDomain::Stop,
+                &results,
+                &state,
+            );
+            loop {
+                thread::park();
+            }
+        }
+        assert_eq!(
+            child_exit("end_call_ends_its_process_when_the_control_port_is_gone"),
+            Some(1)
+        );
+    }
 
     #[test]
     fn recovered_catalog_clears_its_error() {
