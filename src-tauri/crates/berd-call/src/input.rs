@@ -2152,6 +2152,51 @@ mod tests {
         VoiceInputFrame::try_from_samples(&[0.0; INPUT_FRAME_SAMPLES]).unwrap()
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "changes the default output; requires SwitchAudioSource and BlackHole 2ch"]
+    fn native_auto_mute_follows_default_output_during_speech() {
+        fn output(args: &[&str]) -> String {
+            let result = std::process::Command::new("SwitchAudioSource")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        }
+        struct RestoreOutput(String);
+        impl Drop for RestoreOutput {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("SwitchAudioSource")
+                    .args(["-s", &self.0, "-t", "output"])
+                    .output();
+            }
+        }
+        let _restore = RestoreOutput(output(&["-c", "-t", "output"]));
+        let devices = output(&["-a", "-t", "output"]);
+        assert!(devices.contains("MacBook Pro Speakers") && devices.contains("BlackHole 2ch"));
+        let controls = VoiceInputControls::default();
+        let _activity = controls
+            .begin_assistant_activity(0.65, InputDuringTtsPolicy::Auto)
+            .unwrap();
+        for (device, muted) in [
+            ("MacBook Pro Speakers", true),
+            ("BlackHole 2ch", false),
+            ("MacBook Pro Speakers", true),
+        ] {
+            output(&["-s", device, "-t", "output"]);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while controls.is_muted() != muted && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(controls.is_muted(), muted, "Auto did not follow {device}");
+        }
+    }
+
     #[test]
     fn auto_policy_follows_routes_without_overriding_explicit_choices() {
         for (speakers, expected) in [
