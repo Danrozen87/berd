@@ -3285,6 +3285,7 @@ fn queued_spokesperson_settings_are_ready(
     responses: &HashMap<String, LiveResponse>,
     directive_speeches: &HashMap<u64, DirectiveSpeech>,
     cancelled_directives: &HashSet<u64>,
+    expert_tts: bool,
 ) -> bool {
     let work = spokesperson_host_work(
         gate,
@@ -3293,7 +3294,8 @@ fn queued_spokesperson_settings_are_ready(
         directive_speeches,
         cancelled_directives,
     );
-    gate.lifecycle.queued_settings_are_ready(work)
+    // A held directive would make the change unsafe, so it goes first.
+    !(work.pending_expert_prepare && !expert_tts) && gate.lifecycle.queued_settings_are_ready(work)
 }
 
 fn validate_queued_spokesperson_settings(
@@ -3539,6 +3541,7 @@ fn run_expert_spokesperson_session(
             &responses,
             &directive_speeches,
             &cancelled_directives,
+            reply_tts.is_some(),
         );
         if let Some(request) =
             queued_tts_settings.take_ready(pending_voice_update.is_some(), queued_settings_ready)
@@ -4374,7 +4377,7 @@ fn run_expert_spokesperson_session(
             if let Some(request) = turn_gate.take_ready(
                 active.is_some()
                     || pending_voice_update.is_some()
-                    || queued_tts_settings.is_pending(),
+                    || reply_tts.is_some() && queued_tts_settings.is_pending(),
                 responses.len(),
             ) {
                 submit_expert_prepare(
@@ -4614,7 +4617,8 @@ fn run_expert_spokesperson_session(
                         active.as_ref(),
                         &responses,
                     ),
-                    pending_voice_update.is_some() || queued_tts_settings.is_pending(),
+                    pending_voice_update.is_some()
+                        || reply_tts.is_some() && queued_tts_settings.is_pending(),
                     active.is_some(),
                     responses.len(),
                 );

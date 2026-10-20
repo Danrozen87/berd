@@ -1756,6 +1756,75 @@ fn a_spokesperson_rate_change_the_user_overtook_is_retried_beside_the_agents_voi
     );
 }
 
+#[test]
+fn a_message_held_for_a_voice_change_is_said_before_the_change_is_retried() {
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (candidate_seen_tx, candidate_seen_rx) = mpsc::sync_channel(1);
+    let (held_tx, held_rx) = mpsc::sync_channel(1);
+    let (first_tx, first_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (old_stream, _) = listener.accept().await.unwrap();
+                let mut old = accept_async(old_stream).await.unwrap();
+                let initial = receive_realtime_json(&mut old).await;
+                acknowledge_realtime_session(&mut old, &initial).await;
+                let (candidate_stream, _) = listener.accept().await.unwrap();
+                let mut candidate = accept_async(candidate_stream).await.unwrap();
+                let update = receive_realtime_json(&mut candidate).await;
+                candidate_seen_tx.send(()).unwrap();
+                tokio::task::spawn_blocking(move || held_rx.recv().unwrap())
+                    .await
+                    .unwrap();
+                acknowledge_realtime_session(&mut candidate, &update).await;
+                let said = async {
+                    while !receive_realtime_json(&mut old)
+                        .await
+                        .to_string()
+                        .contains("I checked the repository.")
+                    {}
+                };
+                let first = tokio::select! {
+                    () = said => "said",
+                    _ = listener.accept() => "retried",
+                };
+                first_tx.send(first).unwrap();
+                while old.next().await.is_some() {}
+            });
+    });
+    let mut session = ExpertSpokespersonTestSession::start(endpoint_rx.recv().unwrap());
+    session.send(json!({
+        "type":"set_tts_settings",
+        "id":2,
+        "expected_revision":1,
+        "settings":{"backend":"openai","model":"test-model","voice":"new-voice","rate":1.0}
+    }));
+    candidate_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    // The message waits for the voice change, and the change can't land while the message waits.
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":3,
+        "acknowledgement":null,
+        "text":"I checked the repository.",
+        "relay":true
+    }));
+    session.flush();
+    held_tx.send(()).unwrap();
+    assert_eq!(
+        first_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+        "said"
+    );
+}
+
 /// Starts a call with `args`, makes the Spokesperson change in `request`, and speaks while its session is being built: the change rolls back, then lands once the call is idle.
 fn retries_a_voice_change_the_user_overtook(args: &[&str], request: Value) {
     let output = request["settings"].clone();
