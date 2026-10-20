@@ -110,6 +110,8 @@ enum Input {
     Request(SessionRequest),
     Pcm(Box<VoiceInputFrame>),
     Invalid(String),
+    /// A speech request whose voice is now built.
+    VoiceBuilt(SessionRequest),
     /// A speech request's voice could not be built.
     VoiceUnavailable {
         id: u64,
@@ -2008,7 +2010,10 @@ fn expert_session_status_cues_suppressed(
 fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String> {
     let (control_tx, control_rx) = mpsc::channel();
     let (pcm_tx, pcm_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
-    let voice_tx = control_tx.clone();
+    let mut voice_builds = VoiceBuilds {
+        controls: control_tx.clone(),
+        pending: HashSet::new(),
+    };
     thread::spawn(move || read_framed_requests(io::stdin().lock(), control_tx, pcm_tx));
     let audio_transport = Arc::new(unsafe { AudioPipeTransport::from_raw_fd(pcm_output_fd)? });
     let (playback_tx, playback_rx) = mpsc::channel();
@@ -2114,7 +2119,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
         ) else {
             continue;
         };
-        let Some(input) = build_voice_later(input, tts_slot.as_ref(), &voice_tx) else {
+        let Some(input) = voice_builds.filter(input, tts_slot.as_ref(), &mut writer)? else {
             continue;
         };
         match input {
@@ -2126,8 +2131,8 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                 }
                 return Ok(());
             }
-            Input::VoiceUnavailable { id, voice, message } => {
-                refuse_voice(id, &voice, &message, &mut writer)?;
+            Input::VoiceBuilt(_) | Input::VoiceUnavailable { .. } => {
+                unreachable!("voice builds are filtered")
             }
             Input::Eof => {
                 if let Some(current) = active.as_mut() {
@@ -3264,7 +3269,10 @@ fn run_expert_spokesperson_session(
 ) -> Result<(), String> {
     let (control_tx, control_rx) = mpsc::channel();
     let (pcm_tx, pcm_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
-    let voice_tx = control_tx.clone();
+    let mut voice_builds = VoiceBuilds {
+        controls: control_tx.clone(),
+        pending: HashSet::new(),
+    };
     thread::spawn(move || read_framed_requests(io::stdin().lock(), control_tx, pcm_tx));
     let audio_transport = Arc::new(unsafe { AudioPipeTransport::from_raw_fd(pcm_output_fd)? });
     let (audio_control_tx, audio_control_rx) = mpsc::channel();
@@ -4258,7 +4266,7 @@ fn run_expert_spokesperson_session(
         ) else {
             continue;
         };
-        let Some(input) = build_voice_later(input, reply_tts.as_ref(), &voice_tx) else {
+        let Some(input) = voice_builds.filter(input, reply_tts.as_ref(), &mut writer)? else {
             continue;
         };
         match input {
@@ -4266,8 +4274,8 @@ fn run_expert_spokesperson_session(
                 write_protocol_fatal(&mut writer, "invalid session input", &message)?;
                 break;
             }
-            Input::VoiceUnavailable { id, voice, message } => {
-                refuse_voice(id, &voice, &message, &mut writer)?;
+            Input::VoiceBuilt(_) | Input::VoiceUnavailable { .. } => {
+                unreachable!("voice builds are filtered")
             }
             Input::Eof => break,
             Input::Request(SessionRequest::Shutdown) => {
@@ -7206,41 +7214,92 @@ fn refuse_voice(
     )
 }
 
-/// Builds a speech request's new voice on a worker, since that can take seconds, so the session
-/// keeps serving audio and input meanwhile; the worker hands the request back once it's built.
-fn build_voice_later(
-    input: Input,
-    slot: Option<&Arc<ConfiguredTtsSlot>>,
-    controls: &mpsc::Sender<OrderedControl>,
-) -> Option<Input> {
-    let (
-        Some(slot),
-        Input::Request(SessionRequest::PrepareSpeak {
-            id,
-            voice: Some(voice),
-            language,
-            ..
-        }),
-    ) = (slot, &input)
-    else {
-        return Some(input);
-    };
-    if slot.has_voice(voice, language.as_deref()) {
-        return Some(input);
+/// Speech requests waiting on a worker to build a voice the session hasn't used yet, since that
+/// can take seconds and the session must keep serving audio and input meanwhile.
+struct VoiceBuilds {
+    controls: mpsc::Sender<OrderedControl>,
+    pending: HashSet<u64>,
+}
+
+impl VoiceBuilds {
+    /// Takes the requests that wait on a voice, and hands each back once its voice is built.
+    fn filter(
+        &mut self,
+        input: Input,
+        slot: Option<&Arc<ConfiguredTtsSlot>>,
+        writer: &mut impl Write,
+    ) -> Result<Option<Input>, String> {
+        match input {
+            Input::VoiceBuilt(request) => {
+                let SessionRequest::PrepareSpeak { id, .. } = request else {
+                    unreachable!("only speech waits on a voice")
+                };
+                Ok(self.pending.remove(&id).then_some(Input::Request(request)))
+            }
+            Input::VoiceUnavailable { id, voice, message } => {
+                if self.pending.remove(&id) {
+                    refuse_voice(id, &voice, &message, writer)?;
+                }
+                Ok(None)
+            }
+            Input::Request(SessionRequest::Cancel { id }) if self.pending.remove(&id) => {
+                write_message(
+                    writer,
+                    &SessionMessage::CancelResult {
+                        id,
+                        outcome: CancelOutcome::Cancelled,
+                        speech_id: None,
+                    },
+                )?;
+                write_message(
+                    writer,
+                    &SessionMessage::NotAdmitted {
+                        id,
+                        reason: NotAdmittedReason::Cancelled,
+                    },
+                )?;
+                Ok(None)
+            }
+            Input::Request(request @ SessionRequest::PrepareSpeak { id, .. }) => {
+                let missing = slot.and_then(|slot| {
+                    missing_voice(slot, &request).map(|voice| (Arc::clone(slot), voice))
+                });
+                let Some((slot, (voice, language))) = missing else {
+                    return Ok(Some(Input::Request(request)));
+                };
+                let controls = self.controls.clone();
+                self.pending.insert(id);
+                thread::spawn(move || {
+                    let input = match slot.lease_voice(&voice, language.as_deref()) {
+                        Ok(_) => Input::VoiceBuilt(request),
+                        Err(message) => Input::VoiceUnavailable { id, voice, message },
+                    };
+                    let _ = controls.send(OrderedControl {
+                        after_pcm: 0,
+                        input,
+                    });
+                });
+                Ok(None)
+            }
+            input => Ok(Some(input)),
+        }
     }
-    let (id, voice, language) = (*id, voice.clone(), language.clone());
-    let (slot, controls) = (Arc::clone(slot), controls.clone());
-    thread::spawn(move || {
-        let input = match slot.lease_voice(&voice, language.as_deref()) {
-            Ok(_) => input,
-            Err(message) => Input::VoiceUnavailable { id, voice, message },
-        };
-        let _ = controls.send(OrderedControl {
-            after_pcm: 0,
-            input,
-        });
-    });
-    None
+}
+
+/// The voice and language a speech request asks for, when the slot hasn't built them yet.
+fn missing_voice(
+    slot: &ConfiguredTtsSlot,
+    request: &SessionRequest,
+) -> Option<(String, Option<String>)> {
+    let SessionRequest::PrepareSpeak {
+        voice: Some(voice),
+        language,
+        ..
+    } = request
+    else {
+        return None;
+    };
+    (!slot.has_voice(voice, language.as_deref())).then(|| (voice.clone(), language.clone()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9464,6 +9523,12 @@ mod tests {
     fn a_new_voice_is_built_off_the_session_loop_and_its_request_handed_back() {
         let slot = Arc::new(test_tts_slot());
         let (controls, handed_back) = mpsc::channel::<OrderedControl>();
+        let mut builds = VoiceBuilds {
+            controls,
+            pending: HashSet::new(),
+        };
+        let mut writer = Vec::new();
+        let mut filter = |input, slot| builds.filter(input, slot, &mut writer).unwrap();
         let prepare = |id, voice: &str| {
             Input::Request(SessionRequest::PrepareSpeak {
                 id,
@@ -9480,18 +9545,51 @@ mod tests {
                 .unwrap()
                 .input
         };
-        assert!(build_voice_later(prepare(1, "coral"), Some(&slot), &controls).is_none());
+        assert!(filter(prepare(1, "coral"), Some(&slot)).is_none());
         assert!(matches!(
-            next(),
-            Input::Request(SessionRequest::PrepareSpeak { id: 1, .. })
+            filter(next(), Some(&slot)),
+            Some(Input::Request(SessionRequest::PrepareSpeak { id: 1, .. }))
         ));
         assert!(matches!(
-            build_voice_later(prepare(2, "coral"), Some(&slot), &controls),
+            filter(prepare(2, "coral"), Some(&slot)),
             Some(Input::Request(SessionRequest::PrepareSpeak { id: 2, .. }))
         ));
-        assert!(build_voice_later(prepare(3, "nobody"), Some(&slot), &controls).is_none());
-        assert!(matches!(next(), Input::VoiceUnavailable { id: 3, .. }));
-        assert!(build_voice_later(prepare(4, "coral"), None, &controls).is_some());
+        assert!(filter(prepare(3, "nobody"), Some(&slot)).is_none());
+        assert!(filter(next(), Some(&slot)).is_none());
+        // A request cancelled while its voice is built is not revived by the build.
+        assert!(filter(prepare(4, "marin"), Some(&slot)).is_none());
+        assert!(filter(
+            Input::Request(SessionRequest::Cancel { id: 4 }),
+            Some(&slot)
+        )
+        .is_none());
+        assert!(filter(next(), Some(&slot)).is_none());
+        assert!(filter(prepare(5, "cedar"), None).is_some());
+        drop(filter);
+        let types: Vec<_> = String::from_utf8(writer)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let message: serde_json::Value = serde_json::from_str(line).unwrap();
+                format!(
+                    "{} {} {}",
+                    message["type"],
+                    message["id"],
+                    message["reason"]
+                        .as_str()
+                        .or(message["outcome"].as_str())
+                        .unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                r#""not_admitted" 3 invalid_voice"#,
+                r#""cancel_result" 4 cancelled"#,
+                r#""not_admitted" 4 cancelled"#,
+            ]
+        );
     }
 
     #[test]
