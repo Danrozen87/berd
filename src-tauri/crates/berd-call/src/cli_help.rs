@@ -65,7 +65,9 @@ for delivery. Non-blocking sessions require --stream or --codex and emit speech_
 rows only for interruptions, failures, or pending user input. Interrupted results include
 estimatedSpokenText, a best-effort prefix based on delivered audio. --voice speaks
 this text in another voice of the call's reply backend without changing its saved
-voice, so several agents can share one call in distinct voices."#;
+voice, so several agents can share one call in distinct voices. In a call with
+--expert-voice tts, every reply is spoken however stale --re is, and answers
+every open handoff, so --resolves is ignored."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 
