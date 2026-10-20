@@ -417,6 +417,15 @@ impl ConfiguredTtsSlot {
         })
     }
 
+    /// Whether `lease_voice` already has this voice built.
+    pub fn has_voice(&self, voice: &str, language: Option<&str>) -> bool {
+        self.inner.lock().is_ok_and(|state| {
+            state
+                .voices
+                .contains_key(&(voice.to_string(), language.map(str::to_string)))
+        })
+    }
+
     /// The configured backend speaking one utterance in another of its voices,
     /// keeping the other settings. Building it doesn't hold the slot lock.
     pub fn lease_voice(
