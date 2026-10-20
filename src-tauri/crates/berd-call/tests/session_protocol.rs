@@ -65,12 +65,18 @@ impl ExpertSpokespersonTestSession {
             played_frame_limit,
             played_ready,
             cancellation_gate,
+            false,
             &[],
         )
     }
 
+    /// A session whose host player stops once it has played this much of the first speech, as when the output device changes under it.
+    fn start_with_failing_audio(endpoint: String, played_frames: u64) -> Self {
+        Self::launch(endpoint, None, Some(played_frames), None, None, true, &[])
+    }
+
     fn start_with_args(endpoint: String, args: &[&str]) -> Self {
-        Self::launch(endpoint, None, None, None, None, args)
+        Self::launch(endpoint, None, None, None, None, false, args)
     }
 
     fn launch(
@@ -79,6 +85,7 @@ impl ExpertSpokespersonTestSession {
         played_frame_limit: Option<u64>,
         played_ready: Option<mpsc::SyncSender<()>>,
         cancellation_gate: Option<AudioCancellationGate>,
+        fail_at_limit: bool,
         args: &[&str],
     ) -> Self {
         let (mut command, _pcm, audio_host) = session_command();
@@ -119,6 +126,7 @@ impl ExpertSpokespersonTestSession {
             played_frame_limit,
             played_ready,
             cancellation_gate,
+            fail_at_limit,
         );
         let mut session = Self {
             child,
@@ -328,7 +336,7 @@ fn spawn_audio_host(
     reader: UnixStream,
     stdin: Arc<Mutex<std::process::ChildStdin>>,
 ) -> std::thread::JoinHandle<()> {
-    spawn_audio_host_with_played_limit(reader, stdin, None, None, None)
+    spawn_audio_host_with_played_limit(reader, stdin, None, None, None, false)
 }
 
 fn spawn_audio_host_with_played_limit(
@@ -337,9 +345,12 @@ fn spawn_audio_host_with_played_limit(
     played_frame_limit: Option<u64>,
     mut played_ready: Option<mpsc::SyncSender<()>>,
     mut cancellation_gate: Option<AudioCancellationGate>,
+    mut fail_at_limit: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut current = None::<(u64, u64, u64)>;
+        // The speech whose player failed, and what it played: like the real host, it ignores what the session sent before hearing.
+        let mut failed = None::<(u64, u64)>;
         loop {
             let mut header = [0_u8; 8];
             match reader.read_exact(&mut header) {
@@ -362,6 +373,9 @@ fn spawn_audio_host_with_played_limit(
                 2 => {
                     assert!(payload.len() >= 20);
                     let speech_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    if failed.is_some_and(|(id, _)| id == speech_id) {
+                        continue;
+                    }
                     let sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
                     let frames = u64::try_from((payload.len() - 16) / 4).unwrap();
                     let state = current.as_mut().expect("chunk follows begin");
@@ -379,6 +393,16 @@ fn spawn_audio_host_with_played_limit(
                         &mut *writer,
                         &json!({"type":"audio_played","speech_id":speech_id,"played_frames":played_frame_limit.map_or(state.2, |limit| state.2.min(limit))}),
                     );
+                    if reached_limit && fail_at_limit {
+                        fail_at_limit = false;
+                        let played_frames = played_frame_limit.unwrap();
+                        failed = Some((speech_id, played_frames));
+                        current = None;
+                        write_session_json(
+                            &mut *writer,
+                            &json!({"type":"audio_failed","speech_id":speech_id,"played_frames":played_frames,"message":"PCM audio output stopped unexpectedly"}),
+                        );
+                    }
                     writer.flush().unwrap();
                     if reached_limit {
                         if let Some(ready) = played_ready.take() {
@@ -390,6 +414,9 @@ fn spawn_audio_host_with_played_limit(
                 3 => {
                     assert_eq!(payload.len(), 24);
                     let speech_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                    if failed.is_some_and(|(id, _)| id == speech_id) {
+                        continue;
+                    }
                     let sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
                     let frames = u64::from_le_bytes(payload[16..24].try_into().unwrap());
                     assert_eq!(current, Some((speech_id, sequence, frames)));
@@ -406,6 +433,15 @@ fn spawn_audio_host_with_played_limit(
                 4 => {
                     assert_eq!(payload.len(), 8);
                     let speech_id = u64::from_le_bytes(payload.try_into().unwrap());
+                    if let Some((_, played_frames)) = failed.filter(|(id, _)| *id == speech_id) {
+                        let mut writer = stdin.lock().unwrap();
+                        write_session_json(
+                            &mut *writer,
+                            &json!({"type":"audio_cancelled","speech_id":speech_id,"played_frames":played_frames}),
+                        );
+                        writer.flush().unwrap();
+                        continue;
+                    }
                     let played_frames = current
                         .take()
                         .filter(|state| state.0 == speech_id)
@@ -1171,6 +1207,110 @@ fn one_realtime_response_with_two_audio_parts_completes_without_identity_failure
         }
         seen.push(message);
     }
+    session.shutdown();
+    server.join().unwrap();
+}
+
+#[test]
+fn a_reply_whose_player_stops_ends_where_it_was_heard_and_the_call_goes_on() {
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let update = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &update).await;
+                // Two seconds of audio, of which the host plays a fraction before its player stops; then a short reply.
+                for (directive, response, bytes) in [("2", "response-cut", 96_000), ("3", "response-next", 4_096)] {
+                    assert_eq!(
+                        receive_realtime_json(&mut socket).await["type"],
+                        "conversation.item.create"
+                    );
+                    assert_eq!(
+                        receive_realtime_json(&mut socket).await["type"],
+                        "response.create"
+                    );
+                    send_realtime_json(
+                        &mut socket,
+                        json!({"type":"response.created","response":{"id":response,"metadata":{"berd_expert_directive_id":directive}}}),
+                    )
+                    .await;
+                    let item = format!("{response}-item");
+                    for event in [
+                        json!({"type":"response.output_audio.delta","response_id":response,"item_id":item,"output_index":0,"content_index":0,"delta":BASE64.encode(vec![0_u8; bytes])}),
+                        json!({"type":"response.output_audio.done","response_id":response,"item_id":item,"output_index":0,"content_index":0}),
+                        json!({"type":"response.output_audio_transcript.done","response_id":response,"item_id":item,"output_index":0,"content_index":0,"transcript":"a reply"}),
+                        json!({"type":"response.done","response":{"id":response,"status":"completed"}}),
+                    ] {
+                        send_realtime_json(&mut socket, event).await;
+                    }
+                    if directive == "2" {
+                        // The model learns the user heard the 4,096 frames (170 ms) played before the player stopped.
+                        let truncate = receive_realtime_json(&mut socket).await;
+                        assert_eq!(truncate["type"], "conversation.item.truncate");
+                        assert_eq!(truncate["item_id"], item);
+                        assert_eq!(truncate["audio_end_ms"], 170);
+                        send_realtime_json(
+                            &mut socket,
+                            json!({"type":"conversation.item.truncated","item_id":item,"content_index":0}),
+                        )
+                        .await;
+                    }
+                }
+                let _ = socket.next().await;
+            });
+    });
+    let mut session =
+        ExpertSpokespersonTestSession::start_with_failing_audio(endpoint_rx.recv().unwrap(), 4_096);
+    let mut seen = Vec::new();
+    let mut until =
+        |session: &mut ExpertSpokespersonTestSession, what: &str, done: &dyn Fn(&Value) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_else(|| panic!("no {what}: {seen:?}"));
+                let message = session
+                    .output
+                    .recv_timeout(remaining)
+                    .unwrap_or_else(|error| panic!("no {what} ({error}): {seen:?}"));
+                assert_ne!(message["type"], "fatal", "unexpected fatal: {message}");
+                let found = done(&message);
+                seen.push(message);
+                if found {
+                    break;
+                }
+            }
+        };
+    let speak = |session: &mut ExpertSpokespersonTestSession, id: u64| {
+        session.send(
+            json!({"type":"prepare_speak","id":id,"acknowledgement":null,"text":"say something"}),
+        );
+        let admitted = std::iter::repeat_with(|| session.recv(Duration::from_secs(2)))
+            .find(|message| message["id"] == id)
+            .unwrap();
+        assert_eq!(admitted["type"], "admitted", "{admitted}");
+        session.send(json!({"type":"output_ready","id":id,"speech_id":admitted["speech_id"]}));
+    };
+    speak(&mut session, 2);
+    until(&mut session, "interruption", &|message| {
+        message["id"] == 2 && message["type"] == "speech_interrupted"
+    });
+    until(&mut session, "cut transcript", &|message| {
+        message["type"] == "live_event" && message["origin"] == "spokesperson"
+    });
+    speak(&mut session, 3);
+    until(&mut session, "next reply", &|message| {
+        message["id"] == 3 && message["type"] == "speech_completed"
+    });
     session.shutdown();
     server.join().unwrap();
 }
