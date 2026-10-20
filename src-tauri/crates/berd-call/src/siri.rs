@@ -142,6 +142,10 @@ impl<'de> Deserialize<'de> for SiriVoiceIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct SiriVoice {
     pub name: String,
+    /// The name to show: `name`, or for a voice whose catalog name is a locale
+    /// code, its known name (`en-US-F` is `Zack`) or Siri and the name macOS
+    /// shows (`en-GB-C` is `Siri Voice 3`).
+    pub display_name: String,
     pub language: String,
     pub size_bytes: u64,
     pub installed: bool,
@@ -194,6 +198,7 @@ impl std::error::Error for SiriVoiceDownloadError {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawSiriVoice {
     name: String,
+    localized_name: String,
     language: String,
     size_bytes: u64,
     installed: bool,
@@ -253,7 +258,20 @@ fn parse_catalog_json(json: &str) -> Result<Vec<SiriVoice>, String> {
         .into_iter()
         .map(|raw| {
             let identity = SiriVoiceIdentity::new(raw.name, &raw.language)?;
+            let coded = identity
+                .name
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}-", identity.language.to_ascii_lowercase()));
             Ok(SiriVoice {
+                display_name: match identity.name.as_str() {
+                    // Their asset build paths (zack_v2_..., gigi_test_2) name them.
+                    "en-US-F" => "Zack".into(),
+                    "en-US-G" => "Gigi".into(),
+                    _ if coded && !raw.localized_name.is_empty() => {
+                        format!("Siri {}", raw.localized_name)
+                    }
+                    _ => identity.name.clone(),
+                },
                 name: identity.name,
                 language: identity.language,
                 size_bytes: raw.size_bytes,
@@ -701,7 +719,7 @@ mod tests {
     #[test]
     fn catalog_decode_normalizes_identity_and_rejects_malformed_entries() {
         let catalog = parse_catalog_json(
-            r#"[{"name":"Aaron","language":"en_US","sizeBytes":42,"installed":true}]"#,
+            r#"[{"name":"Aaron","localizedName":"","language":"en_US","sizeBytes":42,"installed":true}]"#,
         )
         .expect("valid catalog");
         assert_eq!(catalog.len(), 1);
@@ -712,11 +730,11 @@ mod tests {
 
         assert!(parse_catalog_json("not json").is_err());
         assert!(parse_catalog_json(
-            r#"[{"name":"","language":"en-US","sizeBytes":42,"installed":true}]"#,
+            r#"[{"name":"","localizedName":"","language":"en-US","sizeBytes":42,"installed":true}]"#,
         )
         .is_err());
         assert!(parse_catalog_json(
-            r#"[{"name":"Aaron","language":"en--US","sizeBytes":42,"installed":true}]"#,
+            r#"[{"name":"Aaron","localizedName":"","language":"en--US","sizeBytes":42,"installed":true}]"#,
         )
         .is_err());
     }
@@ -734,7 +752,7 @@ mod tests {
         );
 
         let voices = parse_catalog_json(
-            r#"[{"name":"Aaron","language":"zh-Hans-CN","sizeBytes":42,"installed":true}]"#,
+            r#"[{"name":"Aaron","localizedName":"","language":"zh-Hans-CN","sizeBytes":42,"installed":true}]"#,
         )
         .expect("catalog");
         assert!(voices[0].matches(&identity));
@@ -747,8 +765,8 @@ mod tests {
     fn catalog_decode_preserves_installed_status_for_exact_voices() {
         let voices = parse_catalog_json(
             r#"[
-                {"name":"Aaron","language":"en-US","sizeBytes":42,"installed":true},
-                {"name":"Quinn","language":"en_US","sizeBytes":84,"installed":false}
+                {"name":"Aaron","localizedName":"","language":"en-US","sizeBytes":42,"installed":true},
+                {"name":"Quinn","localizedName":"","language":"en_US","sizeBytes":84,"installed":false}
             ]"#,
         )
         .expect("catalog");
@@ -756,6 +774,36 @@ mod tests {
         assert!(!voices[1].installed);
         assert!(voices[0].matches(&SiriVoiceIdentity::new("Aaron", "en_US").unwrap()));
         assert!(voices[1].matches(&SiriVoiceIdentity::new("Quinn", "en-US").unwrap()));
+    }
+
+    #[test]
+    fn catalog_decode_shows_the_macos_name_only_for_code_named_voices() {
+        let voices = parse_catalog_json(
+            r#"[
+                {"name":"en-US-F","localizedName":"Voice 7","language":"en_US","sizeBytes":42,"installed":true},
+                {"name":"en-US-G","localizedName":"Voice 6","language":"en-US","sizeBytes":42,"installed":false},
+                {"name":"de-DE-C","localizedName":"Voice 3","language":"de-DE","sizeBytes":42,"installed":false},
+                {"name":"en-GB-C","localizedName":"","language":"en-GB","sizeBytes":42,"installed":false},
+                {"name":"Li-Mu","localizedName":"Voice 1","language":"zh-CN","sizeBytes":42,"installed":false},
+                {"name":"Aaron","localizedName":"Voice 1","language":"en-US","sizeBytes":42,"installed":true}
+            ]"#,
+        )
+        .expect("catalog");
+        let names = voices
+            .iter()
+            .map(|voice| (voice.name.as_str(), voice.display_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("en-US-F", "Zack"),
+                ("en-US-G", "Gigi"),
+                ("de-DE-C", "Siri Voice 3"),
+                ("en-GB-C", "en-GB-C"),
+                ("Li-Mu", "Li-Mu"),
+                ("Aaron", "Aaron")
+            ]
+        );
     }
 
     #[test]
@@ -791,6 +839,7 @@ mod tests {
                     available_languages: vec!["en-US".into()],
                     voices: vec![SiriVoice {
                         name: "aaron".into(),
+                        display_name: "aaron".into(),
                         language: "en-US".into(),
                         size_bytes: 42,
                         installed: false,
@@ -810,6 +859,7 @@ mod tests {
             available_languages: vec!["en-US".into()],
             voices: vec![SiriVoice {
                 name: "Aaron".into(),
+                display_name: "Aaron".into(),
                 language: "en-US".into(),
                 size_bytes: 42,
                 installed,
