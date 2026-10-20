@@ -3327,7 +3327,8 @@ fn expert_voice_reply_whose_audio_never_settles_ends_the_session() {
             release,
             at_drain: true,
         }),
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        false,
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     session.send(json!({
         "type":"prepare_speak",
