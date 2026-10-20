@@ -3787,12 +3787,8 @@ fn run_expert_spokesperson_session(
                                         .expect("streaming response state exists")
                                         .queue_audio(samples, total_pending_frames)?;
                                 }
-                                Err(mpsc::TrySendError::Disconnected(_)) => {
-                                    return Err(
-                                        "Spokesperson playback worker closed while streaming"
-                                            .into(),
-                                    )
-                                }
+                                // The worker has stopped; its result settles this reply.
+                                Err(mpsc::TrySendError::Disconnected(_)) => {}
                                 Err(mpsc::TrySendError::Full(LivePlaybackInput::Finish)) => {
                                     unreachable!("streaming sends samples")
                                 }
@@ -5610,8 +5606,11 @@ fn flush_active_live_playback(
                 response.pending_audio.push_front(samples);
                 break;
             }
+            // The worker has stopped, and the result it sent first settles this reply.
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                return Err("Spokesperson playback worker closed while streaming".into())
+                response.pending_audio.clear();
+                response.pending_frames = 0;
+                return Ok(());
             }
             Err(mpsc::TrySendError::Full(LivePlaybackInput::Finish)) => {
                 unreachable!("audio queue contains samples")
@@ -5621,10 +5620,10 @@ fn flush_active_live_playback(
     if response.audio_done && response.pending_audio.is_empty() && !response.finish_sent {
         match playback.sender.try_send(LivePlaybackInput::Finish) {
             Ok(()) => response.finish_sent = true,
-            Err(mpsc::TrySendError::Full(LivePlaybackInput::Finish)) => {}
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                return Err("Spokesperson playback worker closed before finish".into())
-            }
+            Err(
+                mpsc::TrySendError::Full(LivePlaybackInput::Finish)
+                | mpsc::TrySendError::Disconnected(_),
+            ) => {}
             Err(mpsc::TrySendError::Full(LivePlaybackInput::Samples(_))) => {
                 unreachable!("finish queue contains finish")
             }
@@ -9283,6 +9282,23 @@ mod tests {
         assert!(gate.take_ready(false, 1).is_none());
         gate.response_finished("response-new");
         assert_eq!(gate.take_ready(false, 0).map(|request| request.id), Some(7));
+    }
+
+    #[test]
+    fn audio_for_a_playback_worker_that_stopped_waits_for_its_result() {
+        let (playback, _controls) = live_playback_fixture(None);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let active = Some(LivePlayback { sender, ..playback });
+        let mut response = LiveResponse::new(None, Some(3));
+        response.queue_audio(vec![0.25; 32], 0).unwrap();
+        mark_live_response_server_finished(&mut response);
+        let mut responses = HashMap::from([("response-a".into(), response)]);
+
+        // The worker sent the result that settles this reply before it stopped taking audio.
+        flush_active_live_playback(&active, &mut responses).unwrap();
+
+        assert!(responses["response-a"].pending_audio.is_empty());
     }
 
     #[test]
