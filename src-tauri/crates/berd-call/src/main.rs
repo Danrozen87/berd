@@ -9131,10 +9131,7 @@ mod tests {
         clears.borrow()[2]
             .send(Err("provider refused".into()))
             .unwrap();
-        assert_eq!(
-            resets.poll(&mut output).unwrap_err(),
-            "provider refused"
-        );
+        assert_eq!(resets.poll(&mut output).unwrap_err(), "provider refused");
     }
 
     #[test]
