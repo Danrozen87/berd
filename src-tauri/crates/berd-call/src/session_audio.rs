@@ -25,6 +25,8 @@ const MAX_ACCEPTED_NOT_PLAYED_CHUNKS: usize = 64;
 const AUDIO_PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const AUDIO_CANCELLED: &str = "remote PCM output was cancelled";
+/// The host's player stopped, as when the output device changes under it; the host has ended that speech.
+pub const AUDIO_HOST_FAILED: &str = "host audio output failed";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioHostAck {
@@ -621,7 +623,7 @@ impl RemotePcmAudioOutput {
             Err(state
                 .failure
                 .clone()
-                .unwrap_or_else(|| "host audio output failed".into()))
+                .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
         } else {
             Ok(())
         }
@@ -668,7 +670,7 @@ impl RemotePcmAudioOutput {
                     return Err(state
                         .failure
                         .clone()
-                        .unwrap_or_else(|| "host audio output failed".into()));
+                        .unwrap_or_else(|| AUDIO_HOST_FAILED.into()));
                 }
                 Phase::Cancelling => false,
                 Phase::WaitingBegin
@@ -712,7 +714,7 @@ impl RemotePcmAudioOutput {
                         return Err(state
                             .failure
                             .clone()
-                            .unwrap_or_else(|| "host audio output failed".into()))
+                            .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
                     }
                     Phase::Drained => return Err("remote PCM output is already drained".into()),
                     _ => {}
@@ -761,7 +763,7 @@ impl RemotePcmAudioOutput {
                 return Err(state
                     .failure
                     .clone()
-                    .unwrap_or_else(|| "host audio output failed".into()));
+                    .unwrap_or_else(|| AUDIO_HOST_FAILED.into()));
             }
             if state.suspension == SuspensionPhase::Suspended && state.suspension_requested {
                 while state.suspension_requested && self.active.load(Ordering::SeqCst) {
@@ -891,7 +893,7 @@ impl PcmAudioOutput for RemotePcmAudioOutput {
             Err(state
                 .failure
                 .clone()
-                .unwrap_or_else(|| "host audio output failed".into()))
+                .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
         } else {
             Ok(())
         }
@@ -914,7 +916,7 @@ fn accepted_audio_runway_frames(spec: TtsPcmSpec) -> u64 {
 }
 
 fn public_host_failure(_message: String) -> String {
-    "host audio output failed".into()
+    AUDIO_HOST_FAILED.into()
 }
 
 #[cfg(test)]

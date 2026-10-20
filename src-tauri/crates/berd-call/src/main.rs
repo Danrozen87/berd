@@ -81,7 +81,7 @@ mod system_input_mute;
 
 use session_audio::{
     AudioHostAck, AudioOutputControlRequest, AudioPipeTransport, RemotePcmAudioOutput,
-    AUDIO_CANCELLED,
+    AUDIO_CANCELLED, AUDIO_HOST_FAILED,
 };
 
 use session_framing::{
@@ -4191,7 +4191,8 @@ fn run_expert_spokesperson_session(
                     else {
                         continue;
                     };
-                    if message == AUDIO_CANCELLED {
+                    // A reply the host stopped playing ends where it was cut off, as if you had interrupted it; the next gets a new player.
+                    if message == AUDIO_CANCELLED || message == AUDIO_HOST_FAILED {
                         apply_external_coordinator_event(
                             &mut core,
                             runtime.as_ref().expect("initialized runtime"),
@@ -4202,6 +4203,10 @@ fn run_expert_spokesperson_session(
                         )?;
                         if let Some(response) = responses.get_mut(&response_id) {
                             emit_live_interrupted_terminal(response, &playback, &mut writer)?;
+                            if message == AUDIO_HOST_FAILED {
+                                // The model hears only what played, as when the user talks over it.
+                                require_live_response_truncation(response)?;
+                            }
                             send_live_response_truncation(
                                 &response_id,
                                 response,
