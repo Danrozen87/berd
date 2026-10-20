@@ -566,13 +566,13 @@ fn main() {
             print_pretty_json(&response).unwrap_or_else(|error| operational_error("speak", error));
         }
         Some("message-spokesperson") => {
-            let (port, text) = parse_or_exit(parse_message_spokesperson_args(&args), &args);
+            let options = parse_or_exit(parse_message_spokesperson_args(&args), &args);
             let response = host_control::request(
-                port,
+                options.port,
                 host_control::ControlRequest::Speak {
-                    text,
-                    acknowledgement: None,
-                    resolved_handoff_ids: Vec::new(),
+                    text: options.text,
+                    acknowledgement: options.acknowledgement,
+                    resolved_handoff_ids: options.resolved_handoff_ids,
                     voice: None,
                     language: None,
                     relay: true,
@@ -1045,15 +1045,15 @@ fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailur
 }
 
 /// `message-spokesperson` takes only a port and the text.
-fn parse_message_spokesperson_args(args: &[String]) -> Result<(u16, String), ParseFailure> {
+fn parse_message_spokesperson_args(args: &[String]) -> Result<SpeakOptions, ParseFailure> {
     let options = parse_speak_control_args(args)?;
-    if options.acknowledgement.is_some()
-        || !options.resolved_handoff_ids.is_empty()
-        || options.voice.is_some()
-    {
-        return Err("message-spokesperson accepts only --port PORT and TEXT".into());
+    if options.voice.is_some() {
+        return Err("message-spokesperson takes no --voice".into());
     }
-    Ok((options.port, options.text))
+    if options.acknowledgement.is_none() {
+        return Err("message-spokesperson requires --re CURSOR".into());
+    }
+    Ok(options)
 }
 
 fn parse_host_settings_args(
@@ -5220,10 +5220,10 @@ fn submit_expert_prepare(
     next_speech_id: &mut u64,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    // A message to the Spokesperson, or any reply when the Expert has its own
-    // voice, answers every open handoff, so the ones it names don't matter.
-    let answers_all = expert_tts || request.relay;
-    if !answers_all
+    // A reply in the Expert's own voice answers every open handoff, so the
+    // ones it names don't matter. A message to the Spokesperson is a directive.
+    let own_voice = expert_tts && !request.relay;
+    if !own_voice
         && !core
             .unknown_handoff_ids(&request.resolved_handoff_ids)
             .is_empty()
@@ -5236,9 +5236,7 @@ fn submit_expert_prepare(
             },
         );
     }
-    let outcome = if request.relay {
-        core.prepare_expert_message(request.text)
-    } else if expert_tts {
+    let outcome = if own_voice {
         core.prepare_expert_reply(request.acknowledgement, request.text)
     } else {
         core.prepare_expert_directive(request.acknowledgement, request.text)
@@ -5266,7 +5264,7 @@ fn submit_expert_prepare(
             let speech_id = *next_speech_id;
             *next_speech_id += 1;
             core.record_expert_turn(message.clone());
-            if expert_tts && !request.relay {
+            if own_voice {
                 // Played in turn with the Spokesperson's responses, without one of its own.
                 let response_id = format!("expert-reply-{speech_id}");
                 let mut response = LiveResponse::new(Some(request.id), Some(speech_id));
@@ -5279,12 +5277,7 @@ fn submit_expert_prepare(
                 responses.insert(response_id.clone(), response);
                 waiting_responses.push_back(response_id);
             } else {
-                // A message to the Spokesperson already answered every handoff when admitted.
-                let resolved_handoff_ids = if answers_all {
-                    Vec::new()
-                } else {
-                    request.resolved_handoff_ids
-                };
+                let resolved_handoff_ids = request.resolved_handoff_ids;
                 core.mark_handoffs_resolving(&resolved_handoff_ids)?;
                 directive_speeches.insert(
                     request.id,
@@ -12786,19 +12779,28 @@ mod tests {
                 "message-spokesperson",
                 "--port",
                 "5300",
+                "--re",
+                "4",
+                "--resolves",
+                "handoff-1",
                 "Tell them it's fixed."
             ]))
             .unwrap(),
-            (5300, "Tell them it's fixed.".into())
+            SpeakOptions {
+                port: 5300,
+                acknowledgement: Some(4),
+                resolved_handoff_ids: vec!["handoff-1".into()],
+                voice: None,
+                language: None,
+                text: "Tell them it's fixed.".into(),
+            }
         );
-        assert!(parse_message_spokesperson_args(&args(&[
-            "berd-call",
-            "message-spokesperson",
-            "--voice",
-            "Nora",
-            "hello"
-        ]))
-        .is_err());
+        for extra in [&["--voice", "Nora"][..], &[]] {
+            let mut given = args(&["berd-call", "message-spokesperson"]);
+            given.extend(args(extra));
+            given.push("hello".into());
+            assert!(parse_message_spokesperson_args(&given).is_err());
+        }
         assert!(parse_speak_control_args(&args(&[
             "berd-call",
             "speak",

@@ -3093,7 +3093,7 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
 }
 
 #[test]
-fn a_message_to_the_spokesperson_is_said_by_it_and_answers_every_handoff() {
+fn a_message_to_the_spokesperson_is_a_directive_it_says() {
     message_the_spokesperson(false);
     message_the_spokesperson(true);
 }
@@ -3150,7 +3150,7 @@ fn message_the_spokesperson(expert_voice: bool) {
         endpoint,
         if expert_voice { &own } else { &[] },
     );
-    loop {
+    let handoffs = loop {
         session.send(json!({"type":"query_state","id":1,"after":0}));
         let state = loop {
             let message = session.recv(Duration::from_secs(2));
@@ -3159,30 +3159,41 @@ fn message_the_spokesperson(expert_voice: bool) {
                 break message;
             }
         };
-        if state["unresolved_handoff_ids"]
+        if let Some(ids) = state["unresolved_handoff_ids"]
             .as_array()
-            .is_some_and(|ids| ids.len() == 2)
+            .filter(|ids| ids.len() == 2)
         {
-            break;
+            break ids.clone();
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
 
-    // Stale, naming no handoff, and still the Spokesperson's to say.
-    session.send(json!({
-        "type":"prepare_speak",
-        "id":2,
-        "acknowledgement":0,
-        "text":"I checked the repository.",
-        "relay":true
-    }));
-    let admitted = loop {
-        let message = session.recv(Duration::from_secs(2));
-        assert_ne!(message["type"], "fatal", "{message}");
-        if message["id"] == 2 {
-            break message;
+    // A stale message waits for what it missed, like a directive.
+    let prepare = |acknowledgement: &Value| {
+        json!({
+            "type":"prepare_speak",
+            "id":2,
+            "acknowledgement":acknowledgement,
+            "resolved_handoff_ids":[&handoffs[0]],
+            "text":"I checked the repository.",
+            "relay":true
+        })
+    };
+    let mut reply = |session: &mut ExpertSpokespersonTestSession, request| {
+        session.send(request);
+        loop {
+            let message = session.recv(Duration::from_secs(2));
+            assert_ne!(message["type"], "fatal", "{message}");
+            if message["id"] == 2 {
+                break message;
+            }
         }
     };
+    let pending = reply(&mut session, prepare(&json!(0)));
+    assert_eq!(pending["type"], "pending", "{pending}");
+    let latest = &pending["utterances"].as_array().unwrap().last().unwrap()["token"];
+    // Current, it is the Spokesperson's to say, and answers only the handoff it names.
+    let admitted = reply(&mut session, prepare(latest));
     assert_eq!(admitted["type"], "admitted", "{admitted}");
     let relayed = relay_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
@@ -3196,7 +3207,11 @@ fn message_the_spokesperson(expert_voice: bool) {
             break message;
         }
     };
-    assert_eq!(state.get("unresolved_handoff_ids"), None, "{state}");
+    assert_eq!(
+        state["unresolved_handoff_ids"],
+        json!([&handoffs[1]]),
+        "{state}"
+    );
     assert!(speech_requests
         .recv_timeout(Duration::from_millis(300))
         .is_err());

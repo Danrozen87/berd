@@ -155,11 +155,6 @@ impl ExpertSpokespersonCore {
         self.pipe.cursor(RealtimePipePeer::Expert)
     }
 
-    /// The newest message the Expert has been sent, read or not.
-    pub fn delivered_token(&self) -> u64 {
-        self.pipe.delivery_cursor(RealtimePipePeer::Expert)
-    }
-
     pub fn next_live_token(&self) -> u64 {
         self.pipe.next_message_id()
     }

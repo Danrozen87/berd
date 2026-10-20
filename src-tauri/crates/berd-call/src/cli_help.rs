@@ -76,12 +76,14 @@ answers every open handoff, so --resolves is ignored."#;
 const MESSAGE_SPOKESPERSON_HELP: &str = r#"Message the Spokesperson of the active realtime call.
 
 Usage:
-  berd-call message-spokesperson [--port PORT] TEXT
+  berd-call message-spokesperson [--port PORT] --re CURSOR
+    [--resolves HANDOFF_ID]... TEXT
 
 The Spokesperson tells the user in its own voice, even in a call with
---allow-direct-agent-speech, where `speak` uses the Expert's. It is admitted however much
-the user has said since, answers every open handoff, and reports the same result
-as `speak`."#;
+--allow-direct-agent-speech, where `speak` uses the Expert's. Like a directive
+from Berd's Expert, the message must acknowledge the latest input (the
+Spokesperson's own speech doesn't count), each --resolves settles that handoff
+once the Spokesperson has said it, and the result is the same as `speak`'s."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 
