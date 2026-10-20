@@ -1287,6 +1287,7 @@ pub struct RealtimeExpertSpokespersonSession {
     responses: RealtimeResponseCoordinator,
     conversation: ExpertSpokespersonCore,
     open_handoffs: HashMap<String, RealtimeOpenHandoff>,
+    tracks_handoffs: bool,
     call_scope: String,
     pending_expert_events: Vec<RealtimeExpertDeliveryEvent>,
 }
@@ -1387,8 +1388,18 @@ impl RealtimeExpertSpokespersonSession {
             responses: RealtimeResponseCoordinator::default(),
             conversation: ExpertSpokespersonCore::new(initial_cursor),
             open_handoffs: HashMap::new(),
+            tracks_handoffs: true,
             call_scope: call_scope.into(),
             pending_expert_events: Vec::new(),
+        }
+    }
+
+    /// A session whose handoffs reach the Expert but are never held open:
+    /// nothing waits on them, so nothing reminds, resolves or keeps them.
+    pub fn without_handoff_tracking(self) -> Self {
+        Self {
+            tracks_handoffs: false,
+            ..self
         }
     }
 
@@ -1587,21 +1598,6 @@ impl RealtimeExpertSpokespersonSession {
         })
     }
 
-    /// Prepares a reply in the Expert's own voice: like a directive, it waits
-    /// for whatever the Expert hasn't acknowledged, and once admitted it
-    /// answers every open handoff.
-    pub fn prepare_expert_reply(
-        &mut self,
-        acknowledgement: Option<u64>,
-        message: String,
-    ) -> ExpertDirectiveOutcome {
-        let outcome = self.prepare_expert_directive(acknowledgement, message);
-        if matches!(outcome, ExpertDirectiveOutcome::Accepted { .. }) {
-            self.open_handoffs.clear();
-        }
-        outcome
-    }
-
     pub fn record_live_event_with_delivery(
         &mut self,
         event: LiveSideEvent,
@@ -1695,25 +1691,6 @@ impl RealtimeExpertSpokespersonSession {
         self.conversation.semantic_transcript()
     }
 
-    /// The transcript a replacement Spokesperson session starts from: the
-    /// conversation so far, and the handoffs still waiting for a reply, so it
-    /// doesn't hand them off again.
-    pub fn replacement_transcript(&self) -> Vec<SemanticTurn> {
-        let mut turns = self.semantic_transcript();
-        let mut open: Vec<_> = self.open_handoffs.iter().collect();
-        open.sort_by_key(|(id, _)| *id);
-        if !open.is_empty() {
-            turns.push(SemanticTurn::Expert(format!(
-                "The Expert is still working on these handoffs and will answer in its own voice, so do not hand them off again:\n{}",
-                open.iter()
-                    .map(|(_, handoff)| format!("- {}", handoff.message))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )));
-        }
-        turns
-    }
-
     pub fn request_expert_message(
         &mut self,
         message: RealtimeExpertMessage,
@@ -1760,14 +1737,16 @@ impl RealtimeExpertSpokespersonSession {
         let handoff_id = require_non_empty(handoff_id, "handoff id")?;
         let message = require_non_empty(message, "handoff message")?;
         let expert_message = expert_handoff_message(&handoff_id, cursor, &message);
-        self.open_handoffs.insert(
-            handoff_id,
-            RealtimeOpenHandoff {
-                message,
-                reminder_attempts: 0,
-                resolving: false,
-            },
-        );
+        if self.tracks_handoffs {
+            self.open_handoffs.insert(
+                handoff_id,
+                RealtimeOpenHandoff {
+                    message,
+                    reminder_attempts: 0,
+                    resolving: false,
+                },
+            );
+        }
         Ok(expert_message)
     }
 
@@ -3118,40 +3097,21 @@ mod tests {
     }
 
     #[test]
-    fn expert_reply_answers_every_handoff_once_current() {
-        let mut session = RealtimeExpertSpokespersonSession::new(0, "test-call");
-        session
-            .register_handoff("handoff-1", 1, "First request")
-            .unwrap();
-        session
-            .register_handoff("handoff-2", 1, "Second request")
-            .unwrap();
-        let note = SemanticTurn::Expert(
-            "The Expert is still working on these handoffs and will answer in its own voice, so do not hand them off again:\n- First request\n- Second request".into(),
-        );
-        assert_eq!(session.replacement_transcript(), [note]);
-        session
-            .record_live_event_with_delivery(LiveSideEvent::UserTranscript {
-                text: "And one more thing".into(),
+    fn untracked_handoffs_reach_the_expert_and_stay_closed() {
+        let mut session =
+            RealtimeExpertSpokespersonSession::new(0, "test-call").without_handoff_tracking();
+        let (_, delivery) = session
+            .record_live_event_with_delivery(LiveSideEvent::Handoff {
+                call_id: "call-1".into(),
+                message: "First request".into(),
             })
             .unwrap();
-
-        // A reply written before the user's latest words waits for them, and
-        // answers no handoff until it is admitted.
-        assert!(matches!(
-            session.prepare_expert_reply(None, "Stale".into()),
-            ExpertDirectiveOutcome::Pending(_)
-        ));
-        assert!(session.has_unresolved_handoff());
-        assert!(matches!(
-            session.prepare_expert_reply(Some(1), "The answer".into()),
-            ExpertDirectiveOutcome::Accepted {
-                confirmed_token: 1,
-                ..
-            }
-        ));
+        assert_eq!(delivery.unwrap().handoff_ids, ["handoff-test-call-1"]);
         assert!(!session.has_unresolved_handoff());
-        assert_eq!(session.replacement_transcript(), []);
+        assert_eq!(
+            session.complete_expert_turn(&[], 3),
+            RealtimeHandoffReminder::None
+        );
     }
 
     #[test]

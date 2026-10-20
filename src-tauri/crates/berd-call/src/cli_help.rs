@@ -69,8 +69,8 @@ this text in another voice of the call's reply backend without changing its save
 voice, so several agents can share one call in distinct voices. An
 Expert-Spokesperson call refuses speak unless started with
 --allow-direct-agent-speech; otherwise use message-spokesperson. With it, a
-reply acknowledging the latest input is spoken in the Expert's own voice and
-answers every open handoff, so --resolves is ignored."#;
+reply acknowledging the latest input is spoken in the Expert's own voice, and
+handoffs are never held open, so there is nothing for --resolves to name."#;
 
 const MESSAGE_SPOKESPERSON_HELP: &str = r#"Message the Spokesperson of the active realtime call.
 

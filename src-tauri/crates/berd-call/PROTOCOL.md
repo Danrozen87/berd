@@ -221,15 +221,14 @@ backend, keeping its other settings; `language` changes a Siri voice's locale
 too. A voice the backend doesn't offer, or a voice for a call whose replies
 are spoken by the Spokesperson, is `not_admitted(invalid_voice)`. In a call
 whose replies have their own voice, a reply needs the same `acknowledgement`
-as a directive, and answers every open handoff once admitted, so
-`resolved_handoff_ids` is ignored. With `relay: true` (what
+as a directive. With `relay: true` (what
 `berd-call message-spokesperson` sends), the reply is a directive in any
 Expert-Spokesperson call, even one whose replies have their own voice: the
 Spokesperson says it, on the same `acknowledgement` and `resolved_handoff_ids`
-terms. Open
-handoffs in a call whose replies have their own voice don't hold
-back a renewal or recovery of the Spokesperson's session; the replacement is
-told what they asked.
+terms. A call whose replies have their own voice holds no handoff open: the
+Expert still hears each one, but `unresolved_handoff_ids` stays empty, no
+reminder or renewal waits on them, and naming one in `resolved_handoff_ids` is
+`not_admitted(invalid_handoff)`.
 The parent cannot author speaking state or finalized input; those are derived
 only from PCM by the child runtime.
 
