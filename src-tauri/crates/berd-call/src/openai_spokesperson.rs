@@ -226,7 +226,7 @@ pub enum SpokespersonResponseStatus {
 
 pub struct OpenAiSpokespersonRuntime {
     commands: mpsc::UnboundedSender<SpokespersonCommand>,
-    audio: mpsc::Sender<Vec<f32>>,
+    audio: mpsc::Sender<SpokespersonCommand>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -367,8 +367,10 @@ impl OpenAiSpokespersonRuntime {
             command => command,
         };
         match command {
-            SpokespersonCommand::InputPcm48Khz(samples) => {
-                self.audio.try_send(samples).map_err(|error| match error {
+            // Input and the clears that discard it share one queue, so they stay in order.
+            command @ (SpokespersonCommand::InputPcm48Khz(_)
+            | SpokespersonCommand::ResetInput { .. }) => {
+                self.audio.try_send(command).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => "Spokesperson input queue is full".into(),
                     mpsc::error::TrySendError::Closed(_) => "Spokesperson runtime is closed".into(),
                 })
@@ -380,12 +382,11 @@ impl OpenAiSpokespersonRuntime {
         }
     }
 
-    pub fn reset_input(&self) -> Result<(), String> {
+    /// Clears the provider's input buffer of earlier input but not later input; the result arrives once the provider confirms.
+    pub fn reset_input(&self) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
         let (completed, result) = std::sync::mpsc::sync_channel(1);
         self.send(SpokespersonCommand::ResetInput { completed })?;
-        result
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| "Spokesperson input reset timed out".to_string())?
+        Ok(result)
     }
 
     pub fn abort_input_cutover(&self) -> Result<(), String> {
@@ -425,7 +426,7 @@ impl Drop for OpenAiSpokespersonRuntime {
 
 fn reap_spokesperson_worker(
     worker: thread::JoinHandle<()>,
-    audio_lifetime: mpsc::Sender<Vec<f32>>,
+    audio_lifetime: mpsc::Sender<SpokespersonCommand>,
 ) {
     let _ = thread::Builder::new()
         .name("berd-call-spokesperson-reaper".into())
@@ -445,10 +446,21 @@ async fn run(
     run_inner(config, commands, audio_rx, events, false).await
 }
 
+/// The next command, or `None` once the runtime is shut down.
+async fn next_command(
+    commands: &mut mpsc::UnboundedReceiver<SpokespersonCommand>,
+    audio: &mut mpsc::Receiver<SpokespersonCommand>,
+) -> Result<Option<SpokespersonCommand>, String> {
+    tokio::select! {
+        command = commands.recv() => Ok(command),
+        command = audio.recv() => command.map(Some).ok_or_else(|| "Spokesperson input queue is closed".into()),
+    }
+}
+
 async fn run_inner(
     mut config: OpenAiSpokespersonConfig,
     mut commands: mpsc::UnboundedReceiver<SpokespersonCommand>,
-    mut audio: mpsc::Receiver<Vec<f32>>,
+    mut audio: mpsc::Receiver<SpokespersonCommand>,
     events: &std::sync::mpsc::Sender<SpokespersonEvent>,
     forward_provider_events: bool,
 ) -> Result<(), String> {
@@ -590,18 +602,8 @@ async fn run_inner(
                     return Err("Spokesperson output truncation timed out; server context is indeterminate".into());
                 }
             }
-            samples = audio.recv(), if shutdown_deadline.is_none() => {
-                let Some(samples) = samples else {
-                    return Err("Spokesperson input queue is closed".into());
-                };
-                let pcm = downsample_pcm16(&samples);
-                send_json(&mut socket, serde_json::json!({
-                    "type": "input_audio_buffer.append",
-                    "audio": BASE64.encode(pcm),
-                })).await?;
-            }
-            command = commands.recv(), if shutdown_deadline.is_none() => {
-                match command {
+            command = next_command(&mut commands, &mut audio), if shutdown_deadline.is_none() => {
+                match command? {
                     Some(SpokespersonCommand::Provider(event)) => {
                         send_json(&mut socket, event).await?;
                     }
@@ -719,7 +721,8 @@ async fn run_inner(
                     Some(SpokespersonCommand::Shutdown) | None => {
                         commands.close();
                         audio.close();
-                        while let Ok(samples) = audio.try_recv() {
+                        while let Ok(command) = audio.try_recv() {
+                            let SpokespersonCommand::InputPcm48Khz(samples) = command else { continue };
                             let pcm = downsample_pcm16(&samples);
                             send_json(&mut socket, serde_json::json!({
                                 "type": "input_audio_buffer.append",
@@ -1940,6 +1943,49 @@ mod tests {
         ));
         runtime.finish().unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn input_reset_clears_input_sent_before_it_but_not_after() {
+        const FRAMES: usize = 10;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(stream, require_test_authorization)
+                .await
+                .unwrap();
+            let update = receive_json(&mut socket).await;
+            acknowledge_initial_session(&mut socket, &update, "test-model").await;
+            let mut types = Vec::new();
+            for _ in 0..=2 * FRAMES {
+                types.push(receive_json(&mut socket).await["type"].clone());
+            }
+            send_json(&mut socket, json!({"type":"input_audio_buffer.cleared"})).await;
+            let _ = socket.next().await;
+            types
+        });
+        let (runtime, events) =
+            OpenAiSpokespersonRuntime::spawn(test_config(endpoint, "test-voice", 1.0, Vec::new()))
+                .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SpokespersonEvent::Ready
+        ));
+        let pcm = || SpokespersonCommand::InputPcm48Khz(vec![0.5; 960]);
+        (0..FRAMES).for_each(|_| runtime.send(pcm()).unwrap());
+        let reset = runtime.reset_input().unwrap();
+        (0..FRAMES).for_each(|_| runtime.send(pcm()).unwrap());
+        tokio::task::spawn_blocking(move || reset.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        runtime.finish().unwrap();
+        let append = json!("input_audio_buffer.append");
+        let mut expected = vec![append.clone(); 2 * FRAMES];
+        expected.insert(FRAMES, json!("input_audio_buffer.clear"));
+        assert_eq!(server.await.unwrap(), expected);
     }
 
     #[test]
