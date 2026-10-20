@@ -6038,6 +6038,10 @@ fn parse_pcm_output_fd(args: &[String]) -> Result<RawFd, String> {
     let mut value = None;
     let mut index = 2;
     while index < args.len() {
+        if args[index] == DIRECT_AGENT_SPEECH {
+            index += 1;
+            continue;
+        }
         if args[index] == "--pcm-output-fd" {
             if value.is_some() {
                 return Err("--pcm-output-fd may be provided only once".into());
@@ -11412,6 +11416,18 @@ mod tests {
         );
         assert!(
             parse_pcm_output_fd(&args(&["berd-call", "session", "--pcm-output-fd", "2"])).is_err()
+        );
+        // As the host spawns it, after a flag that takes no value.
+        assert_eq!(
+            parse_pcm_output_fd(&args(&[
+                "berd-call",
+                "session",
+                DIRECT_AGENT_SPEECH,
+                "--pcm-output-fd",
+                "9"
+            ]))
+            .unwrap(),
+            9
         );
         assert!(parse_pcm_output_fd(&args(&[
             "berd-call",
