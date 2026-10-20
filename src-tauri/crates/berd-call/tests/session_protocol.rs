@@ -3033,7 +3033,6 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
         "id":2,
         "acknowledgement":1,
         "text":"I checked the repository.",
-        "resolved_handoff_ids":["handoff-external-1"],
         "voice":"coral"
     }));
     let admitted = session.recv(Duration::from_secs(2));
@@ -3285,12 +3284,6 @@ fn an_expert_reply_that_fails_unheard_leaves_its_handoffs_open() {
 
 #[test]
 fn a_message_to_the_spokesperson_is_a_directive_it_says() {
-    message_the_spokesperson(false);
-    message_the_spokesperson(true);
-}
-
-fn message_the_spokesperson(expert_voice: bool) {
-    let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (relay_tx, relay_rx) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
@@ -3335,12 +3328,7 @@ fn message_the_spokesperson(expert_voice: bool) {
                 }
             });
     });
-    let endpoint = endpoint_rx.recv().unwrap();
-    let own = ["--allow-direct-agent-speech", "--tts-url", &speech_url];
-    let mut session = ExpertSpokespersonTestSession::start_with_args(
-        endpoint,
-        if expert_voice { &own } else { &[] },
-    );
+    let mut session = ExpertSpokespersonTestSession::start(endpoint_rx.recv().unwrap());
     let handoffs = loop {
         session.send(json!({"type":"query_state","id":1,"after":0}));
         let state = loop {
@@ -3370,7 +3358,7 @@ fn message_the_spokesperson(expert_voice: bool) {
             "relay":true
         })
     };
-    let mut reply = |session: &mut ExpertSpokespersonTestSession, request| {
+    let reply = |session: &mut ExpertSpokespersonTestSession, request| {
         session.send(request);
         loop {
             let message = session.recv(Duration::from_secs(2));
@@ -3403,18 +3391,15 @@ fn message_the_spokesperson(expert_voice: bool) {
         json!([&handoffs[1]]),
         "{state}"
     );
-    assert!(speech_requests
-        .recv_timeout(Duration::from_millis(300))
-        .is_err());
     session.shutdown();
     server.join().unwrap();
 }
 
 #[test]
-fn expert_voice_handoffs_survive_provider_expiry_and_a_current_reply_answers_them() {
+fn handoffs_hold_nothing_open_when_the_expert_may_speak() {
     let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
-    let (note_tx, note_rx) = mpsc::sync_channel(1);
+    let (renewed_tx, renewed_rx) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3461,23 +3446,20 @@ fn expert_voice_handoffs_survive_provider_expiry_and_a_current_reply_answers_the
                 )
                 .await;
 
-                // The open handoff doesn't stop the replacement, which is told of it.
+                // The handoff was never held open, so the call renews.
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut replacement = accept_async(stream).await.unwrap();
                 let update = receive_realtime_json(&mut replacement).await;
                 acknowledge_realtime_session(&mut replacement, &update).await;
+                renewed_tx.send(()).unwrap();
                 while let Some(Ok(Message::Text(text))) = replacement.next().await {
                     let seed: Value = serde_json::from_str(&text).unwrap();
-                    if seed["type"] != "conversation.item.create" {
-                        continue;
-                    }
-                    send_realtime_json(
-                        &mut replacement,
-                        json!({"type":"conversation.item.created","item":{"id":seed["item"]["id"]}}),
-                    )
-                    .await;
-                    if text.contains("do not hand them off again") {
-                        let _ = note_tx.try_send(seed);
+                    if seed["type"] == "conversation.item.create" {
+                        send_realtime_json(
+                            &mut replacement,
+                            json!({"type":"conversation.item.created","item":{"id":seed["item"]["id"]}}),
+                        )
+                        .await;
                     }
                 }
             });
@@ -3487,14 +3469,10 @@ fn expert_voice_handoffs_survive_provider_expiry_and_a_current_reply_answers_the
         endpoint,
         &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
-    let note = note_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(
-        note.to_string().contains("- inspect the repository"),
-        "{note}"
-    );
+    renewed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
 
-    // A reply written before everything since waits for it, and once it
-    // acknowledges the latest, naming no handoff, it answers them all.
+    // A reply written before everything since waits for it, and is said once
+    // it acknowledges the latest.
     session.send(json!({
         "type":"prepare_speak",
         "id":2,
