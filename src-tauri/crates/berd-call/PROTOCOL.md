@@ -206,7 +206,7 @@ it never admits a replacement while old host audio may still be active.
 {"type":"set_spokesperson_settings","id":u64,"expected_revision":u64,"settings":TtsSettings}
 {"type":"set_input_during_tts","id":u64,"expected_revision":u64,"policy":"allow_barge_in"|"suppress_input"}
 {"type":"reset_input","id":u64}
-{"type":"prepare_speak","id":u64,"acknowledgement":u64|null,"text":string,"resolved_handoff_ids":[string]?,"voice":string?,"language":string?}
+{"type":"prepare_speak","id":u64,"acknowledgement":u64|null,"text":string,"resolved_handoff_ids":[string]?,"voice":string?,"language":string?,"relay":bool?}
 {"type":"output_ready","id":u64,"speech_id":u64}
 audio acknowledgements listed above
 {"type":"query_state","id":u64,"after":u64}
@@ -222,7 +222,9 @@ too. A voice the backend doesn't offer, or a voice for a call whose replies
 are spoken by the Spokesperson, is `not_admitted(invalid_voice)`. In a call
 whose replies have their own voice, a reply is admitted however stale its
 `acknowledgement`, never `pending`, and answers every open handoff once
-admitted, so `resolved_handoff_ids` is ignored. Open handoffs there don't hold
+admitted, so `resolved_handoff_ids` is ignored. With `relay: true` (what
+`berd-call message-spokesperson` sends), the Spokesperson says such a reply instead, as it would in a call without its own
+voice, and it reports the same lifecycle. Open handoffs there don't hold
 back a renewal or recovery of the Spokesperson's session; the replacement is
 told what they asked.
 The parent cannot author speaking state or finalized input; those are derived

@@ -30,6 +30,7 @@ pub(crate) trait HostControl: Send + Sync + 'static {
         resolved_handoff_ids: Vec<String>,
         voice: Option<String>,
         language: Option<String>,
+        relay: bool,
     ) -> Result<Value, String>;
     fn stop(&self) -> Result<Value, String>;
     fn set_non_blocking(&self, enabled: bool) -> Result<Value, String>;
@@ -121,6 +122,8 @@ pub(crate) enum ControlRequest {
         voice: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay: bool,
     },
     Stop,
     NonBlocking {
@@ -239,6 +242,7 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                     resolved_handoff_ids,
                     voice,
                     language,
+                    relay,
                 } => {
                     validate_speak(
                         &text,
@@ -246,7 +250,17 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                         voice.as_deref(),
                         language.is_some(),
                     )?;
-                    control.speak(text, acknowledgement, resolved_handoff_ids, voice, language)
+                    if relay && voice.is_some() {
+                        return Err("a message to the Spokesperson takes no voice".into());
+                    }
+                    control.speak(
+                        text,
+                        acknowledgement,
+                        resolved_handoff_ids,
+                        voice,
+                        language,
+                        relay,
+                    )
                 }
                 ControlRequest::Stop => control.stop(),
                 ControlRequest::TtsSettings { settings } => control.set_tts(settings),
@@ -413,6 +427,7 @@ mod tests {
             resolved_handoff_ids: Vec<String>,
             voice: Option<String>,
             language: Option<String>,
+            relay: bool,
         ) -> Result<Value, String> {
             Ok(json!({
                 "spoken":text,
@@ -420,6 +435,7 @@ mod tests {
                 "resolvedHandoffIds":resolved_handoff_ids,
                 "voice":voice,
                 "language":language,
+                "relay":relay,
             }))
         }
 
@@ -468,6 +484,7 @@ mod tests {
                     resolved_handoff_ids: vec!["call-1".into()],
                     voice: Some("Nora".into()),
                     language: Some("en-GB".into()),
+                    relay: false,
                 }
             )
             .unwrap(),
@@ -477,6 +494,7 @@ mod tests {
                 "resolvedHandoffIds":["call-1"],
                 "voice":"Nora",
                 "language":"en-GB",
+                "relay":false,
             })
         );
         assert_eq!(

@@ -3094,6 +3094,112 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
 }
 
 #[test]
+fn a_relayed_reply_is_said_by_the_spokesperson_and_answers_every_handoff() {
+    let (speech_url, speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (relay_tx, relay_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                for (call_id, message) in [
+                    ("handoff-1", "inspect the repository"),
+                    ("handoff-2", "check the tests"),
+                ] {
+                    send_realtime_json(
+                        &mut socket,
+                        json!({
+                            "type":"response.function_call_arguments.done",
+                            "response_id":format!("response-{call_id}"),
+                            "call_id":call_id,
+                            "name":"handoff",
+                            "arguments":json!({"message":message}).to_string()
+                        }),
+                    )
+                    .await;
+                    while receive_realtime_json(&mut socket)
+                        .await
+                        .pointer("/item/type")
+                        != Some(&json!("function_call_output"))
+                    {}
+                }
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    if text.contains("I checked the repository.") {
+                        let _ = relay_tx.try_send(serde_json::from_str::<Value>(&text).unwrap());
+                    }
+                }
+            });
+    });
+    let endpoint = endpoint_rx.recv().unwrap();
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint,
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    loop {
+        session.send(json!({"type":"query_state","id":1,"after":0}));
+        let state = loop {
+            let message = session.recv(Duration::from_secs(2));
+            assert_ne!(message["type"], "fatal", "{message}");
+            if message["type"] == "state" {
+                break message;
+            }
+        };
+        if state["unresolved_handoff_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == 2)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Stale, naming no handoff, and still the Spokesperson's to say.
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":0,
+        "text":"I checked the repository.",
+        "relay":true
+    }));
+    let admitted = loop {
+        let message = session.recv(Duration::from_secs(2));
+        assert_ne!(message["type"], "fatal", "{message}");
+        if message["id"] == 2 {
+            break message;
+        }
+    };
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    let relayed = relay_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(
+        relayed.to_string().contains("Speak it naturally"),
+        "{relayed}"
+    );
+    session.send(json!({"type":"query_state","id":3,"after":0}));
+    let state = loop {
+        let message = session.recv(Duration::from_secs(2));
+        if message["type"] == "state" {
+            break message;
+        }
+    };
+    assert_eq!(state.get("unresolved_handoff_ids"), None, "{state}");
+    assert!(speech_requests
+        .recv_timeout(Duration::from_millis(300))
+        .is_err());
+    session.shutdown();
+    server.join().unwrap();
+}
+
+#[test]
 fn expert_voice_handoffs_survive_provider_expiry_and_any_late_reply_answers_them() {
     let (speech_url, speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);

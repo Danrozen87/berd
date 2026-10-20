@@ -56,6 +56,9 @@ pub enum SessionRequest {
         voice: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
+        /// The Spokesperson says it, even in a call where the Expert has its own voice.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay: bool,
     },
     OutputReady {
         id: u64,
@@ -401,6 +404,7 @@ mod tests {
                 resolved_handoff_ids: Vec::new(),
                 voice: None,
                 language: None,
+                relay: false,
             }
         );
         assert_eq!(

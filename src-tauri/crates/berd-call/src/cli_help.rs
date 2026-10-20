@@ -8,6 +8,7 @@ Usage:
 Call runtime:
   start                   Run a microphone-backed local voice call
   speak                   Speak through the active local call
+  message-spokesperson    Have the Spokesperson tell the user
   status                  Inspect the active local call
   catch-up                Read finalized input after a cursor
   wait-for-input          Wait for finalized input after a cursor
@@ -68,6 +69,16 @@ this text in another voice of the call's reply backend without changing its save
 voice, so several agents can share one call in distinct voices. In a call with
 --expert-voice tts, every reply is spoken however stale --re is, and answers
 every open handoff, so --resolves is ignored."#;
+
+const MESSAGE_SPOKESPERSON_HELP: &str = r#"Message the Spokesperson of the active realtime call.
+
+Usage:
+  berd-call message-spokesperson [--port PORT] TEXT
+
+The Spokesperson tells the user in its own voice, even in a call with
+--expert-voice tts, where `speak` uses the Expert's. Like `speak` there, it is
+admitted however much the user has said since, answers every open handoff, and
+reports the same result."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 
@@ -213,6 +224,7 @@ fn help_for(topic: &[&str]) -> Option<&'static str> {
         [] => Some(TOP_LEVEL_HELP),
         ["start"] => Some(START_HELP),
         ["speak"] => Some(SPEAK_HELP),
+        ["message-spokesperson"] => Some(MESSAGE_SPOKESPERSON_HELP),
         ["status"] => Some(STATUS_HELP),
         ["catch-up"] | ["wait-for-input"] => Some(POLL_INPUT_HELP),
         ["settings"] => Some(SETTINGS_HELP),
