@@ -138,6 +138,8 @@ enum PlaybackEvent {
 #[derive(Debug)]
 struct PlaybackFailure {
     message: String,
+    /// What the host had played when playback failed.
+    delivery: DeliveryProgress,
     output_quiescent: bool,
 }
 
@@ -4190,7 +4192,7 @@ fn run_expert_spokesperson_session(
                             speech_id,
                             message: failure.message,
                         },
-                        0,
+                        estimated_spoken_through_utf8(&text, &failure.delivery),
                     )
                 }
             };
@@ -8172,17 +8174,16 @@ fn play_tts(
     active: &AtomicBool,
 ) -> Result<(bool, DeliveryProgress), PlaybackFailure> {
     if let Err(message) = output.start() {
+        let delivery = DeliveryProgress {
+            sample_rate: backend.pcm_spec().sample_rate,
+            segments: Vec::new(),
+        };
         if message == AUDIO_CANCELLED {
-            return Ok((
-                false,
-                DeliveryProgress {
-                    sample_rate: backend.pcm_spec().sample_rate,
-                    segments: Vec::new(),
-                },
-            ));
+            return Ok((false, delivery));
         }
         return Err(PlaybackFailure {
             message,
+            delivery,
             output_quiescent: output.failure_is_quiescent(),
         });
     }
@@ -8223,19 +8224,26 @@ fn synthesize_to_output_with_finish(
     use berd_call::{DrainPolicy, DrainTimeoutOutcome, OutboundOutcome, OutboundPlayback};
 
     let spec = backend.pcm_spec();
+    let unplayed = || DeliveryProgress {
+        sample_rate: spec.sample_rate,
+        segments: Vec::new(),
+    };
     let initial_frames = usize::try_from(spec.sample_rate / 5).map_err(|_| PlaybackFailure {
         message: "TTS sample rate is too large".into(),
+        delivery: unplayed(),
         output_quiescent: false,
     })?;
     let mut playback = OutboundPlayback::new(output, active, spec.sample_rate, initial_frames)
         .map_err(|message| PlaybackFailure {
             message,
+            delivery: unplayed(),
             output_quiescent: false,
         })?;
     if playback
         .synthesize_segment(backend, text, &mut |_| Ok(()), on_started, &mut |_| Ok(()))
         .map_err(|failure| PlaybackFailure {
             message: failure.message,
+            delivery: failure.delivery,
             output_quiescent: failure.output_quiescent,
         })?
         == OutboundOutcome::Interrupted
@@ -8246,6 +8254,7 @@ fn synthesize_to_output_with_finish(
         let output_quiescent = output.cancel_and_snapshot().is_ok();
         return Err(PlaybackFailure {
             message,
+            delivery: playback.snapshot(),
             output_quiescent,
         });
     }
@@ -8260,6 +8269,7 @@ fn synthesize_to_output_with_finish(
         )
         .map_err(|failure| PlaybackFailure {
             message: failure.message,
+            delivery: failure.delivery,
             output_quiescent: failure.output_quiescent,
         })?;
     Ok((outcome == OutboundOutcome::Completed, playback.snapshot()))

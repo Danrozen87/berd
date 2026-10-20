@@ -3160,3 +3160,126 @@ fn expert_voice_reply_waits_for_output_ready_before_playing() {
     assert_eq!(session.recv(Duration::from_secs(2))["outcome"], "stale");
     session.shutdown();
 }
+
+/// Fails an Expert reply answering a handoff once the host has played `played_frames` of it,
+/// returning the failure, what the Spokesperson was told, and the handoffs left open.
+fn fail_expert_reply_after(played_frames: u64) -> (Value, String, Value) {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (context_tx, context_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                send_realtime_json(
+                    &mut socket,
+                    json!({
+                        "type":"response.function_call_arguments.done",
+                        "response_id":"response-handoff",
+                        "call_id":"handoff-reply",
+                        "name":"handoff",
+                        "arguments":"{\"message\":\"inspect the repository\"}"
+                    }),
+                )
+                .await;
+                let context = loop {
+                    let text = receive_realtime_json(&mut socket).await.to_string();
+                    if text.contains("spoken reply") || text.contains("in its own voice") {
+                        break text;
+                    }
+                };
+                context_tx.send(context).unwrap();
+                while socket.next().await.is_some() {}
+            });
+    });
+    let (observed, playing) = mpsc::sync_channel(1);
+    let (release_drain, release) = mpsc::sync_channel(1);
+    let mut session = ExpertSpokespersonTestSession::launch(
+        endpoint_rx.recv().unwrap(),
+        None,
+        Some(played_frames),
+        None,
+        Some(AudioCancellationGate {
+            observed,
+            release,
+            at_drain: true,
+        }),
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    assert_eq!(session.recv(Duration::from_secs(2))["origin"], "handoff");
+    assert_eq!(
+        session.recv(Duration::from_secs(2))["handoff_ids"],
+        json!(["handoff-external-1"])
+    );
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":1,
+        "text":"I checked the repository and found three failing tests in the parser.",
+        "resolved_handoff_ids":["handoff-external-1"]
+    }));
+    let admitted = session.recv(Duration::from_secs(2));
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    session.send(json!({"type":"output_ready","id":2,"speech_id":admitted["speech_id"]}));
+    playing.recv_timeout(Duration::from_secs(2)).unwrap();
+    release_drain.send(()).unwrap();
+    session.send(json!({
+        "type":"audio_failed",
+        "speech_id":admitted["speech_id"],
+        "played_frames":played_frames,
+        "message":"output device disappeared"
+    }));
+    let failed = loop {
+        let message = session.recv(Duration::from_secs(2));
+        assert!(
+            !matches!(
+                message["type"].as_str(),
+                Some("fatal" | "speech_completed" | "speech_interrupted")
+            ),
+            "{message}"
+        );
+        if message["type"] == "speech_failed" {
+            break message;
+        }
+    };
+    let context = context_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    session.send(json!({"type":"query_state","id":3,"after":0}));
+    let state = loop {
+        let message = session.recv(Duration::from_secs(2));
+        if message["type"] == "state" {
+            break message;
+        }
+    };
+    session.shutdown();
+    (failed, context, state["unresolved_handoff_ids"].clone())
+}
+
+#[test]
+fn a_failed_expert_reply_tells_the_spokesperson_what_was_heard() {
+    let (failed, context, unresolved) = fail_expert_reply_after(1_000);
+    assert_eq!(failed["id"], 2);
+    assert!(
+        context.contains("in its own voice") && context.contains("I checked the repository"),
+        "{context}"
+    );
+    assert!(!context.contains("in the parser"), "{context}");
+    assert!(unresolved.is_null(), "{unresolved}");
+}
+
+#[test]
+fn an_expert_reply_that_fails_unheard_leaves_its_handoffs_open() {
+    let (failed, context, unresolved) = fail_expert_reply_after(0);
+    assert_eq!(failed["id"], 2);
+    assert!(context.contains("before hearing any of it"), "{context}");
+    assert_eq!(unresolved, json!(["handoff-external-1"]));
+}
