@@ -68,16 +68,14 @@ without changing the call's voice, so agents sharing a call can sound distinct.
 server listens only on `127.0.0.1:5222` by default; all four commands accept
 `--port` when more than one local call must be addressed. `--stream` writes one
 TSV row per delivered transcript event after the `cursor`, `role`, and `text`
-header. In Expert-Spokesperson mode the Expert, like a GPT-Live delegate, hears
-the conversation only when the Spokesperson hands off: the stream prints
-nothing until then, and then every row since the last handoff, ending with the
-`handoff` row. `--stream live` instead shows the conversation as it happens: a
+header. In Expert-Spokesperson mode the stream hears the call as Berd's Expert
+does: a batch of every row since the last one after each Spokesperson reply,
+and at each handoff, ending with the `handoff` row. `--stream live` instead shows the conversation as it happens: a
 `user` row as soon as the words are transcribed, and a `spokesperson_generated`
 row with cursor `0` as soon as a reply is generated, before it is spoken. The
 `spokesperson` or `spokesperson_interrupted` row after playback carries the
 reply's cursor and what was heard. A conventional call has no handoffs, so it
-always streams each row. A `--codex` task hears the call as Berd's Expert
-does: a batch after every Spokesperson reply, and at each handoff. The standalone host intentionally uses only the default devices. It
+always streams each row. A `--codex` task gets the same batches as `--stream`. The standalone host intentionally uses only the default devices. It
 suppresses recognition during playback when the default output
 identifies itself as built-in speakers, preventing the call from transcribing
 its own speech; headphone-like outputs retain barge-in.
