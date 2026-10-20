@@ -4439,6 +4439,64 @@ mod tests {
     }
 
     #[test]
+    fn spokesperson_updates_keep_its_other_setting_and_revision() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let mut snapshot = test_snapshot();
+        let openai = |voice: &str, rate| berd_call::TtsSettings::OpenAi {
+            model: "gpt-realtime".into(),
+            voice: voice.into(),
+            rate,
+        };
+        let session = Arc::new(Mutex::new(snapshot.clone()));
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::clone(&session),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            transcript: Arc::new(Transcript::Silent),
+            speaks: true,
+            session_arguments: vec!["session".into()],
+        };
+        let refusal = control.set_spokesperson(None, Some(1.5)).unwrap_err();
+        assert!(
+            refusal.contains("no separate Spokesperson voice"),
+            "{refusal}"
+        );
+        snapshot.spokesperson = Some(berd_call::TtsConfigurationSnapshot {
+            revision: 3,
+            settings: openai("marin", 1.25),
+        });
+        *session.lock().unwrap() = snapshot;
+        let worker = thread::spawn(move || {
+            (0..2)
+                .map(|_| match receiver.recv().unwrap() {
+                    ControlCommand::SpokespersonSettings {
+                        settings,
+                        expected_revision,
+                        response,
+                    } => {
+                        response.send(Ok(json!({}))).unwrap();
+                        (settings, expected_revision)
+                    }
+                    _ => panic!("expected a Spokesperson settings command"),
+                })
+                .collect::<Vec<_>>()
+        });
+        control.set_spokesperson(None, Some(1.5)).unwrap();
+        control
+            .set_spokesperson(Some("cedar".into()), None)
+            .unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            [(openai("marin", 1.5), 3), (openai("cedar", 1.25), 3)]
+        );
+    }
+
+    #[test]
     fn stop_cancels_a_pending_restart() {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
