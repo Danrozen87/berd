@@ -38,7 +38,8 @@ struct ExpertSpokespersonTestSession {
 struct AudioCancellationGate {
     observed: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
-    /// Hold the drain instead, as a hung host would, without reading anything after it.
+    /// Hold the drain instead, reading nothing after it, as a hung host would. Once released,
+    /// the host goes on without ever draining that speech.
     at_drain: bool,
 }
 
@@ -392,12 +393,14 @@ fn spawn_audio_host_with_played_limit(
                     let sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
                     let frames = u64::from_le_bytes(payload[16..24].try_into().unwrap());
                     assert_eq!(current, Some((speech_id, sequence, frames)));
-                    current = None;
                     if let Some(gate) = cancellation_gate.take_if(|gate| gate.at_drain) {
                         let _ = gate.observed.send(());
-                        let _ = gate.release.recv();
-                        return;
+                        if gate.release.recv().is_err() {
+                            return;
+                        }
+                        continue;
                     }
+                    current = None;
                     json!({"type":"audio_drained","speech_id":speech_id,"sequence":sequence,"played_frames":frames})
                 }
                 4 => {
@@ -2794,6 +2797,98 @@ fn expert_voice_keeps_a_separate_spokesperson_voice_control() {
     server.join().unwrap();
 }
 
+enum ReplyInterruption {
+    UserSpeech,
+    Cancel,
+}
+
+/// Stops an Expert reply partway through playback and returns what the session reports.
+fn interrupt_expert_reply(interruption: ReplyInterruption) -> (Value, usize) {
+    let (speech_url, _speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (user_speaks, user_speech) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let initial = receive_realtime_json(&mut socket).await;
+                acknowledge_realtime_session(&mut socket, &initial).await;
+                if user_speech.recv().is_ok() {
+                    send_realtime_json(
+                        &mut socket,
+                        json!({"type":"input_audio_buffer.speech_started","item_id":"user-1"}),
+                    )
+                    .await;
+                }
+                while socket.next().await.is_some() {}
+            });
+    });
+    let (observed, playing) = mpsc::sync_channel(1);
+    let (release_drain, release) = mpsc::sync_channel(1);
+    // The host has played part of the reply and is still playing it.
+    let mut session = ExpertSpokespersonTestSession::launch(
+        endpoint_rx.recv().unwrap(),
+        None,
+        Some(1_000),
+        None,
+        Some(AudioCancellationGate {
+            observed,
+            release,
+            at_drain: true,
+        }),
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    let text = "I checked the repository and found three failing tests in the parser.";
+    session.send(json!({"type":"prepare_speak","id":2,"acknowledgement":null,"text":text}));
+    let admitted = session.recv(Duration::from_secs(2));
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    session.send(json!({"type":"output_ready","id":2,"speech_id":admitted["speech_id"]}));
+    playing.recv_timeout(Duration::from_secs(2)).unwrap();
+    release_drain.send(()).unwrap();
+    match interruption {
+        ReplyInterruption::UserSpeech => user_speaks.send(()).unwrap(),
+        ReplyInterruption::Cancel => session.send(json!({"type":"cancel","id":2})),
+    }
+    let interrupted = loop {
+        let message = session.recv(Duration::from_secs(2));
+        assert!(
+            !matches!(
+                message["type"].as_str(),
+                Some("fatal" | "speech_failed" | "speech_completed")
+            ),
+            "{message}"
+        );
+        if message["type"] == "speech_interrupted" {
+            break message;
+        }
+    };
+    drop(user_speaks);
+    session.shutdown();
+    (interrupted, text.len())
+}
+
+#[test]
+fn user_speech_interrupts_an_expert_reply_where_it_was_heard() {
+    let (interrupted, length) = interrupt_expert_reply(ReplyInterruption::UserSpeech);
+    assert_eq!(interrupted["id"], 2);
+    assert!(interrupted["spoken_through_utf8"].as_u64().unwrap() < length as u64);
+}
+
+#[test]
+fn cancel_interrupts_an_expert_reply_where_it_was_heard() {
+    let (interrupted, length) = interrupt_expert_reply(ReplyInterruption::Cancel);
+    assert_eq!(interrupted["id"], 2);
+    assert!(interrupted["spoken_through_utf8"].as_u64().unwrap() < length as u64);
+}
+
 #[test]
 fn expert_voice_reply_whose_audio_never_settles_ends_the_session() {
     let (speech_url, _speech_requests) = spawn_speech_server();
@@ -2860,7 +2955,7 @@ fn expert_voice_reply_whose_audio_never_settles_ends_the_session() {
     let status = session.child.0.as_mut().unwrap().wait().unwrap();
     assert!(!status.success());
     cancel_observed.try_recv().unwrap();
-    release_cancel.send(()).unwrap();
+    drop(release_cancel);
 }
 
 #[test]
