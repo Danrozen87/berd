@@ -5237,9 +5237,10 @@ fn submit_expert_prepare(
     next_speech_id: &mut u64,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    // When the Expert has its own voice, any reply answers every open
-    // handoff, so the ones it names don't matter.
-    if !expert_tts
+    // A message to the Spokesperson, or any reply when the Expert has its own
+    // voice, answers every open handoff, so the ones it names don't matter.
+    let answers_all = expert_tts || request.relay;
+    if !answers_all
         && !core
             .unknown_handoff_ids(&request.resolved_handoff_ids)
             .is_empty()
@@ -5252,7 +5253,7 @@ fn submit_expert_prepare(
             },
         );
     }
-    let outcome = if expert_tts {
+    let outcome = if answers_all {
         core.prepare_expert_reply(request.text)
     } else {
         core.prepare_expert_directive(request.acknowledgement, request.text)
@@ -5293,8 +5294,8 @@ fn submit_expert_prepare(
                 response.server_finished = true;
                 responses.insert(response_id, response);
             } else {
-                // A relayed reply already answered every handoff when admitted.
-                let resolved_handoff_ids = if expert_tts {
+                // A message to the Spokesperson already answered every handoff when admitted.
+                let resolved_handoff_ids = if answers_all {
                     Vec::new()
                 } else {
                     request.resolved_handoff_ids

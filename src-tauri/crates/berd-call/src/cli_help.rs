@@ -76,9 +76,9 @@ Usage:
   berd-call message-spokesperson [--port PORT] TEXT
 
 The Spokesperson tells the user in its own voice, even in a call with
---expert-voice tts, where `speak` uses the Expert's. Like `speak` there, it is
-admitted however much the user has said since, answers every open handoff, and
-reports the same result."#;
+--expert-voice tts, where `speak` uses the Expert's. It is admitted however much
+the user has said since, answers every open handoff, and reports the same result
+as `speak`."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 
