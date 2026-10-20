@@ -1590,7 +1590,7 @@ fn expert_spokesperson_voice_change_swaps_atomically_and_flushes_gated_pcm_once(
 }
 
 #[test]
-fn user_activity_during_voice_cutover_rolls_back_and_flushes_gated_pcm_once() {
+fn user_activity_during_voice_cutover_rolls_back_then_retries_once_idle() {
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (clear_seen_tx, clear_seen_rx) = mpsc::sync_channel(1);
     let (release_activity_tx, release_activity_rx) = mpsc::sync_channel(1);
@@ -1664,6 +1664,29 @@ fn user_activity_during_voice_cutover_rolls_back_and_flushes_gated_pcm_once() {
                     .is_err());
                 rollback_seen_tx.send(()).unwrap();
                 let _ = candidate.next().await;
+
+                // Once the conversation is idle, the change is tried again, with the user's words.
+                let (retry_stream, _) = listener.accept().await.unwrap();
+                let mut retry = accept_async(retry_stream).await.unwrap();
+                let retry_update = receive_realtime_json(&mut retry).await;
+                assert_eq!(retry_update["session"]["audio"]["output"]["voice"], "new-voice");
+                acknowledge_realtime_session(&mut retry, &retry_update).await;
+                let seeds = tokio::spawn(async move {
+                    while let Some(Ok(Message::Text(text))) = retry.next().await {
+                        let seed: Value = serde_json::from_str(&text).unwrap();
+                        if seed["type"] == "conversation.item.create" {
+                            send_realtime_json(
+                                &mut retry,
+                                json!({"type":"conversation.item.created","item":{"id":seed["item"]["id"]}}),
+                            )
+                            .await;
+                        }
+                    }
+                });
+                while receive_realtime_json(&mut old).await["type"] != "input_audio_buffer.clear" {}
+                send_realtime_json(&mut old, json!({"type":"input_audio_buffer.cleared"})).await;
+                let _ = old.next().await;
+                seeds.await.unwrap();
             });
     });
     let endpoint = endpoint_rx.recv().unwrap();
@@ -1682,18 +1705,19 @@ fn user_activity_during_voice_cutover_rolls_back_and_flushes_gated_pcm_once() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut saw_user = false;
-    let mut saw_rejection = false;
-    while !(saw_user && saw_rejection) {
+    let mut applied = false;
+    while !(saw_user && applied) {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
-            .expect("rollback did not publish user input and settings rejection promptly");
+            .expect("the retried change did not apply promptly after the user's input");
         let message = session.recv(remaining);
         saw_user |= message["type"] == "live_event";
         if message["type"] == "tts_settings_result" {
-            assert_eq!(message["outcome"], "rejected");
-            assert_eq!(message["snapshot"]["revision"], 1);
-            assert_eq!(message["snapshot"]["voice"], "old-voice");
-            saw_rejection = true;
+            assert!(saw_user, "{message}");
+            assert_eq!(message["outcome"], "applied", "{message}");
+            assert_eq!(message["snapshot"]["revision"], 2);
+            assert_eq!(message["snapshot"]["voice"], "new-voice");
+            applied = true;
         }
     }
     rollback_seen_rx
@@ -2278,6 +2302,7 @@ fn voice_cutover_timeout_is_terminal_and_never_reports_a_settings_result() {
 fn live_event_promptly_aborts_a_stalled_voice_candidate_and_replies_on_old_runtime() {
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (candidate_seen_tx, candidate_seen_rx) = mpsc::sync_channel(1);
+    let (retry_seen_tx, retry_seen_rx) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2324,6 +2349,9 @@ fn live_event_promptly_aborts_a_stalled_voice_candidate_and_replies_on_old_runti
                 .expect("stalled candidate should be cancelled promptly")
                 .unwrap();
                 assert!(!pending_handshake.is_empty());
+                // The change is tried again once the user's turn is over.
+                let (_retry, _) = listener.accept().await.unwrap();
+                retry_seen_tx.send(()).unwrap();
                 let _ = old.next().await;
             });
     });
@@ -2338,21 +2366,18 @@ fn live_event_promptly_aborts_a_stalled_voice_candidate_and_replies_on_old_runti
     candidate_seen_rx
         .recv_timeout(Duration::from_secs(2))
         .unwrap();
-    let mut saw_user = false;
-    let mut saw_rejection = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !(saw_user && saw_rejection) {
+    loop {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
-            .expect("session did not report user input and voice rejection promptly");
+            .expect("session did not report user input promptly");
         let message = session.recv(remaining);
-        saw_user |= message["type"] == "live_event";
-        if message["type"] == "tts_settings_result" {
-            assert_eq!(message["outcome"], "rejected");
-            assert_eq!(message["snapshot"]["voice"], "old-voice");
-            saw_rejection = true;
+        assert_ne!(message["type"], "tts_settings_result", "{message}");
+        if message["type"] == "live_event" {
+            break;
         }
     }
+    retry_seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     session.shutdown();
     server.join().unwrap();
 }
