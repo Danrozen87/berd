@@ -4628,7 +4628,7 @@ fn run_expert_spokesperson_session(
                     response.prepare_id == Some(id) && response.speech_id == Some(speech_id)
                 };
                 let reply = responses.iter_mut().find(|(_, response)| {
-                    response.reply.is_some() && !response.output_ready && matches(response)
+                    response.reply && !response.output_ready && matches(response)
                 });
                 let valid = if let Some((response_id, response)) = reply {
                     response.output_ready = true;
@@ -4640,7 +4640,7 @@ fn run_expert_spokesperson_session(
                         .is_some_and(|directive| directive.speech_id == speech_id)
                         || responses
                             .values()
-                            .any(|response| response.reply.is_none() && matches(response))
+                            .any(|response| !response.reply && matches(response))
                 };
                 write_message(
                     &mut writer,

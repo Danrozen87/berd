@@ -3590,7 +3590,7 @@ fn expert_voice_reply_waits_for_output_ready_before_playing() {
     });
     let mut session = ExpertSpokespersonTestSession::start_with_args(
         endpoint_rx.recv().unwrap(),
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     session.send(json!({
         "type":"prepare_speak",
@@ -3635,9 +3635,9 @@ fn expert_voice_reply_waits_for_output_ready_before_playing() {
     session.shutdown();
 }
 
-/// Fails an Expert reply answering a handoff once the host has played `played_frames` of it,
-/// returning the failure, what the Spokesperson was told, and the handoffs left open.
-fn fail_expert_reply_after(played_frames: u64) -> (Value, String, Value) {
+/// Fails an Expert reply once the host has played `played_frames` of it, returning the
+/// failure and what the Spokesperson was told.
+fn fail_expert_reply_after(played_frames: u64) -> (Value, String) {
     let (speech_url, _speech_requests) = spawn_speech_server();
     let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
     let (context_tx, context_rx) = mpsc::sync_channel(1);
@@ -3655,17 +3655,6 @@ fn fail_expert_reply_after(played_frames: u64) -> (Value, String, Value) {
                 let mut socket = accept_async(stream).await.unwrap();
                 let initial = receive_realtime_json(&mut socket).await;
                 acknowledge_realtime_session(&mut socket, &initial).await;
-                send_realtime_json(
-                    &mut socket,
-                    json!({
-                        "type":"response.function_call_arguments.done",
-                        "response_id":"response-handoff",
-                        "call_id":"handoff-reply",
-                        "name":"handoff",
-                        "arguments":"{\"message\":\"inspect the repository\"}"
-                    }),
-                )
-                .await;
                 let context = loop {
                     let text = receive_realtime_json(&mut socket).await.to_string();
                     if text.contains("spoken reply") || text.contains("in its own voice") {
@@ -3688,19 +3677,14 @@ fn fail_expert_reply_after(played_frames: u64) -> (Value, String, Value) {
             release,
             at_drain: true,
         }),
-        &["--expert-voice", "tts", "--tts-url", &speech_url],
-    );
-    assert_eq!(session.recv(Duration::from_secs(2))["origin"], "handoff");
-    assert_eq!(
-        session.recv(Duration::from_secs(2))["handoff_ids"],
-        json!(["handoff-external-1"])
+        false,
+        &["--allow-direct-agent-speech", "--tts-url", &speech_url],
     );
     session.send(json!({
         "type":"prepare_speak",
         "id":2,
-        "acknowledgement":1,
-        "text":"I checked the repository and found three failing tests in the parser.",
-        "resolved_handoff_ids":["handoff-external-1"]
+        "acknowledgement":null,
+        "text":"I checked the repository and found three failing tests in the parser."
     }));
     let admitted = session.recv(Duration::from_secs(2));
     assert_eq!(admitted["type"], "admitted", "{admitted}");
@@ -3727,35 +3711,26 @@ fn fail_expert_reply_after(played_frames: u64) -> (Value, String, Value) {
         }
     };
     let context = context_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    session.send(json!({"type":"query_state","id":3,"after":0}));
-    let state = loop {
-        let message = session.recv(Duration::from_secs(2));
-        if message["type"] == "state" {
-            break message;
-        }
-    };
     session.shutdown();
-    (failed, context, state["unresolved_handoff_ids"].clone())
+    (failed, context)
 }
 
 #[test]
 fn a_failed_expert_reply_tells_the_spokesperson_what_was_heard() {
-    let (failed, context, unresolved) = fail_expert_reply_after(1_000);
+    let (failed, context) = fail_expert_reply_after(1_000);
     assert_eq!(failed["id"], 2);
     assert!(
         context.contains("in its own voice") && context.contains("I checked the repository"),
         "{context}"
     );
     assert!(!context.contains("in the parser"), "{context}");
-    assert!(unresolved.is_null(), "{unresolved}");
 }
 
 #[test]
-fn an_expert_reply_that_fails_unheard_leaves_its_handoffs_open() {
-    let (failed, context, unresolved) = fail_expert_reply_after(0);
+fn an_expert_reply_that_fails_unheard_tells_the_spokesperson_so() {
+    let (failed, context) = fail_expert_reply_after(0);
     assert_eq!(failed["id"], 2);
     assert!(context.contains("before hearing any of it"), "{context}");
-    assert_eq!(unresolved, json!(["handoff-external-1"]));
 }
 
 #[test]
