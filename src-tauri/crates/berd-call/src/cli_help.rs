@@ -8,6 +8,7 @@ Usage:
 Call runtime:
   start                   Run a microphone-backed local voice call
   speak                   Speak through the active local call
+  message-spokesperson    Have the Spokesperson tell the user
   status                  Inspect the active local call
   catch-up                Read finalized input after a cursor
   wait-for-input          Wait for finalized input after a cursor
@@ -33,14 +34,17 @@ Run `berd-call help <command>` for command-specific usage."#;
 const START_HELP: &str = r#"Run a local voice call backed by the shared session runtime.
 
 Usage:
-  berd-call start [--port PORT] [--stream | --codex] [--non-blocking]
+  berd-call start [--port PORT] [--stream [live] | --codex] [--non-blocking]
     [--no-menu-bar]
     --voice NAME --language BCP47 [session options]
 
 The foreground process owns the default microphone and audio output. Session
 options are the same as `berd-call session`, except the PCM descriptor is owned
-internally. `--stream` prints cursor, role, and text as TSV. `--codex` delivers
-the same records to the calling Codex task (requires CODEX_THREAD_ID). A
+internally. `--stream` prints cursor, role, and text as TSV. In
+Expert-Spokesperson mode it prints a batch after every Spokesperson reply and
+at each handoff, as Berd's Expert hears the call; `--stream live` prints each
+row as it happens. `--codex` delivers the same batches as `--stream` to the
+calling Codex task (requires CODEX_THREAD_ID). A
 menu-bar item controls speech rate, input muting, and ending the call; pass
 `--no-menu-bar` to omit it.
 
@@ -55,12 +59,30 @@ const SPEAK_HELP: &str = r#"Speak through the active local voice call.
 
 Usage:
   berd-call speak [--port PORT] [--re CURSOR]
-    [--resolves HANDOFF_ID]... TEXT
+    [--resolves HANDOFF_ID]... [--voice NAME [--language BCP47]] TEXT
 
 Speech waits for admission. The session setting controls whether it also waits
 for delivery. Non-blocking sessions require --stream or --codex and emit speech_result
 rows only for interruptions, failures, or pending user input. Interrupted results include
-estimatedSpokenText, a best-effort prefix based on delivered audio."#;
+estimatedSpokenText, a best-effort prefix based on delivered audio. --voice speaks
+this text in another voice of the call's reply backend without changing its saved
+voice, so several agents can share one call in distinct voices. An
+Expert-Spokesperson call refuses speak unless started with
+--allow-direct-agent-speech; otherwise use message-spokesperson. With it, a
+reply acknowledging the latest input is spoken in the Expert's own voice, and
+handoffs are never held open, so there is nothing for --resolves to name."#;
+
+const MESSAGE_SPOKESPERSON_HELP: &str = r#"Message the Spokesperson of the active realtime call.
+
+Usage:
+  berd-call message-spokesperson [--port PORT] --re CURSOR
+    [--resolves HANDOFF_ID]... TEXT
+
+The Spokesperson tells the user in its own voice, even in a call with
+--allow-direct-agent-speech, where `speak` uses the Expert's. Like a directive
+from Berd's Expert, the message must acknowledge the latest input (the
+Spokesperson's own speech doesn't count), each --resolves settles that handoff
+once the Spokesperson has said it, and the result is the same as `speak`'s."#;
 
 const SETTINGS_HELP: &str = r#"Update settings for the active local voice call.
 
@@ -68,13 +90,24 @@ Usage:
   berd-call settings [--port PORT] --non-blocking true|false
   berd-call settings [--port PORT] --rate FLOAT
   berd-call settings [--port PORT] --voice NAME [--language BCP47]
+  berd-call settings [--port PORT] --spokesperson-voice NAME
+  berd-call settings [--port PORT] --spokesperson-rate FLOAT
   berd-call settings [--port PORT] --tts JSON
   berd-call settings [--port PORT] --input-during-tts allow|suppress
   berd-call settings [--port PORT] --muted true|false
+  berd-call settings [--port PORT] --spokesperson true|false
   berd-call settings [--port PORT] --restart [session options]
 
-The setting applies to subsequent speak calls. Non-blocking delivery requires
-a call started with --stream or --codex. Successful delivery produces no notification."#;
+The setting applies to subsequent speak calls. In a call started with
+--allow-direct-agent-speech, --voice and --rate change the agents' voice, and
+--spokesperson-voice changes the Spokesperson's (an OpenAI realtime voice).
+--rate also sets the Spokesperson's speed, as close as it can go (0.25 to
+1.5); --spokesperson-rate sets only the Spokesperson's. --spokesperson turns the Spokesperson on
+or off, restarting the call's session in the other mode with the same voice;
+options only the other mode takes are dropped, and in a call started with
+--stream live, agents keep their own voice beside the Spokesperson's.
+Non-blocking delivery requires a call started with --stream or --codex.
+Successful delivery produces no notification."#;
 
 const STATUS_HELP: &str = r#"Inspect the active local voice call.
 
@@ -110,13 +143,20 @@ Usage:
 Each form also accepts:
     [--rate FLOAT]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH]
-    [--mode conventional|expert-spokesperson]
+    [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
+    [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
 contracts. Endpoint URL flags override only the matching service for this call
-and default to OpenAI when no environment override is set."#;
+and default to OpenAI when no environment override is set.
+
+In expert-spokesperson mode, the Expert speaks through the Spokesperson.
+--allow-direct-agent-speech also lets it speak to the user itself, through the
+configured TTS backend, in its own voice beside the Spokesperson's. --spokesperson-voice then
+chooses the Spokesperson's own voice. It speaks as close to --rate as it can, unless
+--spokesperson-rate chooses its own speed."#;
 
 const SYNTHESIZE_HELP: &str = r#"Render text through a configured TTS backend into a new WAV file.
 
@@ -195,6 +235,7 @@ fn help_for(topic: &[&str]) -> Option<&'static str> {
         [] => Some(TOP_LEVEL_HELP),
         ["start"] => Some(START_HELP),
         ["speak"] => Some(SPEAK_HELP),
+        ["message-spokesperson"] => Some(MESSAGE_SPOKESPERSON_HELP),
         ["status"] => Some(STATUS_HELP),
         ["catch-up"] | ["wait-for-input"] => Some(POLL_INPUT_HELP),
         ["settings"] => Some(SETTINGS_HELP),

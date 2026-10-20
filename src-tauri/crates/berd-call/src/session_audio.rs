@@ -17,12 +17,16 @@ pub const AUDIO_END_KIND: u8 = 3;
 pub const AUDIO_CANCEL_KIND: u8 = 4;
 pub const AUDIO_FRAME_HEADER_BYTES: usize = 8;
 pub const MAX_AUDIO_CHUNK_FRAMES: usize = 4096;
-const MIN_ACCEPTED_AUDIO_RUNWAY_MS: f64 = 400.0;
+/// Audio the host may hold beyond what it reports played. It reports a chunk played only once the output device has played it,
+/// up to a few hundred milliseconds after it is heard on Bluetooth headphones, so this must outlast that delay or playback runs dry.
+const MIN_ACCEPTED_AUDIO_RUNWAY_MS: f64 = 1_000.0;
 const MAX_ACCEPTED_NOT_PLAYED_CHUNKS: usize = 64;
 
 const AUDIO_PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const AUDIO_CANCELLED: &str = "remote PCM output was cancelled";
+/// The host's player stopped, as when the output device changes under it; the host has ended that speech.
+pub const AUDIO_HOST_FAILED: &str = "host audio output failed";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioHostAck {
@@ -619,7 +623,7 @@ impl RemotePcmAudioOutput {
             Err(state
                 .failure
                 .clone()
-                .unwrap_or_else(|| "host audio output failed".into()))
+                .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
         } else {
             Ok(())
         }
@@ -666,7 +670,7 @@ impl RemotePcmAudioOutput {
                     return Err(state
                         .failure
                         .clone()
-                        .unwrap_or_else(|| "host audio output failed".into()));
+                        .unwrap_or_else(|| AUDIO_HOST_FAILED.into()));
                 }
                 Phase::Cancelling => false,
                 Phase::WaitingBegin
@@ -710,7 +714,7 @@ impl RemotePcmAudioOutput {
                         return Err(state
                             .failure
                             .clone()
-                            .unwrap_or_else(|| "host audio output failed".into()))
+                            .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
                     }
                     Phase::Drained => return Err("remote PCM output is already drained".into()),
                     _ => {}
@@ -759,7 +763,7 @@ impl RemotePcmAudioOutput {
                 return Err(state
                     .failure
                     .clone()
-                    .unwrap_or_else(|| "host audio output failed".into()));
+                    .unwrap_or_else(|| AUDIO_HOST_FAILED.into()));
             }
             if state.suspension == SuspensionPhase::Suspended && state.suspension_requested {
                 while state.suspension_requested && self.active.load(Ordering::SeqCst) {
@@ -889,7 +893,7 @@ impl PcmAudioOutput for RemotePcmAudioOutput {
             Err(state
                 .failure
                 .clone()
-                .unwrap_or_else(|| "host audio output failed".into()))
+                .unwrap_or_else(|| AUDIO_HOST_FAILED.into()))
         } else {
             Ok(())
         }
@@ -912,7 +916,7 @@ fn accepted_audio_runway_frames(spec: TtsPcmSpec) -> u64 {
 }
 
 fn public_host_failure(_message: String) -> String {
-    "host audio output failed".into()
+    AUDIO_HOST_FAILED.into()
 }
 
 #[cfg(test)]
@@ -1040,8 +1044,8 @@ mod tests {
         let (output, mut host) = fixture();
         start(&output, &mut host);
         let current = Arc::clone(&output);
-        let worker = thread::spawn(move || current.write(&vec![0.25; 4096 * 4]));
-        for sequence in 1..=3 {
+        let worker = thread::spawn(move || current.write(&vec![0.25; 4096 * 7]));
+        for sequence in 1..=6 {
             let (kind, _) = read_record(&mut host);
             assert_eq!(kind, AUDIO_CHUNK_KIND);
             let started = output
@@ -1062,7 +1066,7 @@ mod tests {
         let (kind, _) = read_record(&mut host);
         assert_eq!(kind, AUDIO_CHUNK_KIND);
         output
-            .handle_ack(AudioHostAck::ChunkAccepted { sequence: 4 })
+            .handle_ack(AudioHostAck::ChunkAccepted { sequence: 7 })
             .unwrap();
         worker.join().unwrap().unwrap();
     }
@@ -1525,14 +1529,14 @@ mod tests {
                     sample_rate: 48_000,
                     playback_rate: 1.5,
                 },
-                8,
+                18,
             ),
             (
                 TtsPcmSpec {
                     sample_rate: 24_000,
                     playback_rate: 2.0,
                 },
-                5,
+                12,
             ),
         ] {
             let (output, mut host) =
@@ -1577,6 +1581,86 @@ mod tests {
             .handle_ack(AudioHostAck::ChunkAccepted { sequence: 1 })
             .unwrap();
         worker.join().unwrap().unwrap();
+    }
+
+    /// The silence, in milliseconds, a host playing in real time leaves in 3 s of audio written at once, when it reports each chunk played `lag` after it is heard, as the output device does.
+    fn silence_when_played_reports_lag(lag: Duration) -> f64 {
+        let (output, mut host) = fixture();
+        start(&output, &mut host);
+        // When each chunk is heard, and its frames.
+        let heard = Arc::new(Mutex::new(Vec::<(Instant, Instant, u64)>::new()));
+        let writing = Arc::new(AtomicBool::new(true));
+        let reporter = {
+            let (output, heard, writing) = (
+                Arc::clone(&output),
+                Arc::clone(&heard),
+                Arc::clone(&writing),
+            );
+            thread::spawn(move || {
+                while writing.load(Ordering::SeqCst) {
+                    let now = Instant::now();
+                    let done: u64 = heard
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, end, _)| *end + lag <= now)
+                        .map(|(_, _, frames)| frames)
+                        .sum();
+                    // Less the host's delivery safety, 100 ms.
+                    let played = done.saturating_sub(2_400);
+                    if played > output.played_frames() {
+                        output
+                            .handle_ack(AudioHostAck::Played {
+                                played_frames: played,
+                            })
+                            .unwrap();
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let writer = {
+            let output = Arc::clone(&output);
+            thread::spawn(move || {
+                output.write(&vec![0.25; 72_000])?;
+                output.finish_writes()
+            })
+        };
+        loop {
+            let (kind, payload) = read_record(&mut host);
+            if kind == AUDIO_END_KIND {
+                break;
+            }
+            let frames = (payload.len() as u64 - 16) / 4;
+            let mut heard = heard.lock().unwrap();
+            let start = heard
+                .last()
+                .map_or_else(Instant::now, |(_, end, _)| (*end).max(Instant::now()));
+            heard.push((
+                start,
+                start + Duration::from_micros(frames * 1_000 / 24),
+                frames,
+            ));
+            drop(heard);
+            let sequence = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            output
+                .handle_ack(AudioHostAck::ChunkAccepted { sequence })
+                .unwrap();
+        }
+        writer.join().unwrap().unwrap();
+        writing.store(false, Ordering::SeqCst);
+        reporter.join().unwrap();
+        let heard = heard.lock().unwrap();
+        heard
+            .windows(2)
+            .map(|pair| pair[1].0.duration_since(pair[0].1).as_secs_f64() * 1_000.0)
+            .sum()
+    }
+
+    #[test]
+    fn playback_outlasts_bluetooth_played_reports() {
+        let silence = silence_when_played_reports_lag(Duration::from_millis(300));
+        assert!(silence < 20.0, "{silence:.0} ms of silence");
     }
 
     #[test]

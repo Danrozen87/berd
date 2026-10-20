@@ -28,18 +28,24 @@ pub(crate) trait HostControl: Send + Sync + 'static {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        voice: Option<String>,
+        language: Option<String>,
+        relay: bool,
     ) -> Result<Value, String>;
     fn stop(&self) -> Result<Value, String>;
     fn set_non_blocking(&self, enabled: bool) -> Result<Value, String>;
     fn set_tts(&self, settings: berd_call::TtsSettings) -> Result<Value, String>;
     fn set_rate(&self, rate: f32) -> Result<Value, String>;
     fn set_voice(&self, voice: String, language: Option<String>) -> Result<Value, String>;
+    fn set_spokesperson(&self, voice: Option<String>, rate: Option<f32>) -> Result<Value, String>;
     fn set_input_during_tts(
         &self,
         policy: berd_call::input::InputDuringTtsPolicy,
     ) -> Result<Value, String>;
     fn set_muted(&self, muted: bool) -> Result<Value, String>;
     fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String>;
+    /// Restarts the call's session with the Spokesperson on or off.
+    fn set_spokesperson_mode(&self, on: bool) -> Result<Value, String>;
 }
 
 pub(crate) struct ControlServer {
@@ -114,6 +120,12 @@ pub(crate) enum ControlRequest {
         acknowledgement: Option<u64>,
         #[serde(rename = "resolvedHandoffIds")]
         resolved_handoff_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay: bool,
     },
     Stop,
     NonBlocking {
@@ -129,6 +141,11 @@ pub(crate) enum ControlRequest {
         voice: String,
         language: Option<String>,
     },
+    /// The Spokesperson's voice or speed, when replies have their own.
+    Spokesperson {
+        voice: Option<String>,
+        rate: Option<f32>,
+    },
     InputDuringTts {
         policy: berd_call::input::InputDuringTtsPolicy,
     },
@@ -138,6 +155,9 @@ pub(crate) enum ControlRequest {
     Restart {
         #[serde(rename = "sessionArguments")]
         session_arguments: Vec<String>,
+    },
+    SpokespersonMode {
+        on: bool,
     },
 }
 
@@ -187,7 +207,9 @@ pub(crate) fn begin_request(port: u16, request: ControlRequest) -> Result<Pendin
             | ControlRequest::TtsSettings { .. }
             | ControlRequest::Rate { .. }
             | ControlRequest::Voice { .. }
+            | ControlRequest::Spokesperson { .. }
             | ControlRequest::Restart { .. }
+            | ControlRequest::SpokespersonMode { .. }
     ) {
         None
     } else {
@@ -224,18 +246,40 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                     text,
                     acknowledgement,
                     resolved_handoff_ids,
+                    voice,
+                    language,
+                    relay,
                 } => {
-                    validate_speak(&text, &resolved_handoff_ids)?;
-                    control.speak(text, acknowledgement, resolved_handoff_ids)
+                    validate_speak(
+                        &text,
+                        &resolved_handoff_ids,
+                        voice.as_deref(),
+                        language.is_some(),
+                    )?;
+                    if relay && voice.is_some() {
+                        return Err("a message to the Spokesperson takes no voice".into());
+                    }
+                    control.speak(
+                        text,
+                        acknowledgement,
+                        resolved_handoff_ids,
+                        voice,
+                        language,
+                        relay,
+                    )
                 }
                 ControlRequest::Stop => control.stop(),
                 ControlRequest::TtsSettings { settings } => control.set_tts(settings),
                 ControlRequest::Rate { rate } => control.set_rate(rate),
                 ControlRequest::Voice { voice, language } => control.set_voice(voice, language),
+                ControlRequest::Spokesperson { voice, rate } => {
+                    control.set_spokesperson(voice, rate)
+                }
                 ControlRequest::NonBlocking { enabled } => control.set_non_blocking(enabled),
                 ControlRequest::InputDuringTts { policy } => control.set_input_during_tts(policy),
                 ControlRequest::Muted { muted } => control.set_muted(muted),
                 ControlRequest::Restart { session_arguments } => control.restart(session_arguments),
+                ControlRequest::SpokespersonMode { on } => control.set_spokesperson_mode(on),
             },
         );
     let response = match result {
@@ -300,7 +344,15 @@ fn write_json_line(
         .map_err(|error| format!("could not write berd-call {label}: {error}"))
 }
 
-fn validate_speak(text: &str, resolved_handoff_ids: &[String]) -> Result<(), String> {
+fn validate_speak(
+    text: &str,
+    resolved_handoff_ids: &[String],
+    voice: Option<&str>,
+    language: bool,
+) -> Result<(), String> {
+    if voice.is_some_and(|voice| voice.trim().is_empty()) || language && voice.is_none() {
+        return Err("speak --language requires a nonempty --voice".into());
+    }
     if text.trim().is_empty() {
         return Err("speak text must not be empty".into());
     }
@@ -349,6 +401,13 @@ mod tests {
         fn set_voice(&self, voice: String, language: Option<String>) -> Result<Value, String> {
             Ok(json!({"voice": voice, "language": language}))
         }
+        fn set_spokesperson(
+            &self,
+            voice: Option<String>,
+            rate: Option<f32>,
+        ) -> Result<Value, String> {
+            Ok(json!({"spokesperson": {"voice": voice, "rate": rate}}))
+        }
         fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
             Ok(json!({"nonBlocking": enabled}))
         }
@@ -364,6 +423,9 @@ mod tests {
         fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
             Ok(json!({"sessionArguments": session_arguments}))
         }
+        fn set_spokesperson_mode(&self, on: bool) -> Result<Value, String> {
+            Ok(json!({"spokesperson": on}))
+        }
         fn status(&self) -> Result<Value, String> {
             Ok(json!({"running": !self.stopped.load(Ordering::SeqCst)}))
         }
@@ -373,11 +435,17 @@ mod tests {
             text: String,
             acknowledgement: Option<u64>,
             resolved_handoff_ids: Vec<String>,
+            voice: Option<String>,
+            language: Option<String>,
+            relay: bool,
         ) -> Result<Value, String> {
             Ok(json!({
                 "spoken":text,
                 "acknowledgement":acknowledgement,
                 "resolvedHandoffIds":resolved_handoff_ids,
+                "voice":voice,
+                "language":language,
+                "relay":relay,
             }))
         }
 
@@ -424,6 +492,9 @@ mod tests {
                     text: "hello".into(),
                     acknowledgement: Some(7),
                     resolved_handoff_ids: vec!["call-1".into()],
+                    voice: Some("Nora".into()),
+                    language: Some("en-GB".into()),
+                    relay: false,
                 }
             )
             .unwrap(),
@@ -431,6 +502,9 @@ mod tests {
                 "spoken":"hello",
                 "acknowledgement":7,
                 "resolvedHandoffIds":["call-1"],
+                "voice":"Nora",
+                "language":"en-GB",
+                "relay":false,
             })
         );
         assert_eq!(
@@ -442,9 +516,12 @@ mod tests {
 
     #[test]
     fn speak_validation_rejects_invalid_values() {
-        assert!(validate_speak(" ", &[]).is_err());
-        assert!(validate_speak(&"x".repeat(16 * 1024 + 1), &[]).is_err());
-        assert!(validate_speak("hello", &["".into()]).is_err());
-        assert!(validate_speak("hello", &["same".into(), "same".into()]).is_err());
+        assert!(validate_speak(" ", &[], None, false).is_err());
+        assert!(validate_speak(&"x".repeat(16 * 1024 + 1), &[], None, false).is_err());
+        assert!(validate_speak("hello", &["".into()], None, false).is_err());
+        assert!(validate_speak("hello", &["same".into(), "same".into()], None, false).is_err());
+        assert!(validate_speak("hello", &[], None, true).is_err());
+        assert!(validate_speak("hello", &[], Some(" "), false).is_err());
+        assert!(validate_speak("hello", &[], Some("Nora"), true).is_ok());
     }
 }

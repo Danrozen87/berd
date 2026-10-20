@@ -90,6 +90,11 @@ impl RealtimeHostLifecycle {
         self.activity.user_speaking
     }
 
+    /// Whether user speech has started that is not yet transcribed or discarded.
+    pub fn transcribing(&self) -> bool {
+        !self.activity.pending_user_items.is_empty()
+    }
+
     pub fn is_busy(&self, work: RealtimeHostWork) -> bool {
         self.activity.is_busy(work)
     }

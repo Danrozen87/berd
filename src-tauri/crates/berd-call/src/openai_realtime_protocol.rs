@@ -1287,6 +1287,7 @@ pub struct RealtimeExpertSpokespersonSession {
     responses: RealtimeResponseCoordinator,
     conversation: ExpertSpokespersonCore,
     open_handoffs: HashMap<String, RealtimeOpenHandoff>,
+    tracks_handoffs: bool,
     call_scope: String,
     pending_expert_events: Vec<RealtimeExpertDeliveryEvent>,
 }
@@ -1387,8 +1388,18 @@ impl RealtimeExpertSpokespersonSession {
             responses: RealtimeResponseCoordinator::default(),
             conversation: ExpertSpokespersonCore::new(initial_cursor),
             open_handoffs: HashMap::new(),
+            tracks_handoffs: true,
             call_scope: call_scope.into(),
             pending_expert_events: Vec::new(),
+        }
+    }
+
+    /// A session whose handoffs reach the Expert but are never held open:
+    /// nothing waits on them, so nothing reminds, resolves or keeps them.
+    pub fn without_handoff_tracking(self) -> Self {
+        Self {
+            tracks_handoffs: false,
+            ..self
         }
     }
 
@@ -1726,14 +1737,16 @@ impl RealtimeExpertSpokespersonSession {
         let handoff_id = require_non_empty(handoff_id, "handoff id")?;
         let message = require_non_empty(message, "handoff message")?;
         let expert_message = expert_handoff_message(&handoff_id, cursor, &message);
-        self.open_handoffs.insert(
-            handoff_id,
-            RealtimeOpenHandoff {
-                message,
-                reminder_attempts: 0,
-                resolving: false,
-            },
-        );
+        if self.tracks_handoffs {
+            self.open_handoffs.insert(
+                handoff_id,
+                RealtimeOpenHandoff {
+                    message,
+                    reminder_attempts: 0,
+                    resolving: false,
+                },
+            );
+        }
         Ok(expert_message)
     }
 
@@ -3080,6 +3093,24 @@ mod tests {
         assert_eq!(
             session.unknown_handoff_ids(&["handoff-1".into()]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn untracked_handoffs_reach_the_expert_and_stay_closed() {
+        let mut session =
+            RealtimeExpertSpokespersonSession::new(0, "test-call").without_handoff_tracking();
+        let (_, delivery) = session
+            .record_live_event_with_delivery(LiveSideEvent::Handoff {
+                call_id: "call-1".into(),
+                message: "First request".into(),
+            })
+            .unwrap();
+        assert_eq!(delivery.unwrap().handoff_ids, ["handoff-test-call-1"]);
+        assert!(!session.has_unresolved_handoff());
+        assert_eq!(
+            session.complete_expert_turn(&[], 3),
+            RealtimeHandoffReminder::None
         );
     }
 

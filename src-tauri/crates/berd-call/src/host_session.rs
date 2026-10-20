@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -145,7 +145,7 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
 /// Where live transcript records go: nowhere, stdout TSV, or a Codex task.
 pub(crate) enum Transcript {
     Silent,
-    Stdout,
+    Stdout { live: bool },
     Codex(CodexRelay),
 }
 
@@ -153,7 +153,7 @@ impl Transcript {
     fn for_options(options: &StartOptions) -> Result<Self, String> {
         Ok(match options.transcript {
             TranscriptDestination::None => Self::Silent,
-            TranscriptDestination::Stdout => Self::Stdout,
+            TranscriptDestination::Stdout { live } => Self::Stdout { live },
             TranscriptDestination::Codex => {
                 let target = CodexTarget::from_environment()?;
                 let executable = std::env::current_exe().map_err(|error| {
@@ -174,7 +174,7 @@ impl Transcript {
 
     fn start(&self) -> Result<(), String> {
         match self {
-            Self::Stdout => print_flushed("cursor\trole\ttext"),
+            Self::Stdout { .. } => print_flushed("cursor\trole\ttext"),
             Self::Codex(_) => {
                 println!("Berd Call is delivering transcripts to this Codex task.");
                 Ok(())
@@ -192,7 +192,7 @@ impl Transcript {
     ) -> Result<(), String> {
         match self {
             Self::Silent => Ok(()),
-            Self::Stdout => print_flushed(&format!(
+            Self::Stdout { .. } => print_flushed(&format!(
                 "{}\t{role}\t{}",
                 cursor.unwrap_or_default(),
                 stream_text(text)
@@ -213,7 +213,7 @@ impl Transcript {
     fn finish(&self, text: &str) {
         match self {
             Self::Silent => {}
-            Self::Stdout => {
+            Self::Stdout { .. } => {
                 let _ = self.record(None, "lifecycle", None, text);
             }
             Self::Codex(relay) => relay.finish(Some(CodexRecord {
@@ -342,7 +342,7 @@ impl SessionActor {
         SessionStart {
             saved: self.saved.take().map(|(path, mut saved)| {
                 saved.arguments = saved_settings::persistable_arguments(&restart.arguments[1..]);
-                saved.tts = None;
+                saved.tts = restart.tts;
                 (path, saved)
             }),
             arguments: restart.arguments,
@@ -462,6 +462,10 @@ fn start_session(
         stop_requested: Arc::clone(stop_requested),
         muted: Arc::clone(&actor.muted),
         transcript: Arc::clone(transcript),
+        speaks: !expert_spokesperson
+            || arguments
+                .iter()
+                .any(|argument| argument == crate::DIRECT_AGENT_SPEECH),
         session_arguments: arguments,
     });
     Ok(StartedSession {
@@ -480,6 +484,43 @@ fn default_input_during_tts_policy() -> InputDuringTtsPolicy {
     } else {
         InputDuringTtsPolicy::AllowBargeIn
     }
+}
+
+/// Session options for these speech settings, keeping a Pocket model directory from `arguments`.
+fn tts_arguments(settings: &berd_call::TtsSettings, arguments: &[String]) -> Vec<String> {
+    let pocket_model_dir = arguments
+        .chunks_exact(2)
+        .find(|pair| pair[0] == "--model-dir")
+        .map(|pair| pair[1].clone());
+    let backend = match settings {
+        berd_call::TtsSettings::Siri { .. } => "siri",
+        berd_call::TtsSettings::Pocket { .. } => "pocket",
+        berd_call::TtsSettings::OpenAi { .. } => "openai",
+    };
+    let mut replacement = vec![
+        "--tts-backend".to_string(),
+        backend.to_string(),
+        "--rate".to_string(),
+        settings.rate().to_string(),
+    ];
+    match settings {
+        berd_call::TtsSettings::Siri {
+            voice, language, ..
+        } => replacement.extend([
+            "--voice".into(),
+            voice.clone(),
+            "--language".into(),
+            language.clone(),
+        ]),
+        berd_call::TtsSettings::Pocket { voice, .. } => {
+            if let Some(model_dir) = pocket_model_dir {
+                replacement.extend(["--model-dir".into(), model_dir]);
+            }
+            replacement.extend(["--voice".into(), voice.clone()])
+        }
+        berd_call::TtsSettings::OpenAi { .. } => {}
+    }
+    replacement
 }
 
 #[derive(Clone)]
@@ -508,10 +549,18 @@ enum ControlCommand {
         expected_revision: u64,
         response: SyncSender<Result<Value, String>>,
     },
+    SpokespersonSettings {
+        settings: berd_call::TtsSettings,
+        expected_revision: u64,
+        response: SyncSender<Result<Value, String>>,
+    },
     Speak {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        voice: Option<String>,
+        language: Option<String>,
+        relay: bool,
         non_blocking: bool,
         response: SyncSender<Result<Value, String>>,
     },
@@ -521,6 +570,8 @@ enum ControlCommand {
     Restart {
         arguments: Vec<String>,
         expert_spokesperson: bool,
+        // Speech settings to restore in the new session, beyond what its options can say.
+        tts: Option<berd_call::TtsSettings>,
         response: SyncSender<Result<Value, String>>,
     },
 }
@@ -528,6 +579,7 @@ enum ControlCommand {
 struct PendingRestart {
     arguments: Vec<String>,
     expert_spokesperson: bool,
+    tts: Option<berd_call::TtsSettings>,
     response: SyncSender<Result<Value, String>>,
 }
 
@@ -539,10 +591,32 @@ struct SessionControl {
     stop_requested: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     transcript: Arc<Transcript>,
+    // Whether the Expert may speak to the user rather than only through the Spokesperson.
+    speaks: bool,
     session_arguments: Vec<String>,
 }
 
 impl SessionControl {
+    fn restart_with(
+        &self,
+        session_arguments: Vec<String>,
+        tts: Option<berd_call::TtsSettings>,
+    ) -> Result<Value, String> {
+        let expert_spokesperson = crate::validate_session_arguments(&session_arguments)?;
+        let (response, result) = mpsc::sync_channel(1);
+        self.commands
+            .send(ControlCommand::Restart {
+                arguments: session_arguments,
+                expert_spokesperson,
+                tts,
+                response,
+            })
+            .map_err(|_| "voice call is not running")?;
+        result
+            .recv()
+            .map_err(|_| "voice call stopped during restart".to_string())?
+    }
+
     fn request(
         &self,
         command: impl FnOnce(SyncSender<Result<Value, String>>) -> ControlCommand,
@@ -587,22 +661,56 @@ impl HostControl for SessionControl {
     }
 
     fn set_rate(&self, rate: f32) -> Result<Value, String> {
-        let (settings, expected_revision) = {
+        let (previous, expected_revision, spokesperson) = {
             let session = self
                 .ready
                 .session
                 .lock()
                 .map_err(|_| "session settings lock failed")?;
+            // The Spokesperson keeps as close to the agents' speed as it can.
+            let spokesperson = session.spokesperson.as_ref().map(|spokesperson| {
+                (
+                    spokesperson
+                        .settings
+                        .clone()
+                        .with_rate(crate::spokesperson_speed(rate)),
+                    spokesperson.revision,
+                )
+            });
             (
-                session.tts.settings.clone().with_rate(rate),
+                session.tts.settings.clone(),
                 session.tts.revision,
+                spokesperson,
             )
         };
-        self.request(|response| ControlCommand::TtsSettings {
+        let status = self.request(|response| ControlCommand::TtsSettings {
+            settings: previous.clone().with_rate(rate),
+            expected_revision,
+            response,
+        })?;
+        // A rate the agents' voice refuses leaves the Spokesperson's alone too.
+        let Some((settings, expected_revision)) =
+            spokesperson.filter(|_| status["outcome"] == "applied")
+        else {
+            return Ok(status);
+        };
+        let result = self.request(|response| ControlCommand::SpokespersonSettings {
             settings,
             expected_revision,
             response,
-        })
+        });
+        // One the Spokesperson refuses puts the agents' back, so the voices never disagree.
+        if let (false, Some(expected_revision)) = (
+            matches!(&result, Ok(value) if value["outcome"] == "applied"),
+            status["snapshot"]["revision"].as_u64(),
+        ) {
+            let _ = self.request(|response| ControlCommand::TtsSettings {
+                settings: previous,
+                expected_revision,
+                response,
+            });
+        }
+        result
     }
 
     fn set_voice(&self, voice: String, language: Option<String>) -> Result<Value, String> {
@@ -644,6 +752,38 @@ impl HostControl for SessionControl {
         })
     }
 
+    fn set_spokesperson(&self, voice: Option<String>, rate: Option<f32>) -> Result<Value, String> {
+        let (mut settings, expected_revision) = {
+            let session = self
+                .ready
+                .session
+                .lock()
+                .map_err(|_| "session settings lock failed")?;
+            let spokesperson = session
+                .spokesperson
+                .as_ref()
+                .ok_or("this call has no separate Spokesperson voice; use --voice and --rate")?;
+            (spokesperson.settings.clone(), spokesperson.revision)
+        };
+        if let (
+            Some(voice),
+            berd_call::TtsSettings::OpenAi {
+                voice: selected, ..
+            },
+        ) = (voice, &mut settings)
+        {
+            *selected = voice;
+        }
+        if let Some(rate) = rate {
+            settings = settings.with_rate(rate);
+        }
+        self.request(|response| ControlCommand::SpokespersonSettings {
+            settings,
+            expected_revision,
+            response,
+        })
+    }
+
     fn set_input_during_tts(&self, policy: InputDuringTtsPolicy) -> Result<Value, String> {
         let expected_revision = self
             .ready
@@ -665,18 +805,45 @@ impl HostControl for SessionControl {
     }
 
     fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
-        let expert_spokesperson = crate::validate_session_arguments(&session_arguments)?;
-        let (response, result) = mpsc::sync_channel(1);
-        self.commands
-            .send(ControlCommand::Restart {
-                arguments: session_arguments,
-                expert_spokesperson,
-                response,
-            })
-            .map_err(|_| "voice call is not running")?;
-        result
-            .recv()
-            .map_err(|_| "voice call stopped during restart".to_string())?
+        self.restart_with(session_arguments, None)
+    }
+
+    fn set_spokesperson_mode(&self, on: bool) -> Result<Value, String> {
+        let realtime = crate::validate_session_arguments(&self.session_arguments)?;
+        // Without the one flag that takes no value, so the rest pair up.
+        let arguments: Vec<_> = self.session_arguments[1..]
+            .iter()
+            .filter(|argument| *argument != crate::DIRECT_AGENT_SPEECH)
+            .cloned()
+            .collect();
+        let arguments = &arguments[..];
+        if on == realtime {
+            return self.status();
+        }
+        let direct = matches!(*self.transcript, Transcript::Stdout { live: true });
+        let live = self
+            .ready
+            .session
+            .lock()
+            .map_err(|_| "session settings lock failed")?
+            .tts
+            .settings
+            .clone();
+        // Agents keep the voice they have now, if they speak before and after; otherwise the Spokesperson's voice is
+        // its own, and only their speed carries over.
+        let tts = (self.speaks && (!on || direct)).then(|| live.clone());
+        let arguments = crate::saved_settings::merge_arguments(
+            arguments,
+            &match &tts {
+                Some(settings) => tts_arguments(settings, arguments),
+                None => vec!["--rate".into(), live.rate().to_string()],
+            },
+        );
+        let mut session_arguments = vec!["session".to_string()];
+        session_arguments.extend(crate::saved_settings::with_spokesperson(
+            &arguments, on, direct,
+        ));
+        self.restart_with(session_arguments, tts)
     }
 
     fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
@@ -702,13 +869,25 @@ impl HostControl for SessionControl {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        voice: Option<String>,
+        language: Option<String>,
+        relay: bool,
     ) -> Result<Value, String> {
+        if !relay && !self.speaks {
+            return Err(format!(
+                "the Expert speaks through the Spokesperson: use message-spokesperson, or start the call with {}",
+                crate::DIRECT_AGENT_SPEECH
+            ));
+        }
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
             .send(ControlCommand::Speak {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                voice,
+                language,
+                relay,
                 non_blocking: self.non_blocking.load(Ordering::SeqCst),
                 response: tx,
             })
@@ -752,6 +931,7 @@ enum AudioCommand {
 enum SavedPreference {
     SessionStart,
     Tts,
+    Spokesperson,
     InputPolicy,
 }
 
@@ -767,10 +947,14 @@ struct SessionActor {
     next_id: u64,
     pending_speak: Option<PendingSpeak>,
     pending_settings: std::collections::HashMap<u64, SyncSender<Result<Value, String>>>,
+    // Settings requests answered with the Spokesperson's voice rather than the call's.
+    spokesperson_settings: HashSet<u64>,
     waiting_speaks: VecDeque<ControlCommand>,
     session: Arc<Mutex<VoiceSessionSnapshot>>,
     transcript: Arc<Transcript>,
     expert_spokesperson: bool,
+    // User rows already streamed when transcribed, left out of the Expert batch.
+    transcribed: HashSet<u64>,
     stopping: bool,
     restart: Option<PendingRestart>,
     muted: Arc<AtomicBool>,
@@ -827,10 +1011,12 @@ impl SessionActor {
             next_id: 2,
             pending_speak: None,
             pending_settings: std::collections::HashMap::new(),
+            spokesperson_settings: HashSet::new(),
             waiting_speaks: VecDeque::new(),
             session,
             transcript,
             expert_spokesperson,
+            transcribed: HashSet::new(),
             stopping: false,
             restart: None,
             muted: Arc::new(AtomicBool::new(false)),
@@ -1024,10 +1210,30 @@ impl SessionActor {
                 )?;
                 self.pending_settings.insert(id, response);
             }
+            ControlCommand::SpokespersonSettings {
+                settings,
+                expected_revision,
+                response,
+            } => {
+                let id = self.next_id();
+                send_request(
+                    &self.writer,
+                    &SessionRequest::SetSpokespersonSettings {
+                        id,
+                        expected_revision,
+                        settings,
+                    },
+                )?;
+                self.spokesperson_settings.insert(id);
+                self.pending_settings.insert(id, response);
+            }
             ControlCommand::Speak {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                voice,
+                language,
+                relay,
                 non_blocking,
                 response,
             } => {
@@ -1040,6 +1246,9 @@ impl SessionActor {
                         text,
                         acknowledgement,
                         resolved_handoff_ids,
+                        voice,
+                        language,
+                        relay,
                         non_blocking,
                         response,
                     });
@@ -1053,6 +1262,9 @@ impl SessionActor {
                         acknowledgement,
                         text: text.clone(),
                         resolved_handoff_ids,
+                        voice,
+                        language,
+                        relay,
                     },
                 )?;
                 self.pending_speak = Some(PendingSpeak {
@@ -1065,6 +1277,7 @@ impl SessionActor {
             ControlCommand::Restart {
                 arguments,
                 expert_spokesperson,
+                tts,
                 response,
             } => {
                 if self.stopping {
@@ -1076,6 +1289,7 @@ impl SessionActor {
                 self.restart = Some(PendingRestart {
                     arguments,
                     expert_spokesperson,
+                    tts,
                     response,
                 });
             }
@@ -1145,13 +1359,23 @@ impl SessionActor {
                 snapshot,
                 message,
             } => {
+                let spokesperson = self.spokesperson_settings.remove(&id);
                 if let Ok(mut session) = self.session.lock() {
-                    if snapshot.revision >= session.tts.revision {
-                        session.tts = snapshot.clone();
+                    let voice = if spokesperson {
+                        session.spokesperson.as_mut()
+                    } else {
+                        Some(&mut session.tts)
+                    };
+                    if let Some(voice) = voice.filter(|voice| snapshot.revision >= voice.revision) {
+                        *voice = snapshot.clone();
                     }
                 }
                 if outcome == berd_call::protocol::TtsSettingsOutcome::Applied {
-                    self.persist_settings(SavedPreference::Tts);
+                    self.persist_settings(if spokesperson {
+                        SavedPreference::Spokesperson
+                    } else {
+                        SavedPreference::Tts
+                    });
                 }
                 if let Some(response) = self.pending_settings.remove(&id) {
                     let _ = response.send(Ok(
@@ -1191,6 +1415,21 @@ impl SessionActor {
                 text,
                 origin,
             } if !self.expert_spokesperson => self.stream_live_event(token, origin, &text)?,
+            // Only a live stream shows the conversation as it happens.
+            SessionMessage::UserTranscribed { token, text }
+                if self.expert_spokesperson
+                    && matches!(*self.transcript, Transcript::Stdout { live: true }) =>
+            {
+                self.transcript.record(Some(token), "user", None, &text)?;
+                self.transcribed.insert(token);
+            }
+            SessionMessage::SpokespersonGenerated { text }
+                if self.expert_spokesperson
+                    && matches!(*self.transcript, Transcript::Stdout { live: true }) =>
+            {
+                self.transcript
+                    .record(None, "spokesperson_generated", None, &text)?
+            }
             SessionMessage::ExpertDelivery { events, .. } if self.expert_spokesperson => {
                 self.stream_expert_delivery(&events)?
             }
@@ -1306,8 +1545,11 @@ impl SessionActor {
         self.transcript.record(Some(token), role, None, text)
     }
 
-    fn stream_expert_delivery(&self, events: &[RealtimeExpertDeliveryEvent]) -> Result<(), String> {
-        for event in events {
+    fn stream_expert_delivery(
+        &mut self,
+        events: &[RealtimeExpertDeliveryEvent],
+    ) -> Result<(), String> {
+        for event in unstreamed(events, &mut self.transcribed) {
             self.transcript.record(
                 Some(event.cursor),
                 expert_delivery_role_name(event.role),
@@ -1350,41 +1592,28 @@ impl SessionActor {
         let Ok(session) = self.session.lock() else {
             return;
         };
-        saved.tts = Some(session.tts.settings.clone());
-        let settings = &session.tts.settings;
-        let pocket_model_dir = saved
-            .arguments
-            .chunks_exact(2)
-            .find(|pair| pair[0] == "--model-dir")
-            .map(|pair| pair[1].clone());
-        let backend = match settings {
-            berd_call::TtsSettings::Siri { .. } => "siri",
-            berd_call::TtsSettings::Pocket { .. } => "pocket",
-            berd_call::TtsSettings::OpenAi { .. } => "openai",
-        };
-        let mut replacement = vec![
-            "--tts-backend".to_string(),
-            backend.to_string(),
-            "--rate".to_string(),
-            settings.rate().to_string(),
-        ];
-        match settings {
-            berd_call::TtsSettings::Siri {
-                voice, language, ..
-            } => replacement.extend([
-                "--voice".into(),
-                voice.clone(),
-                "--language".into(),
-                language.clone(),
-            ]),
-            berd_call::TtsSettings::Pocket { voice, .. } => {
-                if let Some(model_dir) = pocket_model_dir {
-                    replacement.extend(["--model-dir".into(), model_dir]);
-                }
-                replacement.extend(["--voice".into(), voice.clone()])
+        if let SavedPreference::Spokesperson = changed {
+            let Some(spokesperson) = &session.spokesperson else {
+                return;
+            };
+            let replacement = vec![
+                "--spokesperson-voice".to_string(),
+                spokesperson.settings.voice().to_string(),
+                "--spokesperson-rate".to_string(),
+                spokesperson.settings.rate().to_string(),
+            ];
+            saved.arguments =
+                crate::saved_settings::merge_arguments(&saved.arguments, &replacement);
+            if let Err(error) = crate::saved_settings::update(path, |latest| {
+                latest.arguments =
+                    crate::saved_settings::merge_arguments(&latest.arguments, &replacement)
+            }) {
+                eprintln!("berd-call: live settings applied but could not be saved: {error}");
             }
-            berd_call::TtsSettings::OpenAi { .. } => {}
+            return;
         }
+        saved.tts = Some(session.tts.settings.clone());
+        let replacement = tts_arguments(&session.tts.settings, &saved.arguments);
         saved.arguments = crate::saved_settings::merge_arguments(&saved.arguments, &replacement);
         if let Err(error) = crate::saved_settings::update(path, |latest| match changed {
             SavedPreference::SessionStart => {
@@ -1397,6 +1626,7 @@ impl SessionActor {
                 latest.tts = saved.tts.clone();
             }
             SavedPreference::InputPolicy => latest.input_policy = saved.input_policy,
+            SavedPreference::Spokesperson => unreachable!("saved above"),
         }) {
             eprintln!("berd-call: live settings applied but could not be saved: {error}");
         }
@@ -2169,6 +2399,16 @@ impl AudioPlaybackState {
         }
     }
 
+    /// What the host played of this speech, once it has ended it. The session may not have heard yet, so its records for it can still arrive.
+    fn retired(&self, speech_id: u64) -> Option<u64> {
+        match self {
+            Self::Finished(retired) if retired.speech_id == speech_id => {
+                Some(retired.played_frames)
+            }
+            _ => None,
+        }
+    }
+
     fn finish(&mut self, speech_id: u64, played_frames: u64) {
         *self = Self::Finished(RetiredAudio {
             speech_id,
@@ -2383,6 +2623,9 @@ fn handle_audio_record(
         AUDIO_CHUNK_KIND if payload.len() >= 16 && (payload.len() - 16).is_multiple_of(4) => {
             let speech_id = le_u64(&payload[0..8])?;
             let sequence = le_u64(&payload[8..16])?;
+            if playback.retired(speech_id).is_some() {
+                return Ok(());
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session sent audio for an inactive speech".to_string())?;
@@ -2415,6 +2658,9 @@ fn handle_audio_record(
         AUDIO_END_KIND if payload.len() == 24 => {
             let speech_id = le_u64(&payload[0..8])?;
             let sequence = le_u64(&payload[8..16])?;
+            if playback.retired(speech_id).is_some() {
+                return Ok(());
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session ended inactive audio".to_string())?;
@@ -2423,6 +2669,15 @@ fn handle_audio_record(
         }
         AUDIO_CANCEL_KIND if payload.len() == 8 => {
             let speech_id = le_u64(payload)?;
+            if let Some(played_frames) = playback.retired(speech_id) {
+                return send_request(
+                    writer,
+                    &SessionRequest::AudioCancelled {
+                        speech_id,
+                        played_frames,
+                    },
+                );
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session cancelled inactive audio".to_string())?;
@@ -2534,7 +2789,18 @@ fn not_admitted_reason_name(reason: NotAdmittedReason) -> &'static str {
         NotAdmittedReason::Cancelled => "cancelled",
         NotAdmittedReason::EmptyText => "empty_text",
         NotAdmittedReason::InvalidHandoff => "invalid_handoff",
+        NotAdmittedReason::InvalidVoice => "invalid_voice",
     }
+}
+
+/// The batch's events not already streamed as they happened.
+fn unstreamed<'a>(
+    events: &'a [RealtimeExpertDeliveryEvent],
+    transcribed: &'a mut HashSet<u64>,
+) -> impl Iterator<Item = &'a RealtimeExpertDeliveryEvent> {
+    events.iter().filter(move |event| {
+        !(event.role == RealtimeExpertDeliveryRole::User && transcribed.remove(&event.cursor))
+    })
 }
 
 fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
@@ -2550,6 +2816,27 @@ fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_batches_leave_out_user_rows_already_streamed() {
+        let event = |cursor, role| RealtimeExpertDeliveryEvent {
+            cursor,
+            role,
+            text: format!("event {cursor}"),
+            handoff_id: None,
+        };
+        let events = [
+            event(1, RealtimeExpertDeliveryRole::User),
+            event(2, RealtimeExpertDeliveryRole::User),
+            event(3, RealtimeExpertDeliveryRole::Spokesperson),
+        ];
+        let mut transcribed = HashSet::from([1, 3]);
+        let cursors: Vec<_> = unstreamed(&events, &mut transcribed)
+            .map(|event| event.cursor)
+            .collect();
+        assert_eq!(cursors, [2, 3]);
+        assert_eq!(transcribed, HashSet::from([3]));
+    }
 
     #[test]
     fn microphone_teardown_reports_a_blocked_forwarder() {
@@ -2674,6 +2961,7 @@ mod tests {
             PendingRestart {
                 arguments: vec!["session".into()],
                 expert_spokesperson: false,
+                tts: None,
                 response,
             },
             InputDuringTtsPolicy::AllowBargeIn,
@@ -2728,6 +3016,7 @@ mod tests {
             PendingRestart {
                 arguments: arguments.clone(),
                 expert_spokesperson: false,
+                tts: None,
                 response,
             },
             InputDuringTtsPolicy::AllowBargeIn,
@@ -2772,6 +3061,7 @@ mod tests {
                 .handle_command(ControlCommand::Restart {
                     arguments: vec!["session".into()],
                     expert_spokesperson: false,
+                    tts: None,
                     response,
                 })
                 .unwrap();
@@ -3161,6 +3451,9 @@ mod tests {
                 text: "next".into(),
                 acknowledgement: Some(7),
                 resolved_handoff_ids: Vec::new(),
+                voice: None,
+                language: None,
+                relay: false,
                 non_blocking: true,
                 response: next_tx,
             })
@@ -3177,6 +3470,7 @@ mod tests {
 
     fn test_snapshot() -> VoiceSessionSnapshot {
         VoiceSessionSnapshot {
+            spokesperson: None,
             tts: berd_call::TtsConfigurationSnapshot {
                 revision: 1,
                 settings: berd_call::TtsSettings::Siri {
@@ -3205,7 +3499,7 @@ mod tests {
             commands,
             audio_commands,
             session,
-            Arc::new(Transcript::Stdout),
+            Arc::new(Transcript::Stdout { live: false }),
             false,
         )
     }
@@ -3576,6 +3870,79 @@ mod tests {
         drop(second);
         first_child.wait().unwrap();
         second_child.wait().unwrap();
+    }
+
+    #[test]
+    fn spokesperson_results_change_and_save_only_its_voice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events, receiver) = mpsc::sync_channel(1);
+        let (_commands, commands) = mpsc::sync_channel(1);
+        let (audio, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, receiver, commands, audio);
+        let openai = |voice: &str, revision| berd_call::TtsConfigurationSnapshot {
+            revision,
+            settings: berd_call::TtsSettings::OpenAi {
+                model: "gpt-realtime".into(),
+                voice: voice.into(),
+                rate: 1.25,
+            },
+        };
+        actor.session.lock().unwrap().spokesperson = Some(openai("marin", 1));
+        actor.saved = Some((
+            path.clone(),
+            crate::saved_settings::SavedSettings {
+                arguments: ["--voice", "Aaron", "--language", "en-US"]
+                    .map(str::to_string)
+                    .to_vec(),
+                ..crate::saved_settings::SavedSettings::default()
+            },
+        ));
+        let (response, result) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::SpokespersonSettings {
+                settings: openai("cedar", 1).settings,
+                expected_revision: 1,
+                response,
+            })
+            .unwrap();
+        let id = *actor.spokesperson_settings.iter().next().unwrap();
+        actor
+            .handle_event(SessionMessage::TtsSettingsResult {
+                id,
+                outcome: berd_call::protocol::TtsSettingsOutcome::Applied,
+                snapshot: openai("cedar", 2),
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(result.recv().unwrap().unwrap()["outcome"], "applied");
+        let session = actor.session.lock().unwrap().clone();
+        assert_eq!(session.spokesperson, Some(openai("cedar", 2)));
+        assert_eq!(session.tts, test_snapshot().tts);
+        let saved = crate::saved_settings::load(&path).unwrap();
+        assert_eq!(saved.tts, None);
+        assert_eq!(
+            saved.arguments,
+            [
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+                "--spokesperson-voice",
+                "cedar",
+                "--spokesperson-rate",
+                "1.25"
+            ]
+            .map(str::to_string)
+        );
+        drop(actor);
+        child.wait().unwrap();
     }
 
     #[test]
@@ -4000,6 +4367,7 @@ mod tests {
             PendingRestart {
                 arguments: vec!["session".into()],
                 expert_spokesperson: false,
+                tts: None,
                 response,
             },
             InputDuringTtsPolicy::AllowBargeIn,
@@ -4059,11 +4427,200 @@ mod tests {
             stop_requested: Arc::clone(&stop_requested),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         drop(receiver);
         assert_eq!(control.stop().unwrap(), json!({"stopping":true}));
         assert!(stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn turning_the_spokesperson_on_restarts_the_call_with_the_agents_current_voice() {
+        let toggle = |transcript, rate| {
+            let mut snapshot = test_snapshot();
+            snapshot.tts.settings = snapshot.tts.settings.with_rate(rate);
+            let (commands, receiver) = mpsc::sync_channel(1);
+            let control = SessionControl {
+                commands,
+                running: Arc::new(AtomicBool::new(true)),
+                ready: ReadyState {
+                    session: Arc::new(Mutex::new(snapshot)),
+                },
+                non_blocking: Arc::new(AtomicBool::new(false)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                muted: Arc::new(AtomicBool::new(false)),
+                transcript: Arc::new(transcript),
+                speaks: true,
+                session_arguments: [
+                    "session",
+                    "--voice",
+                    "Samantha",
+                    "--language",
+                    "en-GB",
+                    "--rate",
+                    "2",
+                    "--stt-backend",
+                    "openai",
+                    "--stt-url",
+                    "ws://127.0.0.1:1/stt",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+            };
+            let worker = thread::spawn(move || match receiver.recv().unwrap() {
+                ControlCommand::Restart {
+                    arguments,
+                    expert_spokesperson,
+                    tts,
+                    response,
+                } => {
+                    response.send(Ok(json!({}))).unwrap();
+                    assert!(expert_spokesperson);
+                    (arguments, tts)
+                }
+                _ => panic!("expected a restart"),
+            });
+            control.set_spokesperson_mode(true).unwrap();
+            worker.join().unwrap()
+        };
+        // Agents with their own voice keep the one they have now.
+        let (arguments, tts) = toggle(Transcript::Stdout { live: true }, 1.25);
+        assert_eq!(
+            arguments,
+            [
+                "session",
+                "--stt-backend",
+                "openai",
+                "--tts-backend",
+                "siri",
+                "--rate",
+                "1.25",
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+                "--mode",
+                "expert-spokesperson",
+                crate::DIRECT_AGENT_SPEECH,
+            ]
+        );
+        assert_eq!(tts, Some(test_snapshot().tts.settings.with_rate(1.25)));
+        // Otherwise only their speed carries over, which the Spokesperson keeps as close to as it can.
+        let (arguments, tts) = toggle(Transcript::Silent, 1.75);
+        assert_eq!(
+            arguments,
+            [
+                "session",
+                "--voice",
+                "Samantha",
+                "--language",
+                "en-GB",
+                "--stt-backend",
+                "openai",
+                "--rate",
+                "1.75",
+                "--mode",
+                "expert-spokesperson",
+            ]
+        );
+        assert_eq!(tts, None);
+        assert!(crate::validate_session_arguments(&arguments).unwrap());
+    }
+
+    #[test]
+    fn turning_the_spokesperson_off_drops_direct_speech_wherever_it_was_given() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::new(Mutex::new(test_snapshot())),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            transcript: Arc::new(Transcript::Stdout { live: true }),
+            speaks: true,
+            session_arguments: [
+                "session",
+                "--mode",
+                "expert-spokesperson",
+                crate::DIRECT_AGENT_SPEECH,
+                "--voice",
+                "Samantha",
+                "--language",
+                "en-GB",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        };
+        let worker = thread::spawn(move || match receiver.recv().unwrap() {
+            ControlCommand::Restart {
+                arguments,
+                expert_spokesperson,
+                response,
+                ..
+            } => {
+                response.send(Ok(json!({}))).unwrap();
+                assert!(!expert_spokesperson);
+                arguments
+            }
+            _ => panic!("expected a restart"),
+        });
+        control.set_spokesperson_mode(false).unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            [
+                "session",
+                "--tts-backend",
+                "siri",
+                "--rate",
+                "1",
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+                "--mode",
+                "conventional",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_expert_speaks_only_through_the_spokesperson_unless_allowed() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::new(Mutex::new(test_snapshot())),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            transcript: Arc::new(Transcript::Silent),
+            speaks: false,
+            session_arguments: vec!["session".into()],
+        };
+        let refusal = control
+            .speak("Hello".into(), None, Vec::new(), None, None, false)
+            .unwrap_err();
+        assert!(refusal.contains("message-spokesperson"), "{refusal}");
+        assert!(receiver.try_recv().is_err());
+        let worker = thread::spawn(move || match receiver.recv().unwrap() {
+            ControlCommand::Speak {
+                relay, response, ..
+            } => {
+                response.send(Ok(json!({}))).unwrap();
+                relay
+            }
+            _ => panic!("expected a message to the Spokesperson"),
+        });
+        control
+            .speak("Hello".into(), None, Vec::new(), None, None, true)
+            .unwrap();
+        assert!(worker.join().unwrap());
     }
 
     #[test]
@@ -4081,6 +4638,7 @@ mod tests {
             stop_requested: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         let worker = thread::spawn(move || match receiver.recv().unwrap() {
@@ -4123,6 +4681,7 @@ mod tests {
             stop_requested: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         let worker = thread::spawn(move || match receiver.recv().unwrap() {
@@ -4151,6 +4710,135 @@ mod tests {
     }
 
     #[test]
+    fn spokesperson_updates_keep_its_other_setting_and_revision() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let mut snapshot = test_snapshot();
+        let openai = |voice: &str, rate| berd_call::TtsSettings::OpenAi {
+            model: "gpt-realtime".into(),
+            voice: voice.into(),
+            rate,
+        };
+        let session = Arc::new(Mutex::new(snapshot.clone()));
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::clone(&session),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            transcript: Arc::new(Transcript::Silent),
+            speaks: true,
+            session_arguments: vec!["session".into()],
+        };
+        let refusal = control.set_spokesperson(None, Some(1.5)).unwrap_err();
+        assert!(
+            refusal.contains("no separate Spokesperson voice"),
+            "{refusal}"
+        );
+        snapshot.spokesperson = Some(berd_call::TtsConfigurationSnapshot {
+            revision: 3,
+            settings: openai("marin", 1.25),
+        });
+        *session.lock().unwrap() = snapshot;
+        let worker = thread::spawn(move || {
+            (0..2)
+                .map(|_| match receiver.recv().unwrap() {
+                    ControlCommand::SpokespersonSettings {
+                        settings,
+                        expected_revision,
+                        response,
+                    } => {
+                        response.send(Ok(json!({}))).unwrap();
+                        (settings, expected_revision)
+                    }
+                    _ => panic!("expected a Spokesperson settings command"),
+                })
+                .collect::<Vec<_>>()
+        });
+        control.set_spokesperson(None, Some(1.5)).unwrap();
+        control
+            .set_spokesperson(Some("cedar".into()), None)
+            .unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            [(openai("marin", 1.5), 3), (openai("cedar", 1.25), 3)]
+        );
+    }
+
+    #[test]
+    fn the_speech_rate_keeps_the_spokesperson_as_close_to_the_agents_as_it_can() {
+        let rates = |spokesperson, outcome: &'static str, spokesperson_outcome: &'static str| {
+            let (commands, receiver) = mpsc::sync_channel(1);
+            let mut snapshot = test_snapshot();
+            snapshot.spokesperson = spokesperson;
+            let control = SessionControl {
+                commands,
+                running: Arc::new(AtomicBool::new(true)),
+                ready: ReadyState {
+                    session: Arc::new(Mutex::new(snapshot)),
+                },
+                non_blocking: Arc::new(AtomicBool::new(false)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                muted: Arc::new(AtomicBool::new(false)),
+                transcript: Arc::new(Transcript::Silent),
+                speaks: true,
+                session_arguments: vec!["session".into()],
+            };
+            let worker = thread::spawn(move || {
+                receiver
+                    .iter()
+                    .map(|command| match command {
+                        ControlCommand::TtsSettings {
+                            settings, response, ..
+                        } => {
+                            response
+                                .send(Ok(json!({"outcome": outcome, "snapshot": {"revision": 2}})))
+                                .unwrap();
+                            ("agents", settings.rate())
+                        }
+                        ControlCommand::SpokespersonSettings {
+                            settings, response, ..
+                        } => {
+                            response
+                                .send(Ok(json!({"outcome": spokesperson_outcome})))
+                                .unwrap();
+                            ("spokesperson", settings.rate())
+                        }
+                        _ => panic!("expected a speech settings command"),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            control.set_rate(2.0).unwrap();
+            drop(control);
+            worker.join().unwrap()
+        };
+        let spokesperson = berd_call::TtsConfigurationSnapshot {
+            revision: 3,
+            settings: berd_call::TtsSettings::OpenAi {
+                model: "gpt-realtime".into(),
+                voice: "marin".into(),
+                rate: 1.0,
+            },
+        };
+        assert_eq!(
+            rates(Some(spokesperson.clone()), "applied", "applied"),
+            [("agents", 2.0), ("spokesperson", 1.5)]
+        );
+        // A Spokesperson that refuses its speed puts the agents' back.
+        assert_eq!(
+            rates(Some(spokesperson.clone()), "applied", "rejected"),
+            [("agents", 2.0), ("spokesperson", 1.5), ("agents", 1.0)]
+        );
+        assert_eq!(
+            rates(Some(spokesperson), "rejected", "applied"),
+            [("agents", 2.0)]
+        );
+        assert_eq!(rates(None, "applied", "applied"), [("agents", 2.0)]);
+    }
+
+    #[test]
     fn stop_cancels_a_pending_restart() {
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
@@ -4167,6 +4855,7 @@ mod tests {
             .handle_command(ControlCommand::Restart {
                 arguments: vec!["session".into()],
                 expert_spokesperson: false,
+                tts: None,
                 response: restart_tx,
             })
             .unwrap();
@@ -4182,6 +4871,7 @@ mod tests {
             .handle_command(ControlCommand::Restart {
                 arguments: vec!["session".into()],
                 expert_spokesperson: false,
+                tts: None,
                 response: late_tx,
             })
             .unwrap();
@@ -4264,6 +4954,17 @@ mod tests {
         });
         assert_eq!(playback.played_frames(17), 48_000);
         assert_eq!(playback.played_frames(18), 0);
+    }
+
+    #[test]
+    fn only_the_ended_speech_is_retired() {
+        let playback = AudioPlaybackState::Finished(RetiredAudio {
+            speech_id: 17,
+            played_frames: 4_096,
+        });
+        assert_eq!(playback.retired(17), Some(4_096));
+        assert_eq!(playback.retired(18), None);
+        assert_eq!(AudioPlaybackState::Idle.retired(17), None);
     }
 
     #[test]

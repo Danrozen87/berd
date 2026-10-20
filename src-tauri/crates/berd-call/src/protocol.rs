@@ -32,6 +32,12 @@ pub enum SessionRequest {
         expected_revision: u64,
         settings: TtsSettings,
     },
+    /// Changes the Spokesperson's voice in a session whose replies have their own.
+    SetSpokespersonSettings {
+        id: u64,
+        expected_revision: u64,
+        settings: TtsSettings,
+    },
     SetInputDuringTts {
         id: u64,
         expected_revision: u64,
@@ -46,6 +52,13 @@ pub enum SessionRequest {
         text: String,
         #[serde(default)]
         resolved_handoff_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        /// The Spokesperson says it, even in a call where the Expert has its own voice.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay: bool,
     },
     OutputReady {
         id: u64,
@@ -139,6 +152,7 @@ pub enum NotAdmittedReason {
     Cancelled,
     EmptyText,
     InvalidHandoff,
+    InvalidVoice,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,8 +171,13 @@ pub enum OutputReadyOutcome {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct VoiceSessionSnapshot {
+    /// The voice that speaks replies: the conventional backend, or the
+    /// Spokesperson's own voice when it reads them.
     pub tts: TtsConfigurationSnapshot,
     pub input_during_tts: InputDuringTtsSnapshot,
+    /// The Spokesperson's voice, when replies have their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spokesperson: Option<TtsConfigurationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -234,6 +253,18 @@ pub enum SessionMessage {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         origin: Option<UtteranceOrigin>,
+    },
+    /// The user's words as soon as they are transcribed, for hosts that show
+    /// the conversation as it happens. `live_event` stays authoritative.
+    UserTranscribed {
+        token: u64,
+        text: String,
+    },
+    /// The Spokesperson's whole reply once it is generated, before it is
+    /// spoken. The transcript recorded after playback stays authoritative and
+    /// says how much was heard when the user cut it off.
+    SpokespersonGenerated {
+        text: String,
     },
     /// A crate-selected batch that is ready to wake the external Expert.
     /// `live_event` remains the authoritative transcript projection; this
@@ -371,6 +402,9 @@ mod tests {
                 acknowledgement: Some(0),
                 text: "hi".into(),
                 resolved_handoff_ids: Vec::new(),
+                voice: None,
+                language: None,
+                relay: false,
             }
         );
         assert_eq!(
@@ -390,10 +424,18 @@ mod tests {
                         revision: 1,
                         policy: InputDuringTtsPolicy::AllowBargeIn,
                     },
+                    spokesperson: Some(TtsConfigurationSnapshot {
+                        revision: 1,
+                        settings: TtsSettings::OpenAi {
+                            model: "gpt-realtime".into(),
+                            voice: "cedar".into(),
+                            rate: 1.0,
+                        },
+                    }),
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#
+            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(
