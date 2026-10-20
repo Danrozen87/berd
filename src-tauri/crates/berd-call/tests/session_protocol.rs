@@ -3092,3 +3092,129 @@ fn expert_voice_speaks_replies_itself_and_tells_the_spokesperson_what_was_heard(
     session.shutdown();
     server.join().unwrap();
 }
+
+#[test]
+fn expert_voice_handoffs_survive_provider_expiry_and_any_late_reply_answers_them() {
+    let (speech_url, speech_requests) = spawn_speech_server();
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    let (note_tx, note_rx) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                endpoint_tx
+                    .send(format!("ws://{}/", listener.local_addr().unwrap()))
+                    .unwrap();
+                let (old_stream, _) = listener.accept().await.unwrap();
+                let mut old = accept_async(old_stream).await.unwrap();
+                let initial = receive_realtime_json(&mut old).await;
+                acknowledge_realtime_session(&mut old, &initial).await;
+                send_realtime_json(
+                    &mut old,
+                    json!({
+                        "type":"conversation.item.input_audio_transcription.completed",
+                        "item_id":"user-1",
+                        "transcript":"What changed in the repository?"
+                    }),
+                )
+                .await;
+                send_realtime_json(
+                    &mut old,
+                    json!({
+                        "type":"response.function_call_arguments.done",
+                        "response_id":"response-handoff",
+                        "call_id":"handoff-1",
+                        "name":"handoff",
+                        "arguments":"{\"message\":\"inspect the repository\"}"
+                    }),
+                )
+                .await;
+                while receive_realtime_json(&mut old).await.pointer("/item/type")
+                    != Some(&json!("function_call_output"))
+                {}
+                send_realtime_json(
+                    &mut old,
+                    json!({
+                        "type":"error",
+                        "error":{"code":"session_expired","message":"provider session expired"}
+                    }),
+                )
+                .await;
+
+                // The open handoff doesn't stop the replacement, which is told of it.
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut replacement = accept_async(stream).await.unwrap();
+                let update = receive_realtime_json(&mut replacement).await;
+                acknowledge_realtime_session(&mut replacement, &update).await;
+                while let Some(Ok(Message::Text(text))) = replacement.next().await {
+                    let seed: Value = serde_json::from_str(&text).unwrap();
+                    if seed["type"] != "conversation.item.create" {
+                        continue;
+                    }
+                    send_realtime_json(
+                        &mut replacement,
+                        json!({"type":"conversation.item.created","item":{"id":seed["item"]["id"]}}),
+                    )
+                    .await;
+                    if text.contains("do not hand them off again") {
+                        let _ = note_tx.try_send(seed);
+                    }
+                }
+            });
+    });
+    let endpoint = endpoint_rx.recv().unwrap();
+    let mut session = ExpertSpokespersonTestSession::start_with_args(
+        endpoint,
+        &["--expert-voice", "tts", "--tts-url", &speech_url],
+    );
+    let note = note_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(
+        note.to_string().contains("- inspect the repository"),
+        "{note}"
+    );
+
+    // A reply written before everything since, naming no handoff, is still spoken.
+    session.send(json!({
+        "type":"prepare_speak",
+        "id":2,
+        "acknowledgement":0,
+        "text":"I checked the repository."
+    }));
+    let admitted = loop {
+        let message = session.recv(Duration::from_secs(2));
+        assert_ne!(message["type"], "fatal", "{message}");
+        if message["id"] == 2 {
+            break message;
+        }
+    };
+    assert_eq!(admitted["type"], "admitted", "{admitted}");
+    session.send(json!({"type":"query_state","id":3,"after":0}));
+    session.send(json!({
+        "type":"output_ready",
+        "id":2,
+        "speech_id":admitted["speech_id"]
+    }));
+    let (mut state, mut completed) = (None, false);
+    while state.is_none() || !completed {
+        let message = session.recv(Duration::from_secs(3));
+        assert_ne!(message["type"], "fatal", "{message}");
+        assert_ne!(message["type"], "speech_failed", "{message}");
+        match message["type"].as_str() {
+            Some("state") => state = Some(message),
+            Some("speech_completed") => completed = true,
+            _ => {}
+        }
+    }
+    assert_eq!(state.unwrap().get("unresolved_handoff_ids"), None);
+    assert_eq!(
+        speech_requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()["input"],
+        "I checked the repository."
+    );
+    session.shutdown();
+    server.join().unwrap();
+}

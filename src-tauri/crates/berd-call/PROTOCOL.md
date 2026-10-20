@@ -219,7 +219,12 @@ Unknown fields are rejected. IDs are positive. Speak text is at most 16 KiB.
 `prepare_speak.voice` speaks that one utterance in another voice of the reply
 backend, keeping its other settings; `language` changes a Siri voice's locale
 too. A voice the backend doesn't offer, or a voice for a call whose replies
-are spoken by the Spokesperson, is `not_admitted(invalid_voice)`.
+are spoken by the Spokesperson, is `not_admitted(invalid_voice)`. In a call
+whose replies have their own voice, a reply is admitted however stale its
+`acknowledgement`, never `pending`, and answers every open handoff once
+admitted, so `resolved_handoff_ids` is ignored. Open handoffs there don't hold
+back a renewal or recovery of the Spokesperson's session; the replacement is
+told what they asked.
 The parent cannot author speaking state or finalized input; those are derived
 only from PCM by the child runtime.
 

@@ -1587,6 +1587,20 @@ impl RealtimeExpertSpokespersonSession {
         })
     }
 
+    /// Prepares an Expert reply spoken in its own voice: it is admitted
+    /// however much was said since it was written, and answers every open
+    /// handoff.
+    pub fn prepare_expert_reply(&mut self, message: String) -> ExpertDirectiveOutcome {
+        let outcome = self.conversation.prepare_directive(ExpertDirective {
+            acknowledgement: Some(self.conversation.delivered_token()),
+            message,
+        });
+        if matches!(outcome, ExpertDirectiveOutcome::Accepted { .. }) {
+            self.open_handoffs.clear();
+        }
+        outcome
+    }
+
     pub fn record_live_event_with_delivery(
         &mut self,
         event: LiveSideEvent,
@@ -1678,6 +1692,25 @@ impl RealtimeExpertSpokespersonSession {
 
     pub fn semantic_transcript(&self) -> Vec<SemanticTurn> {
         self.conversation.semantic_transcript()
+    }
+
+    /// The transcript a replacement Spokesperson session starts from: the
+    /// conversation so far, and the handoffs still waiting for a reply, so it
+    /// doesn't hand them off again.
+    pub fn replacement_transcript(&self) -> Vec<SemanticTurn> {
+        let mut turns = self.semantic_transcript();
+        let mut open: Vec<_> = self.open_handoffs.iter().collect();
+        open.sort_by_key(|(id, _)| *id);
+        if !open.is_empty() {
+            turns.push(SemanticTurn::Expert(format!(
+                "The Expert is still working on these handoffs and will answer in its own voice, so do not hand them off again:\n{}",
+                open.iter()
+                    .map(|(_, handoff)| format!("- {}", handoff.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )));
+        }
+        turns
     }
 
     pub fn request_expert_message(
@@ -1781,16 +1814,6 @@ impl RealtimeExpertSpokespersonSession {
                 .resolving = true;
         }
         Ok(())
-    }
-
-    /// Leaves handoffs open for another reply once the one meant to answer
-    /// them went unheard.
-    pub fn release_handoffs(&mut self, handoff_ids: &[String]) {
-        for handoff_id in handoff_ids {
-            if let Some(handoff) = self.open_handoffs.get_mut(handoff_id) {
-                handoff.resolving = false;
-            }
-        }
     }
 
     pub fn dismiss_handoffs(&mut self, handoff_ids: &[String]) -> Result<(), String> {
@@ -3091,6 +3114,41 @@ mod tests {
             session.unknown_handoff_ids(&["handoff-1".into()]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn expert_reply_answers_every_handoff_however_late() {
+        let mut session = RealtimeExpertSpokespersonSession::new(0, "test-call");
+        session
+            .register_handoff("handoff-1", 1, "First request")
+            .unwrap();
+        session
+            .register_handoff("handoff-2", 1, "Second request")
+            .unwrap();
+        let note = SemanticTurn::Expert(
+            "The Expert is still working on these handoffs and will answer in its own voice, so do not hand them off again:\n- First request\n- Second request".into(),
+        );
+        assert_eq!(session.replacement_transcript(), [note]);
+        session
+            .record_live_event_with_delivery(LiveSideEvent::UserTranscript {
+                text: "And one more thing".into(),
+            })
+            .unwrap();
+
+        // A directive written before the user's latest words waits for them.
+        assert!(matches!(
+            session.prepare_expert_directive(None, "Stale".into()),
+            ExpertDirectiveOutcome::Pending(_)
+        ));
+        assert!(matches!(
+            session.prepare_expert_reply("The answer".into()),
+            ExpertDirectiveOutcome::Accepted {
+                confirmed_token: 1,
+                ..
+            }
+        ));
+        assert!(!session.has_unresolved_handoff());
+        assert_eq!(session.replacement_transcript(), []);
     }
 
     #[test]

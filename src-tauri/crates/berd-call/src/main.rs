@@ -2973,9 +2973,9 @@ struct LiveResponse {
     prepare_id: Option<u64>,
     speech_id: Option<u64>,
     expert_text: Option<String>,
-    /// An Expert reply spoken in its own voice, with the handoffs it answers.
-    /// It has no provider response; its whole text is played at once.
-    reply: Option<Vec<String>>,
+    /// An Expert reply spoken in its own voice. It has no provider
+    /// response; its whole text is played at once.
+    reply: bool,
     /// The voice it asked for, when not the Expert's usual one.
     voice: Option<TtsConfigurationLease>,
     delivery: RealtimeAudioDelivery,
@@ -2995,7 +2995,7 @@ impl LiveResponse {
             prepare_id,
             speech_id,
             expert_text: None,
-            reply: None,
+            reply: false,
             voice: None,
             delivery: RealtimeAudioDelivery::default(),
             pending_audio: VecDeque::new(),
@@ -3219,19 +3219,33 @@ fn validate_queued_spokesperson_settings(
 fn spokesperson_voice_update_is_safe(
     update: &VoiceUpdateTransaction,
     core: &RealtimeExpertSpokespersonSession,
+    expert_tts: bool,
     snapshot: &berd_call::TtsConfigurationSnapshot,
     gate: &ExpertTurnGate,
     work: RealtimeHostWork,
 ) -> bool {
+    // A reply in the Expert's own voice waits for the replacement, and adds
+    // nothing to what it was given.
+    let work = RealtimeHostWork {
+        pending_expert_prepare: work.pending_expert_prepare && !expert_tts,
+        ..work
+    };
     gate.lifecycle.voice_update_is_safe(
         update.purpose(),
         update.semantic_revision,
         core.semantic_revision(),
         update.base_revision,
         snapshot.revision,
-        core.has_unresolved_handoff(),
+        handoffs_hold_session(core, expert_tts),
         work,
     )
+}
+
+/// Whether open handoffs keep the Spokesperson's session from being
+/// replaced: only while it says their replies itself. Replies in the
+/// Expert's own voice need nothing from it.
+fn handoffs_hold_session(core: &RealtimeExpertSpokespersonSession, expert_tts: bool) -> bool {
+    !expert_tts && core.has_unresolved_handoff()
 }
 
 fn unavailable_spokesperson_title(connection_lost: bool, quiescent: bool) -> &'static str {
@@ -3321,7 +3335,7 @@ fn run_expert_spokesperson_session(
             if turn_gate.lifecycle.renewal_is_due(
                 Instant::now(),
                 work,
-                core.has_unresolved_handoff(),
+                handoffs_hold_session(&core, reply_tts.is_some()),
                 pending_voice_update.is_some(),
             ) {
                 let snapshot = session_tts.as_ref().expect("initialized TTS snapshot");
@@ -3338,7 +3352,7 @@ fn run_expert_spokesperson_session(
                     runtime_config
                         .as_ref()
                         .expect("initialized Spokesperson config"),
-                    core.semantic_transcript(),
+                    core.replacement_transcript(),
                     VoiceUpdatePurpose::Renewal,
                 )?);
             }
@@ -3354,6 +3368,7 @@ fn run_expert_spokesperson_session(
             let safe = spokesperson_voice_update_is_safe(
                 update,
                 &core,
+                reply_tts.is_some(),
                 session_tts.as_ref().expect("initialized TTS snapshot"),
                 &turn_gate,
                 work,
@@ -3433,7 +3448,7 @@ fn run_expert_spokesperson_session(
                 runtime_config
                     .as_ref()
                     .expect("initialized Spokesperson config"),
-                core.semantic_transcript(),
+                core.replacement_transcript(),
             ) {
                 Ok(update) => Some(update),
                 Err(message) => {
@@ -3816,6 +3831,7 @@ fn run_expert_spokesperson_session(
                                 let safe = spokesperson_voice_update_is_safe(
                                     update,
                                     &core,
+                                    reply_tts.is_some(),
                                     session_tts.as_ref().expect("initialized TTS snapshot"),
                                     &turn_gate,
                                     work,
@@ -3937,7 +3953,7 @@ fn run_expert_spokesperson_session(
                             &cancelled_directives,
                         );
                         let quiescent = turn_gate.lifecycle.settings_are_quiescent(work)
-                            && !core.has_unresolved_handoff();
+                            && !handoffs_hold_session(&core, reply_tts.is_some());
                         if !quiescent {
                             write_protocol_fatal(
                                 &mut writer,
@@ -3952,7 +3968,7 @@ fn run_expert_spokesperson_session(
                                 .as_ref()
                                 .map(VoiceUpdateTransaction::purpose),
                             work,
-                            core.has_unresolved_handoff(),
+                            handoffs_hold_session(&core, reply_tts.is_some()),
                         );
                         let start_recovery = match recovery_action {
                             RealtimeSessionLossAction::ContinuePendingRecovery => {
@@ -3994,7 +4010,7 @@ fn run_expert_spokesperson_session(
                                 runtime_config
                                     .as_ref()
                                     .expect("initialized Spokesperson config"),
-                                core.semantic_transcript(),
+                                core.replacement_transcript(),
                                 VoiceUpdatePurpose::SessionRecovery {
                                     cause: message.clone(),
                                 },
@@ -4207,7 +4223,6 @@ fn run_expert_spokesperson_session(
                 runtime.as_ref().expect("initialized runtime"),
                 &text[..heard],
                 interrupted,
-                response.reply.as_deref().unwrap_or_default(),
             )?;
         }
         if initialized && !turn_gate.input_blocks_output() {
@@ -4775,9 +4790,7 @@ fn run_expert_spokesperson_session(
                     CancelOutcome::Cancelled
                 } else if let Some(response_id) = responses
                     .iter()
-                    .find(|(_, response)| {
-                        response.reply.is_some() && response.prepare_id == Some(id)
-                    })
+                    .find(|(_, response)| response.reply && response.prepare_id == Some(id))
                     .map(|(response_id, _)| response_id.clone())
                 {
                     waiting_responses.retain(|waiting| *waiting != response_id);
@@ -5059,7 +5072,7 @@ fn drop_waiting_replies(
         if Some(response_id.as_str()) == active_response_id
             || !responses
                 .get(response_id)
-                .is_some_and(|response| response.reply.is_some())
+                .is_some_and(|response| response.reply)
         {
             continue;
         }
@@ -5074,39 +5087,19 @@ fn drop_waiting_replies(
                 spoken_through_utf8: 0,
             },
         )?;
-        finish_expert_reply(
-            core,
-            runtime,
-            "",
-            true,
-            response.reply.as_deref().unwrap_or_default(),
-        )?;
+        finish_expert_reply(core, runtime, "", true)?;
     }
     Ok(())
 }
 
-/// Tells the Spokesperson what the user heard of an Expert reply, and settles
-/// the handoffs it answers.
+/// Tells the Spokesperson what the user heard of an Expert reply.
 fn finish_expert_reply(
     core: &mut RealtimeExpertSpokespersonSession,
     runtime: &OpenAiSpokespersonRuntime,
     heard: &str,
     interrupted: bool,
-    handoff_ids: &[String],
 ) -> Result<(), String> {
     let heard = heard.trim();
-    // Handoffs settled elsewhere while the reply played need no settling here.
-    let unknown = core.unknown_handoff_ids(handoff_ids);
-    let open: Vec<String> = handoff_ids
-        .iter()
-        .filter(|id| !unknown.contains(id))
-        .cloned()
-        .collect();
-    if heard.is_empty() {
-        core.release_handoffs(&open);
-    } else {
-        core.dismiss_handoffs(&open)?;
-    }
     let message = match (heard.is_empty(), interrupted) {
         (true, _) => "The user interrupted the Expert's spoken reply before hearing any of it.".into(),
         (false, false) => format!("The Expert said this to the user in its own voice:\n{heard}"),
@@ -5195,9 +5188,12 @@ fn submit_expert_prepare(
     next_speech_id: &mut u64,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    if !core
-        .unknown_handoff_ids(&request.resolved_handoff_ids)
-        .is_empty()
+    // A reply in the Expert's own voice answers every open handoff, so the
+    // ones it names don't matter.
+    if !expert_tts
+        && !core
+            .unknown_handoff_ids(&request.resolved_handoff_ids)
+            .is_empty()
     {
         return write_message(
             writer,
@@ -5207,7 +5203,12 @@ fn submit_expert_prepare(
             },
         );
     }
-    match core.prepare_expert_directive(request.acknowledgement, request.text) {
+    let outcome = if expert_tts {
+        core.prepare_expert_reply(request.text)
+    } else {
+        core.prepare_expert_directive(request.acknowledgement, request.text)
+    };
+    match outcome {
         ExpertDirectiveOutcome::Pending(events) => write_message(
             writer,
             &SessionMessage::Pending {
@@ -5230,14 +5231,12 @@ fn submit_expert_prepare(
             let speech_id = *next_speech_id;
             *next_speech_id += 1;
             core.record_expert_turn(message.clone());
-            let resolved_handoff_ids = request.resolved_handoff_ids;
-            core.mark_handoffs_resolving(&resolved_handoff_ids)?;
             if expert_tts {
                 // Played in turn with the Spokesperson's responses, without one of its own.
                 let response_id = format!("expert-reply-{speech_id}");
                 let mut response = LiveResponse::new(Some(request.id), Some(speech_id));
                 response.expert_text = Some(message);
-                response.reply = Some(resolved_handoff_ids);
+                response.reply = true;
                 response.voice = request.voice;
                 response.audio_done = true;
                 response.finish_sent = true;
@@ -5245,6 +5244,8 @@ fn submit_expert_prepare(
                 responses.insert(response_id.clone(), response);
                 waiting_responses.push_back(response_id);
             } else {
+                let resolved_handoff_ids = request.resolved_handoff_ids;
+                core.mark_handoffs_resolving(&resolved_handoff_ids)?;
                 directive_speeches.insert(
                     request.id,
                     DirectiveSpeech {
@@ -5413,7 +5414,7 @@ fn start_next_live_playback(
         if response.interrupted || response.playback_complete {
             continue;
         }
-        if response.reply.is_some() {
+        if response.reply {
             let tts = reply_tts.ok_or("an Expert reply has no voice of its own")?;
             *active = Some(spawn_reply_playback(
                 response_id,
