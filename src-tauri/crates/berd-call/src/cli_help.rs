@@ -43,7 +43,8 @@ options are the same as `berd-call session`, except the PCM descriptor is owned
 internally. `--stream` prints cursor, role, and text as TSV. In
 Expert-Spokesperson mode it prints nothing until the Spokesperson hands off,
 then everything since the last handoff; `--stream live` prints each row as it
-happens. `--codex` delivers the handoff batches to the calling Codex task
+happens. `--codex` delivers a batch to the calling Codex task after every
+Spokesperson reply and at each handoff, as Berd's Expert hears the call
 (requires CODEX_THREAD_ID). A
 menu-bar item controls speech rate, input muting, and ending the call; pass
 `--no-menu-bar` to omit it.

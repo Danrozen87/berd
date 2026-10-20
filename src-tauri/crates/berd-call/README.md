@@ -76,8 +76,8 @@ nothing until then, and then every row since the last handoff, ending with the
 row with cursor `0` as soon as a reply is generated, before it is spoken. The
 `spokesperson` or `spokesperson_interrupted` row after playback carries the
 reply's cursor and what was heard. A conventional call has no handoffs, so it
-always streams each row. A `--codex` task, like `--stream`, wakes only at
-handoffs. The standalone host intentionally uses only the default devices. It
+always streams each row. A `--codex` task hears the call as Berd's Expert
+does: a batch after every Spokesperson reply, and at each handoff. The standalone host intentionally uses only the default devices. It
 suppresses recognition during playback when the default output
 identifies itself as built-in speakers, preventing the call from transcribing
 its own speech; headphone-like outputs retain barge-in.

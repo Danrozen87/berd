@@ -1436,10 +1436,7 @@ impl SessionActor {
     ) -> Result<(), String> {
         self.held.extend(events);
         if !handoff
-            && matches!(
-                *self.transcript,
-                Transcript::Stdout { live: false } | Transcript::Codex(_)
-            )
+            && matches!(*self.transcript, Transcript::Stdout { live: false })
         {
             return Ok(());
         }
