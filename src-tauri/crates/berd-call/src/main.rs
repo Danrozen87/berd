@@ -899,10 +899,7 @@ fn parse_saved_start_args_at(args: &[String], path: PathBuf) -> Result<StartOpti
     }
     // Calls whose replies don't have their own voice keep the Spokesperson's for later.
     let spokesperson = saved.arguments.clone();
-    if !args
-        .windows(2)
-        .any(|pair| pair[0] == "--expert-voice" && pair[1] == "tts")
-    {
+    if !args.iter().any(|arg| arg == DIRECT_AGENT_SPEECH) {
         saved.arguments = saved_settings::without_spokesperson(&saved.arguments);
     }
     let mut merged = args[..2].to_vec();
@@ -3330,7 +3327,7 @@ fn run_expert_spokesperson_session(
     let (audio_control_tx, audio_control_rx) = mpsc::channel();
     let (playback_tx, playback_rx) = mpsc::channel::<LivePlaybackResult>();
     let (reply_tx, reply_rx) = mpsc::channel::<ReplyResult>();
-    // The Expert's own voice, with `--expert-voice tts`.
+    // The Expert's own voice, with `--allow-direct-agent-speech`.
     let mut reply_tts: Option<Arc<ConfiguredTtsSlot>> = None;
     let (tts_configuration_tx, tts_configuration_rx) = mpsc::channel::<TtsConfigurationEvent>();
     let mut tts_update: Option<ActiveTtsConfigurationUpdate> = None;
@@ -5253,8 +5250,10 @@ fn submit_expert_prepare(
             },
         );
     }
-    let outcome = if answers_all {
-        core.prepare_expert_reply(request.text)
+    let outcome = if request.relay {
+        core.prepare_expert_message(request.text)
+    } else if expert_tts {
+        core.prepare_expert_reply(request.acknowledgement, request.text)
     } else {
         core.prepare_expert_directive(request.acknowledgement, request.text)
     };
@@ -5922,6 +5921,10 @@ fn finish_unready_input_runtime(runtime: VoiceInputRuntime) -> Result<(), String
         .map_err(|error| format!("finish unready voice input runtime: {error}"))
 }
 
+/// Lets the Expert speak to the user in its own voice in an
+/// Expert-Spokesperson call, rather than only through the Spokesperson.
+pub(crate) const DIRECT_AGENT_SPEECH: &str = "--allow-direct-agent-speech";
+
 fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     if args.get(1).map(String::as_str) != Some("session") {
         return Err("the only supported command is session".into());
@@ -5943,6 +5946,11 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         let flag = args[index].as_str();
         if is_help_flag(flag) {
             return Err(ParseFailure::HelpRequested);
+        }
+        if flag == DIRECT_AGENT_SPEECH {
+            expert_tts = true;
+            index += 1;
+            continue;
         }
         let value = args
             .get(index + 1)
@@ -5973,13 +5981,6 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     _ => return Err("--mode must be conventional or expert-spokesperson".into()),
                 }
             }
-            "--expert-voice" => {
-                expert_tts = match value.as_str() {
-                    "tts" => true,
-                    "spokesperson" => false,
-                    _ => return Err("--expert-voice must be tts or spokesperson".into()),
-                }
-            }
             "--spokesperson-voice" => spokesperson_voice = Some(value.clone()),
             "--spokesperson-rate" => {
                 spokesperson_rate = Some(
@@ -5999,12 +6000,13 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         return Err("--realtime-url requires --mode expert-spokesperson".into());
     }
     if expert_tts && mode != SessionMode::ExpertSpokesperson {
-        return Err("--expert-voice requires --mode expert-spokesperson".into());
+        return Err(format!("{DIRECT_AGENT_SPEECH} requires --mode expert-spokesperson").into());
     }
     if (spokesperson_voice.is_some() || spokesperson_rate.is_some()) && !expert_tts {
-        return Err(
-            "--spokesperson-voice and --spokesperson-rate require --expert-voice tts".into(),
-        );
+        return Err(format!(
+            "--spokesperson-voice and --spokesperson-rate require {DIRECT_AGENT_SPEECH}"
+        )
+        .into());
     }
     if let Some(voice) = &spokesperson_voice {
         if !berd_call::openai_realtime_protocol::OPENAI_REALTIME_VOICE_IDS.contains(&voice.as_str())
@@ -10713,18 +10715,12 @@ mod tests {
             parse(&all)
         };
         assert!(!expert(&["--tts-backend", "openai"]).unwrap().expert_tts);
-        assert!(
-            !expert(&["--tts-backend", "openai", "--expert-voice", "spokesperson"])
-                .unwrap()
-                .expert_tts
-        );
         let own = expert(&[
             "--tts-backend",
             "openai",
             "--rate",
             "2.0",
-            "--expert-voice",
-            "tts",
+            "--allow-direct-agent-speech",
             "--tts-url",
             "http://127.0.0.1:18870/v1/audio/speech",
         ])
@@ -10750,8 +10746,7 @@ mod tests {
         let chosen = expert(&[
             "--tts-backend",
             "openai",
-            "--expert-voice",
-            "tts",
+            "--allow-direct-agent-speech",
             "--spokesperson-voice",
             "cedar",
             "--spokesperson-rate",
@@ -10761,13 +10756,17 @@ mod tests {
         apply_spokesperson_startup_settings(&chosen, &mut realtime).unwrap();
         assert_eq!((realtime.voice(), realtime.speed()), ("cedar", 1.25));
         for (extra, error) in [
-            (&["--spokesperson-voice", "cedar"][..], "--expert-voice tts"),
+            (&["--spokesperson-voice", "cedar"][..], DIRECT_AGENT_SPEECH),
             (
-                &["--expert-voice", "tts", "--spokesperson-voice", "nobody"],
+                &[
+                    "--allow-direct-agent-speech",
+                    "--spokesperson-voice",
+                    "nobody",
+                ],
                 "no realtime voice named nobody",
             ),
             (
-                &["--expert-voice", "tts", "--spokesperson-rate", "2"],
+                &["--allow-direct-agent-speech", "--spokesperson-rate", "2"],
                 "between 0.25 and 1.5",
             ),
         ] {
@@ -10776,20 +10775,20 @@ mod tests {
         }
         let read_aloud = expert(&["--tts-backend", "openai", "--rate", "2.0"]).unwrap();
         assert!(apply_spokesperson_startup_settings(&read_aloud, &mut realtime).is_err());
-        assert!(expert(&["--expert-voice", "loud"])
-            .unwrap_err()
-            .contains("tts or spokesperson"));
-        assert!(parse(&["--tts-backend", "openai", "--expert-voice", "tts"])
-            .unwrap_err()
-            .contains("--mode expert-spokesperson"));
+        assert!(
+            parse(&["--tts-backend", "openai", "--allow-direct-agent-speech"])
+                .unwrap_err()
+                .contains("--mode expert-spokesperson")
+        );
         assert_eq!(
             saved_settings::persistable_arguments(&args(&[
                 "--mode",
                 "expert-spokesperson",
-                "--expert-voice",
-                "tts"
+                "--allow-direct-agent-speech",
+                "--voice",
+                "Aaron"
             ])),
-            args(&["--mode", "expert-spokesperson"])
+            args(&["--mode", "expert-spokesperson", "--voice", "Aaron"])
         );
     }
 
@@ -12539,10 +12538,14 @@ mod tests {
             .iter()
             .any(|flag| flag.starts_with("--spokesperson")));
         assert!(conventional.saved.unwrap().1.arguments.starts_with(&chosen));
-        let own = start(&["--mode", "expert-spokesperson", "--expert-voice", "tts"]);
+        let own = start(&[
+            "--mode",
+            "expert-spokesperson",
+            "--allow-direct-agent-speech",
+        ]);
         assert!(own
             .session_arguments
-            .ends_with(&args(&["--expert-voice", "tts"])));
+            .ends_with(&args(&["--allow-direct-agent-speech"])));
         assert!(own
             .session_arguments
             .windows(2)

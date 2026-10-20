@@ -1587,14 +1587,22 @@ impl RealtimeExpertSpokespersonSession {
         })
     }
 
-    /// Prepares an Expert message to the Spokesperson, or any reply when the
-    /// Expert has its own voice: it is admitted however much was said since
-    /// it was written, and answers every open handoff.
-    pub fn prepare_expert_reply(&mut self, message: String) -> ExpertDirectiveOutcome {
-        let outcome = self.conversation.prepare_directive(ExpertDirective {
-            acknowledgement: Some(self.conversation.delivered_token()),
-            message,
-        });
+    /// Prepares an Expert message to the Spokesperson: it is admitted however
+    /// much was said since it was written, and answers every open handoff.
+    pub fn prepare_expert_message(&mut self, message: String) -> ExpertDirectiveOutcome {
+        let acknowledgement = Some(self.conversation.delivered_token());
+        self.prepare_expert_reply(acknowledgement, message)
+    }
+
+    /// Prepares a reply in the Expert's own voice: like a directive, it waits
+    /// for whatever the Expert hasn't acknowledged, and once admitted it
+    /// answers every open handoff.
+    pub fn prepare_expert_reply(
+        &mut self,
+        acknowledgement: Option<u64>,
+        message: String,
+    ) -> ExpertDirectiveOutcome {
+        let outcome = self.prepare_expert_directive(acknowledgement, message);
         if matches!(outcome, ExpertDirectiveOutcome::Accepted { .. }) {
             self.open_handoffs.clear();
         }
@@ -3117,7 +3125,7 @@ mod tests {
     }
 
     #[test]
-    fn expert_reply_answers_every_handoff_however_late() {
+    fn expert_message_answers_every_handoff_however_late() {
         let mut session = RealtimeExpertSpokespersonSession::new(0, "test-call");
         session
             .register_handoff("handoff-1", 1, "First request")
@@ -3135,13 +3143,15 @@ mod tests {
             })
             .unwrap();
 
-        // A directive written before the user's latest words waits for them.
+        // A reply written before the user's latest words waits for them, and
+        // answers no handoff until it is admitted.
         assert!(matches!(
-            session.prepare_expert_directive(None, "Stale".into()),
+            session.prepare_expert_reply(None, "Stale".into()),
             ExpertDirectiveOutcome::Pending(_)
         ));
+        assert!(session.has_unresolved_handoff());
         assert!(matches!(
-            session.prepare_expert_reply("The answer".into()),
+            session.prepare_expert_message("The answer".into()),
             ExpertDirectiveOutcome::Accepted {
                 confirmed_token: 1,
                 ..

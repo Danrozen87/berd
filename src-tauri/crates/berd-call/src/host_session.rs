@@ -462,6 +462,10 @@ fn start_session(
         stop_requested: Arc::clone(stop_requested),
         muted: Arc::clone(&actor.muted),
         transcript: Arc::clone(transcript),
+        speaks: !expert_spokesperson
+            || arguments
+                .iter()
+                .any(|argument| argument == crate::DIRECT_AGENT_SPEECH),
         session_arguments: arguments,
     });
     Ok(StartedSession {
@@ -547,6 +551,8 @@ struct SessionControl {
     stop_requested: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     transcript: Arc<Transcript>,
+    // Whether the Expert may speak to the user rather than only through the Spokesperson.
+    speaks: bool,
     session_arguments: Vec<String>,
 }
 
@@ -746,6 +752,12 @@ impl HostControl for SessionControl {
         language: Option<String>,
         relay: bool,
     ) -> Result<Value, String> {
+        if !relay && !self.speaks {
+            return Err(format!(
+                "the Expert speaks through the Spokesperson: use message-spokesperson, or start the call with {}",
+                crate::DIRECT_AGENT_SPEECH
+            ));
+        }
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
             .send(ControlCommand::Speak {
@@ -4350,11 +4362,48 @@ mod tests {
             stop_requested: Arc::clone(&stop_requested),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         drop(receiver);
         assert_eq!(control.stop().unwrap(), json!({"stopping":true}));
         assert!(stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_expert_speaks_only_through_the_spokesperson_unless_allowed() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::new(Mutex::new(test_snapshot())),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            transcript: Arc::new(Transcript::Silent),
+            speaks: false,
+            session_arguments: vec!["session".into()],
+        };
+        let refusal = control
+            .speak("Hello".into(), None, Vec::new(), None, None, false)
+            .unwrap_err();
+        assert!(refusal.contains("message-spokesperson"), "{refusal}");
+        assert!(receiver.try_recv().is_err());
+        let worker = thread::spawn(move || match receiver.recv().unwrap() {
+            ControlCommand::Speak {
+                relay, response, ..
+            } => {
+                response.send(Ok(json!({}))).unwrap();
+                relay
+            }
+            _ => panic!("expected a message to the Spokesperson"),
+        });
+        control
+            .speak("Hello".into(), None, Vec::new(), None, None, true)
+            .unwrap();
+        assert!(worker.join().unwrap());
     }
 
     #[test]
@@ -4372,6 +4421,7 @@ mod tests {
             stop_requested: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         let worker = thread::spawn(move || match receiver.recv().unwrap() {
@@ -4414,6 +4464,7 @@ mod tests {
             stop_requested: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             transcript: Arc::new(Transcript::Silent),
+            speaks: true,
             session_arguments: vec!["session".into()],
         };
         let worker = thread::spawn(move || match receiver.recv().unwrap() {

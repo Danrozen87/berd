@@ -128,12 +128,17 @@ pub(crate) fn merge_arguments(saved: &[String], explicit: &[String]) -> Vec<Stri
 }
 
 pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
+    let arguments: Vec<_> = arguments
+        .iter()
+        .filter(|argument| *argument != crate::DIRECT_AGENT_SPEECH)
+        .cloned()
+        .collect();
     arguments
         .chunks_exact(2)
         .filter(|pair| {
             !matches!(
                 pair[0].as_str(),
-                "--realtime-url" | "--stt-url" | "--tts-url" | "--expert-voice"
+                "--realtime-url" | "--stt-url" | "--tts-url"
             )
         })
         .flatten()

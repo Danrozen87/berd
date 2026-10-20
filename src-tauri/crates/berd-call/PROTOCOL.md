@@ -74,8 +74,8 @@ Detailed backend errors are diagnostics on stderr only; protocol rejection and
 fatal messages are sanitized at the stdout boundary.
 `session.tts` describes the voice that speaks replies, and `set_tts_settings`
 changes it: in Expert-Spokesperson sessions, that is the configured TTS backend
-with `--expert-voice tts` and otherwise the Spokesperson's own voice. With
-`--expert-voice tts`, `session.spokesperson` is the Spokesperson's own OpenAI
+with `--allow-direct-agent-speech` and otherwise the Spokesperson's own voice. With
+`--allow-direct-agent-speech`, `session.spokesperson` is the Spokesperson's own OpenAI
 snapshot, with its own revision, and `set_spokesperson_settings` changes it the
 way `set_tts_settings` changes the Spokesperson's voice in other sessions. A reply in
 the Expert's own voice reports the same `admitted`, `speech_completed`,
@@ -220,11 +220,12 @@ Unknown fields are rejected. IDs are positive. Speak text is at most 16 KiB.
 backend, keeping its other settings; `language` changes a Siri voice's locale
 too. A voice the backend doesn't offer, or a voice for a call whose replies
 are spoken by the Spokesperson, is `not_admitted(invalid_voice)`. In a call
-whose replies have their own voice, a reply is admitted however stale its
-`acknowledgement`, never `pending`, and answers every open handoff once
-admitted, so `resolved_handoff_ids` is ignored. With `relay: true` (what
+whose replies have their own voice, a reply needs the same `acknowledgement`
+as a directive, and answers every open handoff once admitted, so
+`resolved_handoff_ids` is ignored. With `relay: true` (what
 `berd-call message-spokesperson` sends), the Spokesperson says the reply in any
-Expert-Spokesperson call, on those same terms, with the same lifecycle. Open
+Expert-Spokesperson call; it is admitted however stale its `acknowledgement`,
+never `pending`, and answers every open handoff. Open
 handoffs in a call whose replies have their own voice don't hold
 back a renewal or recovery of the Spokesperson's session; the replacement is
 told what they asked.
