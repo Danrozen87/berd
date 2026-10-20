@@ -2309,6 +2309,16 @@ impl AudioPlaybackState {
         }
     }
 
+    /// What the host played of this speech, once it has ended it. The session may not have heard yet, so its records for it can still arrive.
+    fn retired(&self, speech_id: u64) -> Option<u64> {
+        match self {
+            Self::Finished(retired) if retired.speech_id == speech_id => {
+                Some(retired.played_frames)
+            }
+            _ => None,
+        }
+    }
+
     fn finish(&mut self, speech_id: u64, played_frames: u64) {
         *self = Self::Finished(RetiredAudio {
             speech_id,
@@ -2523,6 +2533,9 @@ fn handle_audio_record(
         AUDIO_CHUNK_KIND if payload.len() >= 16 && (payload.len() - 16).is_multiple_of(4) => {
             let speech_id = le_u64(&payload[0..8])?;
             let sequence = le_u64(&payload[8..16])?;
+            if playback.retired(speech_id).is_some() {
+                return Ok(());
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session sent audio for an inactive speech".to_string())?;
@@ -2555,6 +2568,9 @@ fn handle_audio_record(
         AUDIO_END_KIND if payload.len() == 24 => {
             let speech_id = le_u64(&payload[0..8])?;
             let sequence = le_u64(&payload[8..16])?;
+            if playback.retired(speech_id).is_some() {
+                return Ok(());
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session ended inactive audio".to_string())?;
@@ -2563,6 +2579,15 @@ fn handle_audio_record(
         }
         AUDIO_CANCEL_KIND if payload.len() == 8 => {
             let speech_id = le_u64(payload)?;
+            if let Some(played_frames) = playback.retired(speech_id) {
+                return send_request(
+                    writer,
+                    &SessionRequest::AudioCancelled {
+                        speech_id,
+                        played_frames,
+                    },
+                );
+            }
             let active = playback
                 .playing_mut(speech_id)
                 .ok_or_else(|| "voice session cancelled inactive audio".to_string())?;
@@ -4610,6 +4635,17 @@ mod tests {
         });
         assert_eq!(playback.played_frames(17), 48_000);
         assert_eq!(playback.played_frames(18), 0);
+    }
+
+    #[test]
+    fn only_the_ended_speech_is_retired() {
+        let playback = AudioPlaybackState::Finished(RetiredAudio {
+            speech_id: 17,
+            played_frames: 4_096,
+        });
+        assert_eq!(playback.retired(17), Some(4_096));
+        assert_eq!(playback.retired(18), None);
+        assert_eq!(AudioPlaybackState::Idle.retired(17), None);
     }
 
     #[test]
