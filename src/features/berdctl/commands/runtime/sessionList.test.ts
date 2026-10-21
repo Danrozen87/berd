@@ -342,6 +342,42 @@ describe("listSessionsForBerdctl", () => {
     expect(mocks.acpGetSessionInfo).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ["a remote host", { remoteHost: "devbox" }],
+    ["a composite remote id", { id: "ssh:devbox#remote-1" }],
+  ])("pages instead of probing a cached row on %s", async (_label, overrides) => {
+    const seed = [cachedSession("remote", 900, overrides)];
+    serveSessionList(
+      Array.from({ length: 120 }, (_, index) =>
+        acpSession(`s-${String(index).padStart(3, "0")}`, 500 - index),
+      ),
+    );
+    const expected = await exhaustiveIds(seed, unarchived, 2);
+
+    expect(await listIds(unarchived, 2)).toEqual(expected);
+    expect(mocks.acpGetSessionInfo).not.toHaveBeenCalled();
+    expect(mocks.acpListSessionsPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops waiting on a slow lookup and keeps paging", async () => {
+    vi.useFakeTimers();
+    const seed = [cachedSession("stalled", 900)];
+    serveSessionList(
+      Array.from({ length: 120 }, (_, index) =>
+        acpSession(`s-${String(index).padStart(3, "0")}`, 500 - index),
+      ),
+    );
+    const expected = await exhaustiveIds(seed, unarchived, 2);
+    mocks.acpGetSessionInfo.mockReturnValue(new Promise(() => {}));
+
+    const listing = listIds(unarchived, 2);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(await listing).toEqual(expected);
+    expect(mocks.acpGetSessionInfo).toHaveBeenCalledOnce();
+    expect(mocks.acpListSessionsPage).toHaveBeenCalledTimes(3);
+  });
+
   it("re-reads the store after a lookup so concurrent archives are honored", async () => {
     const seed = [cachedSession("draft", 900, { messageCount: 0 })];
     serveSessionList(

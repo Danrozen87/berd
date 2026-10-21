@@ -13,10 +13,13 @@ import {
   acpGetSessionInfo,
   acpListSessionsPage,
 } from "@/shared/api/acp";
+import { isCompositeSessionId } from "@/shared/api/acpBackendId";
 import { berdctlErrorDetail } from "../helpers";
 import { CommandError } from "../types";
 
 const MS_PER_SECOND = 1000;
+/** A local getSessionInfo is one indexed row read; past this, page instead. */
+const CACHED_SESSION_PROBE_TIMEOUT_MS = 1000;
 
 /** Progress after each session/list page has been merged into the store. */
 interface SessionListScanProgress {
@@ -134,7 +137,7 @@ async function findSettledFirstMatches(
     if (!uncheckedMatch) {
       return firstMatches;
     }
-    await checkCachedSession(uncheckedMatch.id, options);
+    await checkCachedSession(uncheckedMatch, options);
   }
 }
 
@@ -152,7 +155,7 @@ function isOutsideSessionList(
 }
 
 async function checkCachedSession(
-  sessionId: string,
+  session: ChatSession,
   {
     deadlineMs,
     cachedSessionChecks,
@@ -161,13 +164,41 @@ async function checkCachedSession(
   },
 ): Promise<void> {
   throwIfPastDeadline(deadlineMs);
-  let check: CachedSessionCheck = null;
-  try {
-    check = await acpGetSessionInfo(sessionId);
-  } catch {
-    // Unconfirmed; keep reading pages instead of trusting the cached row.
+  // Remote rows are never in the local list. Probing them could reconnect a
+  // host (and restart its daemon), so leave them unconfirmed and keep paging.
+  const isLocalSession =
+    !session.remoteHost && !isCompositeSessionId(session.id);
+  const check = isLocalSession
+    ? await readSessionInfoWithin(session.id, probeBudgetMs(deadlineMs))
+    : null;
+  cachedSessionChecks.set(session.id, check);
+}
+
+function probeBudgetMs(deadlineMs: number | undefined): number {
+  if (deadlineMs == null) {
+    return CACHED_SESSION_PROBE_TIMEOUT_MS;
   }
-  cachedSessionChecks.set(sessionId, check);
+  return Math.min(CACHED_SESSION_PROBE_TIMEOUT_MS, deadlineMs - Date.now());
+}
+
+/** getSessionInfo, or null when it fails or outlasts `budgetMs`. A late
+ *  lookup cannot be cancelled; it settles on its own and is ignored. */
+async function readSessionInfoWithin(
+  sessionId: string,
+  budgetMs: number,
+): Promise<AcpSessionInfo | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), budgetMs);
+  });
+  try {
+    return await Promise.race([
+      acpGetSessionInfo(sessionId).catch(() => null),
+      expired,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
