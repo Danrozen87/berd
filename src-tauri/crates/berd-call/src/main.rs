@@ -533,13 +533,6 @@ fn main() {
                 std::process::exit(1);
             }
             #[cfg(target_os = "macos")]
-            if matches!(options.transcript, TranscriptDestination::Stdout { .. }) {
-                if let Err(error) = host_lifetime::watch_stdout(options.port) {
-                    eprintln!("berd-call start failed: {error}");
-                    std::process::exit(1);
-                }
-            }
-            #[cfg(target_os = "macos")]
             let _update_guard = guard_and_request_bundled_app_update();
             #[cfg(target_os = "macos")]
             if let Err(error) = menu_bar::run(options) {

@@ -49,6 +49,9 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
     transcript.start()?;
     let non_blocking = Arc::new(AtomicBool::new(options.non_blocking));
     let stop_requested = Arc::new(AtomicBool::new(false));
+    if matches!(&*transcript, Transcript::Stdout { .. }) {
+        crate::host_lifetime::watch_stdout(Arc::clone(&stop_requested))?;
+    }
     let status_sounds = Arc::new(Mutex::new(StatusSounds {
         mode: options
             .saved
@@ -95,6 +98,10 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
             }
             Ok(Some(next)) => {
                 session = next;
+            }
+            Err(_) if stop_requested.load(Ordering::SeqCst) => {
+                transcript.finish(CLEAN_STOP);
+                return Ok(());
             }
             Err(message) => {
                 transcript.finish(&format!("Berd Call failed: {message}"));
@@ -370,7 +377,7 @@ fn start_session(
             status_sound_output_device: None,
         },
     )?;
-    let ready = receive_ready(&event_rx)?;
+    let ready = receive_ready(&event_rx, stop_requested)?;
     let running = Arc::new(AtomicBool::new(true));
     let (command_tx, command_rx) = mpsc::sync_channel(32);
     let mut actor = SessionActor::new(
@@ -1781,18 +1788,11 @@ struct PendingInputPoll {
     response: SyncSender<Result<Value, String>>,
 }
 
-fn receive_ready(events: &Receiver<SessionMessage>) -> Result<ReadyState, String> {
-    let event = events
-        .recv_timeout(Duration::from_secs(60))
-        .map_err(|error| {
-            match error {
-                mpsc::RecvTimeoutError::Timeout => "timed out waiting for voice session startup",
-                mpsc::RecvTimeoutError::Disconnected => {
-                    "voice session event stream closed during startup"
-                }
-            }
-            .to_string()
-        })?;
+fn receive_ready(
+    events: &Receiver<SessionMessage>,
+    stopped: &AtomicBool,
+) -> Result<ReadyState, String> {
+    let event = crate::host_lifetime::receive_ready_event(events, stopped)?;
     match event {
         SessionMessage::Ready {
             id: 1,
