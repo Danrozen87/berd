@@ -67,6 +67,8 @@ mod cli_help;
 #[cfg(target_os = "macos")]
 mod codex;
 mod host_control;
+#[cfg(unix)]
+mod host_lifetime;
 #[cfg(target_os = "macos")]
 mod host_session;
 #[cfg(target_os = "macos")]
@@ -526,9 +528,16 @@ fn main() {
         Some("start") => {
             let options = parse_or_exit(parse_saved_start_args(&args), &args);
             #[cfg(target_os = "macos")]
-            if let Err(error) = host_session::route_stop_signals(options.port) {
+            if let Err(error) = host_lifetime::route_stop_signals(options.port) {
                 eprintln!("berd-call start failed: {error}");
                 std::process::exit(1);
+            }
+            #[cfg(target_os = "macos")]
+            if matches!(options.transcript, TranscriptDestination::Stdout { .. }) {
+                if let Err(error) = host_lifetime::watch_stdout(options.port) {
+                    eprintln!("berd-call start failed: {error}");
+                    std::process::exit(1);
+                }
             }
             #[cfg(target_os = "macos")]
             let _update_guard = guard_and_request_bundled_app_update();
