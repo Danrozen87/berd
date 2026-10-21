@@ -6842,7 +6842,11 @@ fn stt_benchmark_target(config: &SttBackendConfig) -> Result<SttBenchmarkTarget,
                 vad_threshold: 0.5,
                 endpoint_source: Some(endpoint_source.into()),
                 model_source: Some(model_source.into()),
-                credential_source: Some("OPENAI_API_KEY environment variable".into()),
+                credential_source: Some(format!(
+                    "{} environment variable",
+                    berd_call::openai::openai_key_var("OPENAI_STT_API_KEY")
+                        .unwrap_or("OPENAI_STT_API_KEY")
+                )),
             })
         }
     }
@@ -6887,10 +6891,8 @@ fn create_openai_tts_configuration(
     voice: String,
     endpoint: Option<&str>,
 ) -> Result<TtsConfiguration, String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| "OPENAI_API_KEY is required".to_string())?;
+    let api_key = berd_call::openai::openai_key("OPENAI_TTS_API_KEY")
+        .ok_or_else(|| "OPENAI_TTS_API_KEY or OPENAI_API_KEY is required".to_string())?;
     let base =
         std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
     Ok(TtsConfiguration::openai(
@@ -7148,10 +7150,9 @@ fn create_input_runtime(
             }
         }
         SttBackendConfig::OpenAi => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|key| !key.trim().is_empty())
-                .ok_or_else(|| "OPENAI_API_KEY is required for OpenAI STT".to_string())?;
+            let api_key = berd_call::openai::openai_key("OPENAI_STT_API_KEY").ok_or_else(|| {
+                "OPENAI_STT_API_KEY or OPENAI_API_KEY is required for OpenAI STT".to_string()
+            })?;
             let endpoint = endpoint_override
                 .map(str::to_string)
                 .or_else(|| {
@@ -7293,7 +7294,7 @@ fn public_tts_rejection_message(kind: TtsConfigurationRejectionKind) -> &'static
 fn public_tts_startup_error(config: &TtsBackendConfig) -> String {
     match config {
         TtsBackendConfig::OpenAi { .. } => {
-            "OpenAI TTS could not initialize; verify OPENAI_API_KEY and the selected model and voice"
+            "OpenAI TTS could not initialize; verify OPENAI_TTS_API_KEY or OPENAI_API_KEY and the selected model and voice"
                 .into()
         }
         TtsBackendConfig::Siri { .. } =>
@@ -7315,7 +7316,7 @@ fn public_stt_startup_error(config: &SttBackendConfig) -> String {
                 .into()
         }
         SttBackendConfig::OpenAi => {
-            "OpenAI speech recognition could not initialize; verify OPENAI_API_KEY and the selected transcription model"
+            "OpenAI speech recognition could not initialize; verify OPENAI_STT_API_KEY or OPENAI_API_KEY and the selected transcription model"
                 .into()
         }
     }
