@@ -43,6 +43,12 @@ pub(crate) trait HostControl: Send + Sync + 'static {
         policy: berd_call::input::InputDuringTtsPolicy,
     ) -> Result<Value, String>;
     fn set_muted(&self, muted: bool) -> Result<Value, String>;
+    /// Changes the status sound mode, or reports whether the agent is working.
+    fn set_status_sounds(
+        &self,
+        mode: Option<berd_call::StatusSoundMode>,
+        status: Option<berd_call::ConversationStatus>,
+    ) -> Result<Value, String>;
     fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String>;
     /// Restarts the call's session with the Spokesperson on or off.
     fn set_spokesperson_mode(&self, on: bool) -> Result<Value, String>;
@@ -152,6 +158,10 @@ pub(crate) enum ControlRequest {
     Muted {
         muted: bool,
     },
+    StatusSounds {
+        mode: Option<berd_call::StatusSoundMode>,
+        status: Option<berd_call::ConversationStatus>,
+    },
     Restart {
         #[serde(rename = "sessionArguments")]
         session_arguments: Vec<String>,
@@ -192,29 +202,36 @@ impl PendingResponse {
     }
 }
 
+fn read_timeout(request: &ControlRequest) -> Result<Option<Duration>, String> {
+    Ok(
+        if let ControlRequest::PollInput {
+            timeout_seconds, ..
+        } = request
+        {
+            if !POLL_TIMEOUT_SECONDS.contains(timeout_seconds) {
+                return Err("timeout must be between 1 and 3600 seconds".into());
+            }
+            Some(Duration::from_secs(*timeout_seconds) + IO_TIMEOUT)
+        } else if matches!(
+            request,
+            ControlRequest::Speak { .. }
+                | ControlRequest::TtsSettings { .. }
+                | ControlRequest::Rate { .. }
+                | ControlRequest::Voice { .. }
+                | ControlRequest::Spokesperson { .. }
+                | ControlRequest::StatusSounds { .. }
+                | ControlRequest::Restart { .. }
+                | ControlRequest::SpokespersonMode { .. }
+        ) {
+            None
+        } else {
+            Some(IO_TIMEOUT)
+        },
+    )
+}
+
 pub(crate) fn begin_request(port: u16, request: ControlRequest) -> Result<PendingResponse, String> {
-    let read_timeout = if let ControlRequest::PollInput {
-        timeout_seconds, ..
-    } = &request
-    {
-        if !POLL_TIMEOUT_SECONDS.contains(timeout_seconds) {
-            return Err("timeout must be between 1 and 3600 seconds".into());
-        }
-        Some(Duration::from_secs(*timeout_seconds) + IO_TIMEOUT)
-    } else if matches!(
-        &request,
-        ControlRequest::Speak { .. }
-            | ControlRequest::TtsSettings { .. }
-            | ControlRequest::Rate { .. }
-            | ControlRequest::Voice { .. }
-            | ControlRequest::Spokesperson { .. }
-            | ControlRequest::Restart { .. }
-            | ControlRequest::SpokespersonMode { .. }
-    ) {
-        None
-    } else {
-        Some(IO_TIMEOUT)
-    };
+    let read_timeout = read_timeout(&request)?;
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .map_err(|error| format!("could not connect to berd-call on port {port}: {error}"))?;
     configure_stream(&stream, read_timeout)?;
@@ -278,6 +295,9 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                 ControlRequest::NonBlocking { enabled } => control.set_non_blocking(enabled),
                 ControlRequest::InputDuringTts { policy } => control.set_input_during_tts(policy),
                 ControlRequest::Muted { muted } => control.set_muted(muted),
+                ControlRequest::StatusSounds { mode, status } => {
+                    control.set_status_sounds(mode, status)
+                }
                 ControlRequest::Restart { session_arguments } => control.restart(session_arguments),
                 ControlRequest::SpokespersonMode { on } => control.set_spokesperson_mode(on),
             },
@@ -420,6 +440,13 @@ mod tests {
         fn set_muted(&self, muted: bool) -> Result<Value, String> {
             Ok(json!({"muted": muted}))
         }
+        fn set_status_sounds(
+            &self,
+            mode: Option<berd_call::StatusSoundMode>,
+            status: Option<berd_call::ConversationStatus>,
+        ) -> Result<Value, String> {
+            Ok(json!({"statusSounds": mode, "conversationStatus": status}))
+        }
         fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
             Ok(json!({"sessionArguments": session_arguments}))
         }
@@ -523,5 +550,18 @@ mod tests {
         assert!(validate_speak("hello", &[], None, true).is_err());
         assert!(validate_speak("hello", &[], Some(" "), false).is_err());
         assert!(validate_speak("hello", &[], Some("Nora"), true).is_ok());
+    }
+
+    #[test]
+    fn status_sounds_wait_for_the_session_without_a_read_timeout() {
+        let request = ControlRequest::StatusSounds {
+            mode: Some(berd_call::StatusSoundMode::Off),
+            status: None,
+        };
+        assert_eq!(read_timeout(&request).unwrap(), None);
+        assert_eq!(
+            read_timeout(&ControlRequest::Muted { muted: true }).unwrap(),
+            Some(IO_TIMEOUT)
+        );
     }
 }
