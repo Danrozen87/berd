@@ -205,6 +205,9 @@ struct SessionConfig {
     /// The Spokesperson's own voice and speed when replies have theirs.
     spokesperson_voice: Option<String>,
     spokesperson_rate: Option<f32>,
+    /// The Spokesperson's session options beyond its voice and speed.
+    spokesperson_options:
+        Option<berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -3369,6 +3372,16 @@ fn apply_spokesperson_startup_settings(
     let (TtsBackendConfig::OpenAi { rate }
     | TtsBackendConfig::Siri { rate, .. }
     | TtsBackendConfig::Pocket { rate, .. }) = &session.tts;
+    if let Some(options) = &session.spokesperson_options {
+        let defaults = std::mem::replace(&mut spokesperson.session, options.clone());
+        let chosen = &mut spokesperson.session;
+        chosen.model = chosen.model.take().or(defaults.model);
+        chosen.transcription_model = chosen
+            .transcription_model
+            .take()
+            .or(defaults.transcription_model);
+        (chosen.voice, chosen.speed) = (defaults.voice, defaults.speed);
+    }
     if let Some(voice) = &session.spokesperson_voice {
         spokesperson.session.voice = Some(voice.clone());
     }
@@ -6065,6 +6078,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut expert_tts = false;
     let mut spokesperson_voice = None;
     let mut spokesperson_rate = None;
+    let mut spokesperson_options = None;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -6111,6 +6125,11 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     value
                         .parse::<f32>()
                         .map_err(|_| "--spokesperson-rate must be a number".to_string())?,
+                )
+            }
+            "--spokesperson-options" => {
+                spokesperson_options = Some(
+                    berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions::from_call_json(value)?,
                 )
             }
             "--pcm-output-fd" => {}
@@ -6160,6 +6179,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         expert_tts,
         spokesperson_voice,
         spokesperson_rate,
+        spokesperson_options,
     })
 }
 
@@ -10751,6 +10771,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
 
@@ -10764,6 +10785,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
     }
@@ -10843,6 +10865,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -10901,6 +10924,7 @@ mod tests {
             expert_tts: false,
             spokesperson_voice: None,
             spokesperson_rate: None,
+            spokesperson_options: None,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -10919,6 +10943,68 @@ mod tests {
 
         assert_eq!(realtime.speed(), 1.5);
         assert_eq!(realtime.voice(), "marin");
+    }
+
+    #[test]
+    fn spokesperson_options_reach_its_session_without_being_saved() {
+        let options = r#"{"model":"gpt-realtime-2","turnDetection":"semantic_vad","eagerness":"low","noiseReduction":"near_field","maxOutputTokens":512,"transcriptionPrompt":"Berd, Buzz"}"#;
+        let parse = |options: &str| {
+            parse_args(&args(&[
+                "berd-call",
+                "session",
+                "--mode",
+                "expert-spokesperson",
+                "--tts-backend",
+                "openai",
+                "--spokesperson-options",
+                options,
+            ]))
+        };
+        let mut realtime = OpenAiSpokespersonConfig {
+            endpoint: "ws://localhost".into(),
+            api_key: "test-key".into(),
+            session: berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions {
+                model: Some("env-model".into()),
+                transcription_model: Some("env-transcription".into()),
+                voice: Some("marin".into()),
+                speed: Some(1.0),
+                ..Default::default()
+            },
+            semantic_transcript: Vec::new(),
+        };
+        apply_spokesperson_startup_settings(&parse(options).unwrap(), &mut realtime);
+        let update =
+            berd_call::openai_realtime_protocol::spokesperson_session_update(&realtime.session);
+        let input = &update["session"]["audio"]["input"];
+        assert_eq!(realtime.model(), "gpt-realtime-2");
+        assert_eq!(input["turn_detection"]["type"], "semantic_vad");
+        assert_eq!(input["turn_detection"]["eagerness"], "low");
+        assert_eq!(input["noise_reduction"]["type"], "near_field");
+        assert_eq!(input["transcription"]["model"], "env-transcription");
+        assert_eq!(input["transcription"]["prompt"], "Berd, Buzz");
+        assert_eq!(update["session"]["max_output_tokens"], 512);
+        assert_eq!(update["session"]["audio"]["output"]["voice"], "marin");
+        for (options, error) in [
+            (r#"{"voice":"cedar"}"#, "voice"),
+            (r#"{"speed":1.2}"#, "speed"),
+            (r#"{"vadThreshold":2}"#, "vadThreshold"),
+            (r#"{"silenceDurationMs":50}"#, "silenceDurationMs"),
+            (r#"{"maxOutputTokens":0}"#, "maxOutputTokens"),
+            (r#"{"model":" "}"#, "model"),
+            (r#"{"turnDetection":"loud"}"#, "--spokesperson-options"),
+            (r#"{"temperature":1}"#, "temperature"),
+            ("[]", "--spokesperson-options"),
+        ] {
+            assert!(parse(options).unwrap_err().contains(error), "{options}");
+        }
+        let arguments = args(&["--spokesperson-options", options, "--voice", "Aaron"]);
+        assert_eq!(
+            saved_settings::persistable_arguments(&arguments),
+            args(&["--voice", "Aaron"])
+        );
+        // Turning the Spokesperson off and on keeps its options for later.
+        assert!(saved_settings::with_spokesperson(&arguments, false, false)
+            .contains(&"--spokesperson-options".to_string()));
     }
 
     #[test]
@@ -11123,6 +11209,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -11187,6 +11274,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -11634,6 +11722,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                spokesperson_options: None,
             }
         );
     }
