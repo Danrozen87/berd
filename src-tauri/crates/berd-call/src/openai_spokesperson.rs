@@ -368,7 +368,9 @@ impl OpenAiSpokespersonRuntime {
         match command {
             // Input and the clears that discard it share one queue, so they stay in order.
             command @ (SpokespersonCommand::InputPcm48Khz(_)
-            | SpokespersonCommand::ResetInput { .. }) => {
+            | SpokespersonCommand::ResetInput { .. }
+            | SpokespersonCommand::BeginInputCutover { .. }
+            | SpokespersonCommand::AbortInputCutover) => {
                 self.audio.try_send(command).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => "Spokesperson input queue is full".into(),
                     mpsc::error::TrySendError::Closed(_) => "Spokesperson runtime is closed".into(),
@@ -1827,6 +1829,54 @@ mod tests {
             .any(|event| matches!(event, SpokespersonEvent::InputCutoverFinished { .. })));
         runtime.finish().unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn input_replayed_after_an_aborted_cutover_follows_its_clear() {
+        const ROUNDS: usize = 20;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(stream, require_test_authorization)
+                .await
+                .unwrap();
+            let update = receive_json(&mut socket).await;
+            acknowledge_initial_session(&mut socket, &update, "test-model").await;
+            let mut kinds = Vec::new();
+            for _ in 0..2 * ROUNDS {
+                kinds.push(receive_json(&mut socket).await["type"].clone());
+            }
+            for _ in 0..ROUNDS {
+                send_json(&mut socket, json!({"type":"input_audio_buffer.cleared"})).await;
+            }
+            let _ = socket.next().await;
+            kinds
+        });
+        let (runtime, events) =
+            OpenAiSpokespersonRuntime::spawn(test_config(endpoint, "old-voice", 1.0, Vec::new()))
+                .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SpokespersonEvent::Ready
+        ));
+        for request_id in 0..ROUNDS as u64 {
+            runtime
+                .send(SpokespersonCommand::BeginInputCutover { request_id })
+                .unwrap();
+            runtime.abort_input_cutover().unwrap();
+            runtime
+                .send(SpokespersonCommand::InputPcm48Khz(vec![0.5; 960]))
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        runtime.finish().unwrap();
+        let kinds = server.await.unwrap();
+        assert!(kinds.chunks(2).all(|round| round
+            == [
+                json!("input_audio_buffer.clear"),
+                json!("input_audio_buffer.append")
+            ]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
