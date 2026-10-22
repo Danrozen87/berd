@@ -458,3 +458,7 @@ as the session; reports record only which source supplied them and never include
 the key or endpoint value.
 
 Auto is the default input-during-speech preference. It mutes microphone input during playback on detected speakers and permits interruption on other routes. It follows the default output route during a call (within about 100 ms). Explicit allow/suppress overrides Auto. The preference is saved across calls and restarts. Speaker detection is best-effort; use suppress for an unrecognized external speaker.
+
+### Input activity in stdout streams
+
+`start --stream` (including `--stream live`) emits ephemeral `0\tinput_activity\t{"speaking":true,"recognizing":false}` rows when input speech or recognition state changes. Both booleans are snapshots; show activity while either is true. These rows have cursor zero, are not utterances, and must never advance a speech cursor, trigger an agent turn, or enter transcript history. They are not delivered to Codex tasks. Clear client activity on session restart, stream end, or failure. Older CLIs omit these rows.

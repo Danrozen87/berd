@@ -197,6 +197,13 @@ impl Transcript {
     }
 }
 
+fn input_activity_line(speaking: bool, recognizing: bool) -> String {
+    format!(
+        "0\tinput_activity\t{}",
+        json!({"speaking": speaking, "recognizing": recognizing})
+    )
+}
+
 fn print_flushed(line: &str) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{line}")
@@ -1470,8 +1477,18 @@ impl SessionActor {
 
     fn handle_event(&mut self, event: SessionMessage) -> Result<(), String> {
         match event {
-            SessionMessage::InputSpeaking { active } => self.input_speaking = active,
-            SessionMessage::RecognitionPending { active } => self.recognition_pending = active,
+            SessionMessage::InputSpeaking { active } => {
+                if self.input_speaking != active {
+                    self.input_speaking = active;
+                    self.stream_input_activity()?;
+                }
+            }
+            SessionMessage::RecognitionPending { active } => {
+                if self.recognition_pending != active {
+                    self.recognition_pending = active;
+                    self.stream_input_activity()?;
+                }
+            }
             SessionMessage::State {
                 id,
                 confirmed_token,
@@ -1569,6 +1586,7 @@ impl SessionActor {
             SessionMessage::InputMuteApplied { id, active } => {
                 // Commit before acknowledging so a restart cannot read a stale value.
                 self.muted.store(active, Ordering::SeqCst);
+                self.stream_input_activity()?;
                 if let Some(response) = self.pending_settings.remove(&id) {
                     let _ = response.send(Ok(json!({"muted":active})));
                 }
@@ -1696,6 +1714,23 @@ impl SessionActor {
                 }
             }
         }
+    }
+
+    /// Ephemeral UI state never enters the transcript or wakes a Codex task.
+    fn stream_input_activity(&self) -> Result<(), String> {
+        if matches!(&*self.transcript, Transcript::Stdout { .. }) {
+            print_flushed(&input_activity_line(
+                self.input_speaking && !self.muted.load(Ordering::SeqCst),
+                self.recognition_pending && !self.muted.load(Ordering::SeqCst),
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn reset_input_activity(&mut self) -> Result<(), String> {
+        self.input_speaking = false;
+        self.recognition_pending = false;
+        self.stream_input_activity()
     }
 
     fn stream_live_event(
@@ -2204,7 +2239,7 @@ impl DefaultInputCapture {
             .map_err(Clone::clone);
         let writer = &self.writer;
         let failures = &self.failures;
-        if self
+        let change = self
             .recovery
             .reconcile(now, key, failed, InputCapture::stop, || {
                 // The previous stream and its forwarder have stopped before this reset.
@@ -2218,9 +2253,9 @@ impl DefaultInputCapture {
                     self.muted.clone(),
                     self.mute_epoch.clone(),
                 )
-            })?
-        {
-            actor.input_speaking = false;
+            })?;
+        if change.invalidated || change.opened {
+            actor.reset_input_activity()?;
         }
         Ok(())
     }
@@ -4382,6 +4417,145 @@ mod tests {
             Arc::new(Transcript::Stdout { live: false }),
             false,
         )
+    }
+
+    #[test]
+    fn input_activity_is_cursorless_and_preserves_both_states() {
+        for speaking in [false, true] {
+            for recognizing in [false, true] {
+                let line = input_activity_line(speaking, recognizing);
+                let fields: Vec<_> = line.split('\t').collect();
+                assert_eq!(fields[..2], ["0", "input_activity"]);
+                let state: Value = serde_json::from_str(fields[2]).unwrap();
+                assert_eq!(
+                    state,
+                    json!({"speaking": speaking, "recognizing": recognizing})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_activity_stream_covers_transitions_mute_and_recovery() {
+        const CHILD: &str = "BERD_CALL_TEST_ACTIVITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host_session::tests::input_activity_stream_covers_transitions_mute_and_recovery", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let rows: Vec<Value> = stdout
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("0\tinput_activity\t")
+                        .map(|text| serde_json::from_str(text).unwrap())
+                })
+                .collect();
+            let expected: Vec<_> = [
+                (true, false),
+                (true, true),
+                (false, true),
+                (false, false),
+                (false, false),
+                (false, false),
+                (false, true),
+                (true, true),
+                (false, false),
+                (true, false),
+                (true, true),
+                (false, false),
+                (true, false),
+                (true, true),
+                (false, false),
+            ]
+            .into_iter()
+            .map(|(speaking, recognizing)| json!({"speaking":speaking, "recognizing":recognizing}))
+            .collect();
+            assert_eq!(rows, expected, "{stdout}");
+            return;
+        }
+        for stream in [true, false] {
+            let mut child = Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+            let (_event_tx, events) = mpsc::sync_channel(1);
+            let (_command_tx, commands) = mpsc::sync_channel(1);
+            let (audio, _audio_rx) = mpsc::sync_channel(1);
+            let mut actor = test_actor(writer, events, commands, audio);
+            if !stream {
+                actor.transcript = Arc::new(Transcript::Silent);
+            }
+            actor.muted.store(false, Ordering::SeqCst);
+            let next_id = actor.next_id;
+            for event in [
+                SessionMessage::InputSpeaking { active: true },
+                SessionMessage::RecognitionPending { active: true },
+                SessionMessage::InputSpeaking { active: false },
+                SessionMessage::InputMuteApplied {
+                    id: 0,
+                    active: true,
+                },
+                SessionMessage::InputSpeaking { active: true },
+                SessionMessage::InputSpeaking { active: false },
+                SessionMessage::InputMuteApplied {
+                    id: 0,
+                    active: false,
+                },
+                SessionMessage::InputSpeaking { active: true },
+            ] {
+                actor.handle_event(event).unwrap();
+            }
+            actor.reset_input_activity().unwrap();
+            actor
+                .handle_event(SessionMessage::InputSpeaking { active: false })
+                .unwrap();
+            for device_missing in [true, false] {
+                actor
+                    .handle_event(SessionMessage::InputSpeaking { active: true })
+                    .unwrap();
+                actor
+                    .handle_event(SessionMessage::RecognitionPending { active: true })
+                    .unwrap();
+                let mut recovery =
+                    crate::microphone_recovery::MicrophoneRecovery::new("input".into(), ());
+                let change = recovery
+                    .reconcile(
+                        Instant::now(),
+                        if device_missing {
+                            Err("unavailable".into())
+                        } else {
+                            Ok("input".into())
+                        },
+                        true,
+                        |_| Ok(()),
+                        || Err("replacement open failed".into()),
+                    )
+                    .unwrap();
+                assert!(change.invalidated);
+                assert!(!change.opened);
+                if change.invalidated || change.opened {
+                    actor.reset_input_activity().unwrap();
+                }
+                assert!(
+                    !actor.input_speaking && !actor.recognition_pending,
+                    "invalidated capture must clear activity before recovery retries"
+                );
+                assert!(recovery.capture().is_none());
+            }
+            assert_eq!(actor.next_id, next_id);
+            assert!(actor.transcribed.is_empty());
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 
     #[test]
