@@ -63,6 +63,7 @@ use berd_call::{
 };
 use serde::Serialize;
 
+mod capture;
 mod cli_help;
 #[cfg(target_os = "macos")]
 mod codex;
@@ -211,6 +212,8 @@ struct SessionConfig {
     /// The Spokesperson's session options beyond its voice and speed.
     spokesperson_options:
         Option<berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions>,
+    /// Where to record this session for speech-detection replay.
+    capture: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -644,7 +647,24 @@ fn main() {
             let config = parse_or_exit(parse_args(&args), &args);
             let pcm_output_fd = parse_or_exit(parse_pcm_output_fd(&args), &args);
             let result = match config.mode {
-                SessionMode::Conventional => run_session(config, pcm_output_fd),
+                SessionMode::Conventional => config
+                    .capture
+                    .as_deref()
+                    .map(|root| capture::Capture::start(root, capture_session(&config, &args)))
+                    .transpose()
+                    .and_then(|capture| {
+                        if let Some(capture) = &capture {
+                            eprintln!(
+                                "berd-call: capturing this call in {}",
+                                capture.dir().display()
+                            );
+                        }
+                        let result = run_session(config, pcm_output_fd, capture.clone());
+                        if let Some(capture) = &capture {
+                            capture.finish();
+                        }
+                        result
+                    }),
                 SessionMode::ExpertSpokesperson => {
                     run_expert_spokesperson_session(config, pcm_output_fd)
                 }
@@ -2181,7 +2201,39 @@ fn expert_session_status_cues_suppressed(
     turn_gate.lifecycle.user_speaking() || assistant_output_active
 }
 
-fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String> {
+/// What a capture's manifest records about the session.
+fn capture_session(config: &SessionConfig, args: &[String]) -> serde_json::Value {
+    let (stt_backend, continuous_recognition) = match config.stt {
+        SttBackendConfig::Macos => ("macos", true),
+        SttBackendConfig::Parakeet { .. } => ("parakeet", false),
+        SttBackendConfig::OpenAi => ("openai", false),
+    };
+    let tts_backend = match config.tts {
+        TtsBackendConfig::OpenAi { .. } => "openai",
+        TtsBackendConfig::Siri { .. } => "siri",
+        TtsBackendConfig::Pocket { .. } => "pocket",
+    };
+    #[cfg(target_os = "macos")]
+    let devices = serde_json::json!({
+        "default_input": berd_call::macos_audio_route::default_input_device_name(),
+        "default_output": berd_call::macos_audio_route::default_output_device_name(),
+    });
+    #[cfg(not(target_os = "macos"))]
+    let devices = serde_json::Value::Null;
+    serde_json::json!({
+        "arguments": &args[2..],
+        "stt_backend": stt_backend,
+        "continuous_recognition": continuous_recognition,
+        "tts_backend": tts_backend,
+        "devices": devices,
+    })
+}
+
+fn run_session(
+    config: SessionConfig,
+    pcm_output_fd: RawFd,
+    capture: Option<capture::Capture>,
+) -> Result<(), String> {
     let (control_tx, control_rx) = mpsc::channel();
     let (pcm_tx, pcm_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
     let mut voice_builds = VoiceBuilds {
@@ -2199,12 +2251,14 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
             &mut io::stderr(),
         )
     });
-    let audio_transport = Arc::new(unsafe { AudioPipeTransport::from_raw_fd(pcm_output_fd)? });
+    let audio_transport = Arc::new(
+        unsafe { AudioPipeTransport::from_raw_fd(pcm_output_fd)? }.with_capture(capture.clone()),
+    );
     let (playback_tx, playback_rx) = mpsc::channel();
     let (audio_control_tx, audio_control_rx) = mpsc::channel();
     let (tts_configuration_tx, tts_configuration_rx) = mpsc::channel::<TtsConfigurationEvent>();
     let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    let mut writer = capture::Tee::new(BufWriter::new(stdout.lock()), capture.clone());
     let mut core = SessionCore::default();
     let mut initialized = false;
     let mut tts_slot: Option<Arc<ConfiguredTtsSlot>> = None;
@@ -2309,6 +2363,13 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
         ) else {
             continue;
         };
+        if let Some(capture) = &capture {
+            match &input {
+                Input::Pcm(frame) => capture.mic(frame),
+                Input::Request(request) => capture.received(request),
+                _ => {}
+            }
+        }
         input_progress
             .processed
             .store(processed_pcm, Ordering::Relaxed);
@@ -6285,6 +6346,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut spokesperson_voice = None;
     let mut spokesperson_rate = None;
     let mut spokesperson_options = None;
+    let mut capture = None;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -6349,6 +6411,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions::from_call_json(value)?,
                 )
             }
+            "--capture" => capture = Some(PathBuf::from(value)),
             "--pcm-output-fd" => {}
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
@@ -6382,6 +6445,9 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     {
         return Err("--tts-url and --stt-url apply only to conventional mode; Expert-Spokesperson uses --realtime-url".into());
     }
+    if capture.is_some() && mode != SessionMode::Conventional {
+        return Err("--capture applies only to conventional mode".into());
+    }
     if endpoints.tts.is_some() && !matches!(tts, TtsBackendConfig::OpenAi { .. }) {
         return Err("--tts-url requires --tts-backend openai".into());
     }
@@ -6398,6 +6464,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         spokesperson_voice,
         spokesperson_rate,
         spokesperson_options,
+        capture,
     })
 }
 
@@ -11174,6 +11241,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
 
@@ -11189,6 +11257,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
     }
@@ -11270,6 +11339,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -11330,6 +11400,7 @@ mod tests {
             spokesperson_voice: None,
             spokesperson_rate: None,
             spokesperson_options: None,
+            capture: None,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -11616,6 +11687,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -11682,6 +11754,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
         assert!(parse_args(&args(&[
@@ -12131,6 +12204,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 spokesperson_options: None,
+                capture: None,
             }
         );
     }
@@ -13815,5 +13889,42 @@ mod speech_hint_tests {
         assert!(parse_args(&args(&[&"a".repeat(257)])).is_err());
         let many = (0..101).map(|i| format!("agent{i}")).collect::<Vec<_>>();
         assert!(parse_args(&args(&many.iter().map(String::as_str).collect::<Vec<_>>())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod capture_argument_tests {
+    use super::*;
+
+    #[test]
+    fn capture_records_only_conventional_sessions() {
+        let args = |extra: &[&str]| {
+            [
+                "berd-call",
+                "session",
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parse_args(&args(&["--capture", "/tmp/captures"]))
+                .unwrap()
+                .capture,
+            Some(PathBuf::from("/tmp/captures"))
+        );
+        assert_eq!(parse_args(&args(&[])).unwrap().capture, None);
+        assert!(parse_args(&args(&[
+            "--mode",
+            "expert-spokesperson",
+            "--capture",
+            "/tmp/captures"
+        ]))
+        .is_err());
     }
 }

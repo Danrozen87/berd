@@ -42,6 +42,10 @@ initialization finish before `ready`. STT must report readiness within 60
 seconds; otherwise the child emits a sanitized fatal event and performs bounded
 runtime cleanup before exiting.
 
+`--capture DIR` records a conventional session into a new directory under
+`DIR`, as the README's capture section describes. It changes nothing on the
+wire; Expert-Spokesperson sessions reject it.
+
 Siri startup preflight validates the exact case-sensitive installed name,
 normalized BCP-47 language, and a responsive sirittsd availability query. It
 does not guarantee that a later synthesis request cannot fail; those failures

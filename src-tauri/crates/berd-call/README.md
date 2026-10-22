@@ -63,6 +63,15 @@ berd-call stop
 
 Apple speech recognition accepts repeated `--stt-hint PHRASE` options on `start` or `session`. Pass agent names or domain terms to bias its vocabulary without restricting normal transcription, for example `berd-call start --stt-hint Nora --stt-hint Zack`. Up to 100 nonempty phrases of 256 bytes each are accepted. Hints apply to macOS speech recognition and survive recognition restarts within the call; other speech backends ignore them.
 
+`--capture DIR` on `start` or `session` records a conventional call for offline speech-detection replay. Each call gets a new `DIR/<UTC start>/` holding `manifest.json`, `mic.wav`, `events.jsonl` and `agent-<speech id>.sent.wav`:
+
+- `mic.wav` is every 48 kHz microphone frame the session received, as 16-bit mono, before muting. Frame `n` starts at sample `n × 960`.
+- `events.jsonl` has one JSON object per line, each with `us` (microseconds since capture start, on one monotonic clock) and `frame` (microphone frames received before it). `type` is `in` or `out` for a protocol message received or sent, with the message verbatim in `message`; `agent` for each Begin, chunk, End or Cancel record sent on the audio pipe; `clock` once a second of microphone audio; `gap` when frames paused for over 100 ms (`input_paused`) or the capture fell behind (`capture_dropped`); and `limit` when audio stopped at the storage limit.
+- `agent-<speech id>.sent.wav` is the audio sent to the host for that speech. The host's playback acknowledgements in `events.jsonl` estimate when it was heard; they don't measure the output device.
+- `manifest.json` records the schema, berd-call version, wall-clock start, speech backends, whether recognition is continuous (Apple) or segmented, default audio devices, and session arguments.
+
+All captures in `DIR` together stay under 10 GB: the oldest are deleted first, and a capture that alone reaches the limit stops recording audio. Captures stay on this Mac. Saved settings never keep `--capture`, so `status` shows it among the session arguments only for a call started with it.
+
 `speak --voice` speaks one reply in another voice of the call's reply backend
 without changing the call's voice, so agents sharing a call can sound distinct.
 

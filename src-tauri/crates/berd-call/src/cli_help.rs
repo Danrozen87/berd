@@ -153,11 +153,17 @@ Each form also accepts:
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--spokesperson-options JSON]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
+    [--capture DIR]
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
 contracts. Endpoint URL flags override only the matching service for this call
 and default to OpenAI when no environment override is set.
+
+--capture records a conventional session into a new directory under DIR for
+speech-detection replay: microphone audio, every protocol message, and the audio
+sent for each reply. It keeps all captures in DIR under 10 GB, deleting the
+oldest first. Saved settings don't keep it, so pass it on each start.
 
 In expert-spokesperson mode, the Expert speaks through the Spokesperson.
 --allow-direct-agent-speech also lets it speak to the user itself, through the
