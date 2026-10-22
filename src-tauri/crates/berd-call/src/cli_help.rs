@@ -22,6 +22,7 @@ Speech and models:
   models                  Inspect or install speech models
 
 Diagnostics:
+  vad-replay              Compare offline continuous-recognition VAD fixtures
   benchmark tts           Benchmark a TTS backend
   benchmark stt           Benchmark an STT backend
 
@@ -275,6 +276,7 @@ fn help_for(topic: &[&str]) -> Option<&'static str> {
         | ["models", "openai", "voices"]
         | ["models", "pocket", "status" | "install" | "voices"]
         | ["models", "parakeet", "status" | "install"] => Some(MODELS_HELP),
+        ["vad-replay"] => Some("Usage: berd-call vad-replay INPUT.json [--candidates CANDIDATES.json]\n\nReplays continuous-recognition VAD fixtures without changing live profiles.\nWrites one JSON report per recorded/candidate profile. See VAD_REPLAY.md for the fixture schema and scoring limits."),
         ["benchmark"] => Some(BENCHMARK_HELP),
         ["benchmark", "tts"] => Some(BENCHMARK_TTS_HELP),
         ["benchmark", "stt"] => Some(BENCHMARK_STT_HELP),

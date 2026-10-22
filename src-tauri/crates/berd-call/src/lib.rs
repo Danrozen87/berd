@@ -42,6 +42,7 @@ mod synthesis;
 mod tts;
 #[cfg(target_os = "macos")]
 pub mod update_guard;
+pub mod vad_replay;
 
 pub use audio_output::{wait_until_drained, PcmAudioOutput};
 pub use configured_tts::{

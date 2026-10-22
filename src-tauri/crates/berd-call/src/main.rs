@@ -82,6 +82,7 @@ mod session_audio;
 mod session_framing;
 #[cfg(target_os = "macos")]
 mod system_input_mute;
+mod vad_replay_cli;
 
 use session_audio::{
     AudioHostAck, AudioOutputControlRequest, AudioPipeTransport, RemotePcmAudioOutput,
@@ -550,6 +551,13 @@ fn main() {
         None => {}
     }
     match args.get(1).map(String::as_str) {
+        Some("vad-replay") => {
+            if let Err(error) = vad_replay_cli::run(&args[2..]) {
+                eprintln!("berd-call vad-replay: {error}");
+                std::process::exit(2);
+            }
+        }
+
         #[cfg(target_os = "macos")]
         Some("detection-profile") => {
             let result = (|| -> Result<serde_json::Value, String> {
