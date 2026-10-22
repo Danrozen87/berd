@@ -213,6 +213,7 @@ struct SessionConfig {
     spokesperson_rate: Option<f32>,
     interruption_threshold: f32,
     listening_threshold: f32,
+    pending_utterance_timeout_ms: u32,
     dynamic_listening: bool,
     dynamic_interruption: bool,
     /// The Spokesperson's session options beyond its voice and speed.
@@ -2578,6 +2579,7 @@ fn run_session(
                     &config.stt_hints,
                     berd_call::detection::DetectionSettings {
                         timing: Default::default(),
+                        pending_utterance_timeout_ms: config.pending_utterance_timeout_ms,
                         listening: berd_call::detection::Threshold {
                             value: config.listening_threshold,
                             dynamic: config.dynamic_listening,
@@ -6509,6 +6511,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut spokesperson_rate = None;
     let mut interruption_threshold = 0.65;
     let mut listening_threshold = 0.5;
+    let mut pending_utterance_timeout_ms = 5000;
     let mut dynamic_listening = false;
     let mut dynamic_interruption = false;
     let mut spokesperson_options = None;
@@ -6528,6 +6531,12 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
             .get(index + 1)
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag {
+            "--pending-utterance-timeout-ms" => {
+                pending_utterance_timeout_ms = value.parse::<u32>().map_err(|_| format!("{flag} must be an integer"))?;
+                if !(250..=30000).contains(&pending_utterance_timeout_ms) {
+                    return Err(format!("{flag} must be 250 to 30000 ms").into());
+                }
+            }
             "--interruption-threshold" | "--listening-threshold" => {
                 let threshold = value
                     .parse::<f32>()
@@ -6654,6 +6663,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         spokesperson_rate,
         interruption_threshold,
         listening_threshold,
+        pending_utterance_timeout_ms,
         dynamic_listening,
         dynamic_interruption,
         spokesperson_options,
@@ -9057,6 +9067,30 @@ mod tests {
         assert!(parse_args(&args).unwrap().dynamic_interruption);
         args.extend(["--dynamic-listening".into(), "maybe".into()]);
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn pending_speech_hold_timeout_is_bounded_and_defaults_to_five_seconds() {
+        let base = ["berd-call", "session", "--tts-backend", "openai"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(
+            parse_args(&base).unwrap().pending_utterance_timeout_ms,
+            5000
+        );
+        for value in ["250", "750", "30000"] {
+            let mut args = base.clone();
+            args.extend(["--pending-utterance-timeout-ms".into(), value.into()]);
+            assert_eq!(
+                parse_args(&args).unwrap().pending_utterance_timeout_ms,
+                value.parse::<u32>().unwrap()
+            );
+        }
+        for value in ["0", "249", "30001", "-1", "500.5", "no"] {
+            let mut args = base.clone();
+            args.extend(["--pending-utterance-timeout-ms".into(), value.into()]);
+            assert!(parse_args(&args).is_err());
+        }
     }
 
     #[test]
@@ -11535,6 +11569,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,
@@ -11555,6 +11590,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,
@@ -11641,6 +11677,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,
@@ -11706,6 +11743,7 @@ mod tests {
             spokesperson_rate: None,
             interruption_threshold: 0.65,
             listening_threshold: 0.5,
+            pending_utterance_timeout_ms: 5000,
             dynamic_listening: false,
             dynamic_interruption: false,
             spokesperson_options: None,
@@ -11997,6 +12035,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,
@@ -12068,6 +12107,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,
@@ -12522,6 +12562,7 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
                 spokesperson_options: None,

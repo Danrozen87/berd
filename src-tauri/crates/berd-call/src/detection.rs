@@ -17,6 +17,13 @@ pub struct DetectionSettings {
     pub interruption: Threshold,
     #[serde(default)]
     pub timing: VadTiming,
+    /// Maximum idle speech hold while recognition remains pending.
+    #[serde(default = "default_pending_utterance_timeout_ms")]
+    pub pending_utterance_timeout_ms: u32,
+}
+
+pub const fn default_pending_utterance_timeout_ms() -> u32 {
+    5000
 }
 
 /// Apple recognition keeps receiving audio while these local activity gates settle.
@@ -65,7 +72,8 @@ impl SpeechGate {
 pub fn is_detection_flag(flag: &str) -> bool {
     matches!(
         flag,
-        "--listening-threshold"
+        "--pending-utterance-timeout-ms"
+            | "--listening-threshold"
             | "--interruption-threshold"
             | "--dynamic-listening"
             | "--dynamic-interruption"
@@ -103,6 +111,7 @@ impl Default for DetectionSettings {
     fn default() -> Self {
         Self {
             timing: VadTiming::default(),
+            pending_utterance_timeout_ms: default_pending_utterance_timeout_ms(),
             listening: Threshold {
                 value: 0.5,
                 dynamic: false,
@@ -121,6 +130,9 @@ impl DetectionSettings {
             || !(16..=3000).contains(&self.timing.release_ms)
         {
             return Err("VAD onset must be 16 to 1000 ms and release 16 to 3000 ms".into());
+        }
+        if !(250..=30000).contains(&self.pending_utterance_timeout_ms) {
+            return Err("pending utterance speech-hold timeout must be 250 to 30000 ms".into());
         }
         for threshold in [self.listening, self.interruption] {
             if !threshold.value.is_finite() || !(0.0..=1.0).contains(&threshold.value) {
@@ -267,6 +279,28 @@ mod tests {
             serde_json::from_str(r#"{"listening":{"value":0.5},"interruption":{"value":0.65}}"#)
                 .unwrap();
         assert_eq!(settings.timing, VadTiming::default());
+        assert_eq!(settings.pending_utterance_timeout_ms, 5000);
+        for value in [0, 249, 30001, u32::MAX] {
+            assert!(DetectionSettings {
+                pending_utterance_timeout_ms: value,
+                ..settings
+            }
+            .validate()
+            .is_err());
+        }
+        for value in [250, 750, 30000] {
+            let custom = DetectionSettings {
+                pending_utterance_timeout_ms: value,
+                ..settings
+            }
+            .validate()
+            .unwrap();
+            assert_eq!(
+                serde_json::from_value::<DetectionSettings>(serde_json::to_value(custom).unwrap())
+                    .unwrap(),
+                custom
+            );
+        }
         for timing in [
             VadTiming {
                 onset_ms: 0,
@@ -284,6 +318,7 @@ mod tests {
     fn tuner() -> DetectionTuner {
         DetectionTuner::new(DetectionSettings {
             timing: VadTiming::default(),
+            pending_utterance_timeout_ms: 5000,
             listening: Threshold {
                 value: 0.5,
                 dynamic: true,

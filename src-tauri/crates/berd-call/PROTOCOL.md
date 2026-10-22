@@ -62,12 +62,12 @@ initial policy; a host-specific `auto` mode must be resolved before the request.
 {"type":"hello","id":1,"input_during_tts":"allow_barge_in","status_sound_output_device":"MacBook Pro Speakers"}
 ```
 
-The response uses `protocol:7` as the exact session message-set version. The
+The response uses `protocol:8` as the exact session message-set version. The
 parent must reject a version it does not support; the JSON version is independent
 of the fixed binary framing marker described below:
 
 ```json
-{"type":"ready","id":1,"protocol":7,"session":{"tts":{"revision":1,"backend":"siri","voice":"Aaron","language":"en-US","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}
+{"type":"ready","id":1,"protocol":8,"session":{"tts":{"revision":1,"backend":"siri","voice":"Aaron","language":"en-US","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}
 ```
 
 The `session.tts` object is the authoritative, sanitized TTS configuration.
@@ -410,3 +410,7 @@ Conventional session readiness includes an optional `session.detection` snapshot
 A host sends `{"type":"set_detection_settings","id":42,"settings":{"listening":{"value":0.7,"dynamic":true},"interruption":{"value":0.8,"dynamic":false}}}` to replace both settings atomically and discard stale input/learning evidence. The session returns `detection_settings_result` with that ID and an applied `snapshot`, or `snapshot:null` and a `message` explaining rejection. Invalid settings leave the current values unchanged. Dynamic choices require macOS STT.
 
 During adaptive tuning, the session sends `detection_settings_result` with `id:null` and the new snapshot. Hosts must handle these unsolicited updates, report applied values, and keep profile persistence associated with their actual input/output device pair. Protocol 7 adds `settings.timing` (`onset_ms`, `release_ms`) for Apple local VAD. Older profiles omit this field and receive defaults of 16 ms onset and 300 ms release. Final transcripts are emitted immediately, independently of the local activity gate.
+
+Protocol 8 adds `settings.pending_utterance_timeout_ms`, an integer from 250 to 30000 (default 5000 when absent from older profiles). It limits the idle agent speech admission hold after local speech ends. Changing settings affects newly armed deadlines. Expiry emits `recognition_pending.active:false` without cancelling recognition, clearing audio, or changing recognizer generation. Valid late final text is still forwarded. New VAD speech reasserts the hold, cancels the idle deadline, and the next speech end arms a fresh deadline.
+
+`recognition_pending.active` reports this admission hold, not unresolved native recognition. Native finals have no utterance identity: expired credits are consumed before newer blocking credits and do not tune newer detector evidence. If an old recognition never produces a final, a newer final may consume its expired credit and leave the newer hold until timeout. Credit accounting caps at 1024; saturation latches ambiguous attribution until an explicit recognizer reset. In that state finals continue forwarding but cannot resolve newer holds or tune evidence.

@@ -150,6 +150,7 @@ Usage:
 
 Each form also accepts:
     [--rate FLOAT] [--listening-threshold 0..1] [--interruption-threshold 0..1]
+    [--pending-utterance-timeout-ms 250..30000]
     [--dynamic-listening true|false] [--dynamic-interruption true|false]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
@@ -160,6 +161,8 @@ Each form also accepts:
 
 --listening-threshold sets local speech detection before agent playback (default 0.5).
 --interruption-threshold sets local speech detection during agent playback (default 0.65).
+--pending-utterance-timeout-ms bounds the idle agent speech hold (default 5000 ms).
+Expiry keeps macOS recognition running and accepts late transcripts.
 Higher values require stronger evidence of speech before pausing playback.
 Dynamic adjustment is experimental, off by default, and requires macOS STT.
 Each enabled threshold learns independently, moving by 0.01 within 0.10..0.95.
