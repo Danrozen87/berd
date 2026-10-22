@@ -2,9 +2,11 @@
 //!
 //! A capture directory holds `manifest.json`, `mic.wav` (every microphone frame the
 //! session received, contiguous), `events.jsonl` (every protocol line in either
-//! direction, with gaps and clock records) and `agent-<speech id>.sent.wav` for the
+//! direction, with gaps, clock and recognizer records), `vad.jsonl` (every speech
+//! detector frame and the settings it used) and `agent-<speech id>.sent.wav` for the
 //! audio the session sent the host. Every record carries `us`, microseconds since
-//! capture start, and `frame`, the number of microphone frames received so far.
+//! capture start, nondecreasing in each file; events also carry `frame`, the number of
+//! microphone frames written before them.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -16,7 +18,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use berd_call::input::{VoiceInputFrame, INPUT_FRAME_SAMPLES};
+use berd_call::detection::DetectionSettings;
+use berd_call::input::{DetectionTrace, TracedFrame, VoiceInputFrame, INPUT_FRAME_SAMPLES};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -41,17 +44,38 @@ enum Record {
     },
     Line {
         us: u64,
-        frame: u64,
         kind: &'static str,
         json: String,
     },
     Agent {
         us: u64,
-        frame: u64,
         kind: u8,
         payload: Vec<u8>,
     },
+    Event {
+        us: u64,
+        kind: &'static str,
+        detail: Value,
+    },
+    /// A JSON object, serialized where its single-precision values were exact.
+    Detection {
+        us: u64,
+        json: String,
+    },
     Finish(SyncSender<()>),
+}
+
+impl Record {
+    fn us(&mut self) -> Option<&mut u64> {
+        match self {
+            Self::Mic { us, .. }
+            | Self::Line { us, .. }
+            | Self::Agent { us, .. }
+            | Self::Event { us, .. }
+            | Self::Detection { us, .. } => Some(us),
+            Self::Finish(_) => None,
+        }
+    }
 }
 
 /// Records a session into a new directory; clones share it.
@@ -106,6 +130,7 @@ impl Capture {
                 "frame_samples": INPUT_FRAME_SAMPLES,
                 "source": "every frame the voice session received from the host, including frames it then ignored while muted; gap records mark pauses in what the host sent and frames the capture lost",
             },
+            "vad": "vad.jsonl has one row per 16 ms speech detector frame on macOS recognition; mic_sample is the mic.wav sample just past the frame's audio, us is when it was computed, and settings records precede the rows that use them",
             "agent": "agent-<speech id>.sent.wav is the audio the session sent the host; acknowledgements in events.jsonl are host-reported playback positions, estimates rather than measurements of audible output",
             "session": session,
         });
@@ -159,7 +184,6 @@ impl Capture {
     pub fn agent(&self, kind: u8, payload: &[u8]) {
         self.send(Record::Agent {
             us: self.us(),
-            frame: self.frames(),
             kind,
             payload: payload.to_vec(),
         });
@@ -176,7 +200,6 @@ impl Capture {
     fn line(&self, kind: &'static str, json: String) {
         self.send(Record::Line {
             us: self.us(),
-            frame: self.frames(),
             kind,
             json,
         });
@@ -192,8 +215,45 @@ impl Capture {
         u64::try_from(self.0.start.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
-    fn frames(&self) -> u64 {
+    fn detection(&self, record: &impl Serialize) {
+        if let Ok(json) = serde_json::to_string(record) {
+            self.send(Record::Detection {
+                us: self.us(),
+                json,
+            });
+        }
+    }
+}
+
+impl DetectionTrace for Capture {
+    fn received_frames(&self) -> u64 {
         self.0.frames.load(Ordering::Relaxed)
+    }
+
+    fn settings(&self, revision: u64, settings: DetectionSettings) {
+        #[derive(Serialize)]
+        struct Settings {
+            r#type: &'static str,
+            revision: u64,
+            settings: DetectionSettings,
+        }
+        self.detection(&Settings {
+            r#type: "settings",
+            revision,
+            settings,
+        });
+    }
+
+    fn frame(&self, frame: TracedFrame) {
+        self.detection(&frame);
+    }
+
+    fn recognizer(&self, generation: u64, reason: &'static str) {
+        self.send(Record::Event {
+            us: self.us(),
+            kind: "recognizer",
+            detail: json!({"generation": generation, "reason": reason}),
+        });
     }
 }
 
@@ -245,6 +305,10 @@ struct Writer {
     limit: u64,
     bytes: u64,
     events: BufWriter<File>,
+    vad: BufWriter<File>,
+    /// The latest `us` written; producers on several threads may enqueue slightly
+    /// out of order, so later records never go back in time.
+    last_us: u64,
     mic: Option<Wav>,
     mic_frames: u64,
     last_mic_us: Option<u64>,
@@ -269,6 +333,8 @@ impl Writer {
             limit,
             bytes: 0,
             events: BufWriter::new(File::create(dir.join("events.jsonl"))?),
+            vad: BufWriter::new(File::create(dir.join("vad.jsonl"))?),
+            last_us: 0,
             mic: Some(wav(&dir.join("mic.wav"), MIC_SAMPLE_RATE)?),
             mic_frames: 0,
             last_mic_us: None,
@@ -298,17 +364,21 @@ impl Writer {
         let _ = self.close();
     }
 
-    fn write(&mut self, record: Record) -> Fallible<()> {
+    fn write(&mut self, mut record: Record) -> Fallible<()> {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
-            let (us, frame) = (self.last_mic_us.unwrap_or_default(), self.mic_frames);
             self.event(
-                us,
-                frame,
+                self.last_us,
+                self.mic_frames,
                 "gap",
                 json!({"reason": "capture_dropped", "records": dropped}),
             )?;
         }
+        if let Some(us) = record.us() {
+            *us = (*us).max(self.last_us);
+            self.last_us = *us;
+        }
+        let frame = self.mic_frames;
         match record {
             Record::Mic { us, frame, samples } => {
                 if self
@@ -344,24 +414,24 @@ impl Writer {
                 }
                 Ok(())
             }
-            Record::Line {
-                us,
-                frame,
-                kind,
-                json,
-            } => {
+            Record::Line { us, kind, json } => {
                 let line = format!(
                     "{{\"us\":{us},\"frame\":{frame},\"type\":\"{kind}\",\"message\":{json}}}\n"
                 );
                 self.bytes += line.len() as u64;
                 Ok(self.events.write_all(line.as_bytes())?)
             }
-            Record::Agent {
-                us,
-                frame,
-                kind,
-                payload,
-            } => self.agent(us, frame, kind, &payload),
+            Record::Agent { us, kind, payload } => self.agent(us, frame, kind, &payload),
+            Record::Event { us, kind, detail } => self.event(us, frame, kind, detail),
+            Record::Detection { us, json } => {
+                if self.mic.is_none() {
+                    return Ok(());
+                }
+                let fields = json.strip_prefix('{').unwrap_or_default();
+                let line = format!("{{\"us\":{us},{fields}\n");
+                self.bytes += line.len() as u64;
+                Ok(self.vad.write_all(line.as_bytes())?)
+            }
             Record::Finish(_) => unreachable!("finish is handled by run"),
         }
     }
@@ -421,14 +491,10 @@ impl Writer {
     }
 
     fn event(&mut self, us: u64, frame: u64, kind: &str, detail: Value) -> Fallible<()> {
-        let mut record = json!({"us": us, "frame": frame, "type": kind});
-        if let Value::Object(fields) = detail {
-            record
-                .as_object_mut()
-                .expect("record is an object")
-                .extend(fields);
-        }
-        let line = format!("{record}\n");
+        let line = format!(
+            "{}\n",
+            stamped(json!({"us": us, "frame": frame, "type": kind}), detail)
+        );
         self.bytes += line.len() as u64;
         Ok(self.events.write_all(line.as_bytes())?)
     }
@@ -441,6 +507,7 @@ impl Writer {
             wav.flush()?;
         }
         self.events.flush()?;
+        self.vad.flush()?;
         self.prune()
     }
 
@@ -454,7 +521,7 @@ impl Writer {
                     for (_, wav) in self.agents.drain() {
                         wav.finalize()?;
                     }
-                    let (us, frame) = (self.last_mic_us.unwrap_or_default(), self.mic_frames);
+                    let (us, frame) = (self.last_us, self.mic_frames);
                     self.event(us, frame, "limit", json!({"limit_bytes": self.limit}))?;
                 }
                 return Ok(());
@@ -472,8 +539,17 @@ impl Writer {
         for (_, wav) in self.agents.drain() {
             wav.finalize()?;
         }
+        self.vad.flush()?;
         Ok(self.events.flush()?)
     }
+}
+
+/// `head` followed by the fields of `detail`, when it is an object.
+fn stamped(mut head: Value, detail: Value) -> Value {
+    if let (Some(record), Value::Object(fields)) = (head.as_object_mut(), detail) {
+        record.extend(fields);
+    }
+    head
 }
 
 fn wav(path: &Path, sample_rate: u32) -> Fallible<Wav> {
@@ -640,6 +716,114 @@ mod tests {
         assert!(events
             .windows(2)
             .all(|pair| pair[0]["us"].as_u64() <= pair[1]["us"].as_u64()));
+    }
+
+    fn lines(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn records_detector_frames_settings_and_recognizer_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = Capture::start(root.path(), Value::Null).unwrap();
+        capture.mic(&frame(0.0));
+        capture.recognizer(1, "start");
+        capture.settings(0, DetectionSettings::default());
+        capture.frame(TracedFrame {
+            mic_sample: 768,
+            vad_frame: 0,
+            epoch: 0,
+            generation: 1,
+            mode: berd_call::vad_replay::Mode::Listening,
+            probability: 0.75,
+            threshold: 0.5,
+            detected: true,
+            active: true,
+            settings_revision: 0,
+        });
+        capture.finish();
+
+        let mut vad = lines(&capture.dir().join("vad.jsonl"));
+        for row in &mut vad {
+            assert!(row.as_object_mut().unwrap().remove("us").unwrap().is_u64());
+        }
+        assert_eq!(
+            vad,
+            [
+                json!({"type": "settings", "revision": 0, "settings": {"listening": {"value": 0.5, "dynamic": false}, "interruption": {"value": 0.65, "dynamic": false}, "timing": {"onset_ms": 16, "release_ms": 300}}}),
+                json!({"mic_sample": 768, "vad_frame": 0, "epoch": 0, "generation": 1, "mode": "listening", "probability": 0.75, "threshold": 0.5, "detected": true, "active": true, "settings_revision": 0}),
+            ]
+        );
+        let events = events(capture.dir());
+        assert_eq!(
+            (
+                &events[0]["type"],
+                &events[0]["frame"],
+                &events[0]["generation"],
+                &events[0]["reason"]
+            ),
+            (&json!("recognizer"), &json!(1), &json!(1), &json!("start"))
+        );
+    }
+
+    #[test]
+    fn keeps_times_nondecreasing_when_records_arrive_out_of_order_or_are_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("capture");
+        fs::create_dir(&dir).unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut writer = Writer::new(root.path(), &dir, LIMIT_BYTES, Arc::clone(&dropped)).unwrap();
+        let silence = || Box::new([0.0; INPUT_FRAME_SAMPLES]);
+        let line = |us, kind| Record::Line {
+            us,
+            kind,
+            json: "{}".into(),
+        };
+        writer
+            .write(Record::Mic {
+                us: 100,
+                frame: 0,
+                samples: silence(),
+            })
+            .unwrap();
+        writer.write(line(500, "in")).unwrap();
+        writer.write(line(300, "out")).unwrap();
+        dropped.store(2, Ordering::Relaxed);
+        writer
+            .write(Record::Mic {
+                us: 200,
+                frame: 1,
+                samples: silence(),
+            })
+            .unwrap();
+        writer
+            .write(Record::Detection {
+                us: 250,
+                json: r#"{"vad_frame":0}"#.into(),
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let times = |records: Vec<Value>| -> Vec<(String, u64)> {
+            records
+                .iter()
+                .map(|record| {
+                    (
+                        record["type"].as_str().unwrap_or("row").to_owned(),
+                        record["us"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            times(events(&dir)),
+            [("in".into(), 500), ("out".into(), 500), ("gap".into(), 500)]
+        );
+        assert_eq!(times(lines(&dir.join("vad.jsonl"))), [("row".into(), 500)]);
     }
 
     #[test]
