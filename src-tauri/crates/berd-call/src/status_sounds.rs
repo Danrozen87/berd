@@ -99,6 +99,7 @@ impl StatusSoundStateMachine {
 pub struct StatusSoundRuntime {
     machine: StatusSoundStateMachine,
     next_tick: Option<Instant>,
+    pending_status_cue: bool,
     player: StatusSoundPlayer,
     output_device: Option<String>,
     input_controls: Option<crate::input::VoiceInputControls>,
@@ -109,6 +110,7 @@ impl Default for StatusSoundRuntime {
         Self {
             machine: StatusSoundStateMachine::default(),
             next_tick: None,
+            pending_status_cue: false,
             player: StatusSoundPlayer::new(),
             output_device: None,
             input_controls: None,
@@ -129,6 +131,10 @@ impl StatusSoundRuntime {
     }
 
     pub fn update(&mut self, status: ConversationStatus, settings: StatusSoundSettings) {
+        self.pending_status_cue |= self
+            .machine
+            .current
+            .is_some_and(|(previous, _)| previous != status);
         let changed = self.machine.update(status, settings);
         if changed {
             self.player.stop();
@@ -141,8 +147,9 @@ impl StatusSoundRuntime {
     }
 
     fn update_conversation_activity(&mut self, conversation_active: bool) {
-        if conversation_active {
-            self.stop();
+        if !conversation_active && self.pending_status_cue {
+            self.next_tick = Some(Instant::now());
+            self.pending_status_cue = false;
         }
     }
 
@@ -747,6 +754,23 @@ mod tests {
     }
 
     #[test]
+    fn status_change_during_speech_is_announced_when_speech_finishes() {
+        for (before, after) in [
+            (ConversationStatus::Working, ConversationStatus::Waiting),
+            (ConversationStatus::Waiting, ConversationStatus::Working),
+        ] {
+            let mut runtime = StatusSoundRuntime::default();
+            let settings = settings(StatusSoundMode::WorkingAndWaiting);
+            runtime.update(before, settings);
+            runtime.poll(true).unwrap();
+            runtime.update(after, settings);
+            runtime.poll(true).unwrap();
+            runtime.update_conversation_activity(false);
+            assert!(runtime.next_tick.unwrap() <= Instant::now());
+        }
+    }
+
+    #[test]
     fn cues_due_during_speech_are_skipped_without_catching_up() {
         let mut runtime = StatusSoundRuntime::default();
         runtime.update(
@@ -779,6 +803,37 @@ mod tests {
         runtime.set_conversation_active(false).unwrap();
         assert!(!runtime.inner.activity.lock().unwrap().is_active());
         runtime.finish().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn speech_does_not_cancel_a_sample_already_playing() {
+        struct PendingOutput;
+        impl crate::PcmAudioOutput for PendingOutput {
+            fn write(&self, _: &[f32]) -> Result<(), String> {
+                Ok(())
+            }
+            fn cancel(&self) {}
+            fn is_drained(&self) -> bool {
+                false
+            }
+            fn check_health(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn played_frames(&self) -> u64 {
+                0
+            }
+        }
+        let mut runtime = StatusSoundRuntime::default();
+        runtime.player.active = Some(ActiveStatusSound {
+            player: Box::new(PendingOutput),
+            drain_deadline: Instant::now() + Duration::from_secs(10),
+            output_tail_deadline: None,
+            _input_activity: None,
+        });
+        assert!(runtime.poll(true).unwrap());
+        assert!(runtime.player.active.is_some());
+        runtime.stop();
     }
 
     #[cfg(target_os = "macos")]
