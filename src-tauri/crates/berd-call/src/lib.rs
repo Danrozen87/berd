@@ -79,4 +79,5 @@ pub use tts::{
 
 pub mod capture_replay;
 pub mod failure_fixtures;
+pub mod learning_corpus;
 pub mod learning_evaluation;

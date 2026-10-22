@@ -68,9 +68,26 @@ A finding without such a start in its context window is excluded rather than cut
 
 **Output.** Each `OUT_DIR/<session_id>/` directory contains:
 
-- `fixture.json`: provenance (including `held_out`) and findings.
+- `fixture.json`: provenance (including `held_out` and `audio_setup`) and findings. `audio_setup` holds the default input and output device UIDs read when the session started, with `basis: "session_start"`. It is null when the session could not read both UIDs, including older captures that recorded only device names.
 - `input.json`: a replay input on the clip's own timeline, for the replay command above.
 - `mic.wav`: begins at `provenance.source_sample_offset`, which is a multiple of 48 samples, so clip milliseconds are source milliseconds minus `offset / 48`.
 - `vad.jsonl` and `events.jsonl`: verbatim source lines, still on the source sample and processing clocks. `vad.jsonl` is preceded by the settings records it references.
 
 Extraction refuses to overwrite an existing fixture directory, checking every destination before it writes any. It prints a summary including every exclusion and its reason.
+
+## Loading fixtures for evaluation
+
+`learning_corpus::load` reads fixture directories into one corpus per input and output device UID pair. Each corpus holds index-aligned `inputs`, `source_sessions` and `starts` for `evaluate_grouped`, sorted by source session and offset, plus each fixture's provenance and findings for audit. Loading checks each fixture's own consistency, not its clip start, which only re-running extraction on the source capture can verify.
+
+A fixture is rejected, with its directory and reason, when:
+
+- its schema, `input.json` or provenance fields are invalid or unknown;
+- its `session_id` or partition disagrees with its provenance, or its source session is not a canonical `capture-<ms>`;
+- its interval is empty or not 48-sample aligned, or its frames, labels or reply waits extend past its audio;
+- its `quiet` start has a probability bound outside 0 to 1 or a zero duration;
+- its `mic.wav` is not mono 48 kHz PCM16, or its decoded samples (not its header length) differ from the provenance interval;
+- its capture recorded no device UIDs, or an empty one.
+
+A source session is rejected entirely when its fixtures overlap (including a recut under another policy), span both partitions, or disagree on audio setup. Fixture files must be regular files. `fixture.json`, `input.json`, the fixture count and the total bytes read are all bounded; exceeding the count or total fails the whole load.
+
+Every corpus is currently diagnostic only, and lists why in `trial_ineligible`. The host can switch detection profiles when devices change during a call, so a setup read at session start does not establish the devices behind each clip. A corpus may authorize a live profile trial only once route continuity or per-clip setup is recorded.
