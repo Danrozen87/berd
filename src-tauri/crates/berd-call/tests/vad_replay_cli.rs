@@ -376,6 +376,40 @@ fn extraction_writes_offset_clips_with_verbatim_slices_and_explicit_partition() 
     assert!(corpus.inputs[0].held_out);
     assert!(!corpus.trial_ineligible.is_empty());
 
+    let baseline = dir.path().join("baseline.json");
+    std::fs::write(&baseline, settings(0.5).to_string()).unwrap();
+    let evaluated = Command::new(env!("CARGO_BIN_EXE_berd-call"))
+        .args(["vad-replay", "evaluate"])
+        .args([&baseline, &clip])
+        .output()
+        .unwrap();
+    assert!(
+        evaluated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&evaluated.stderr)
+    );
+    let evaluation: Value = serde_json::from_slice(&evaluated.stdout).unwrap();
+    assert_eq!(evaluation["schema"], "berd-call-evaluation/1");
+    assert_eq!(evaluation["corpora"][0]["devices"]["input_uid"], "mic-uid");
+    assert_eq!(evaluation["corpora"][0]["trial_eligible"], false);
+    assert!(!evaluation["corpora"][0]["trial_ineligible"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        evaluation["corpora"][0]["evaluation"]["source_sessions"],
+        json!(["capture-42"])
+    );
+    assert_eq!(evaluation["corpora"][0]["evaluation"]["accepted"], false);
+    assert!(evaluation["rejected"].as_array().unwrap().is_empty());
+    let invalid = Command::new(env!("CARGO_BIN_EXE_berd-call"))
+        .args(["vad-replay", "evaluate"])
+        .arg(&baseline)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+
     // Re-extraction never overwrites, and labels must agree with the partition.
     assert!(!extract("held-out").status.success());
     write(

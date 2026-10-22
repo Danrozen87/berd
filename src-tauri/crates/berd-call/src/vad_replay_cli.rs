@@ -19,6 +19,46 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().is_some_and(|value| value == "evaluate") {
+        if args.len() < 3 {
+            return Err("usage: berd-call vad-replay evaluate BASELINE.json FIXTURE_DIR...".into());
+        }
+        let baseline: berd_call::detection::DetectionSettings = read_json(Path::new(&args[1]))?;
+        baseline.validate()?;
+        let dirs: Vec<_> = args[2..].iter().map(std::path::PathBuf::from).collect();
+        let loaded = berd_call::learning_corpus::load(
+            &dirs,
+            &berd_call::learning_corpus::CorpusLimits::default(),
+        )?;
+        let policy = berd_call::learning_evaluation::AcceptancePolicy::default();
+        let evaluations: Vec<_> = loaded.corpora.iter().map(|corpus| {
+            let evaluation = berd_call::learning_evaluation::evaluate_grouped(
+                &corpus.inputs, &corpus.source_sessions, &corpus.starts, baseline, &policy,
+            );
+            match evaluation {
+                Ok(evaluation) => serde_json::json!({
+                    "devices": corpus.devices,
+                    "trial_eligible": evaluation.accepted && corpus.trial_ineligible.is_empty(),
+                    "trial_ineligible": corpus.trial_ineligible,
+                    "fixtures": corpus.fixtures,
+                    "evaluation": evaluation,
+                }),
+                Err(error) => serde_json::json!({"devices": corpus.devices, "trial_eligible": false, "error": error}),
+            }
+        }).collect();
+        let report = serde_json::json!({
+            "schema": "berd-call-evaluation/1",
+            "baseline": baseline,
+            "policy": policy,
+            "corpora": evaluations,
+            "rejected": loaded.rejected,
+        });
+        serde_json::to_writer(std::io::stdout().lock(), &report)
+            .map_err(|error| error.to_string())?;
+        println!();
+        return Ok(());
+    }
+
     if args.first().is_some_and(|value| value == "convert") {
         if args.len() != 2 {
             return Err("usage: berd-call vad-replay convert CAPTURE_DIR".into());

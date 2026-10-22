@@ -91,3 +91,7 @@ A fixture is rejected, with its directory and reason, when:
 A source session is rejected entirely when its fixtures overlap (including a recut under another policy), span both partitions, or disagree on audio setup. Fixture files must be regular files. `fixture.json`, `input.json`, the fixture count and the total bytes read are all bounded; exceeding the count or total fails the whole load.
 
 Every corpus is currently diagnostic only, and lists why in `trial_ineligible`. The host can switch detection profiles when devices change during a call, so a setup read at session start does not establish the devices behind each clip. A corpus may authorize a live profile trial only once route continuity or per-clip setup is recorded.
+
+## Grouped evaluation
+
+Run `berd-call vad-replay evaluate BASELINE.json FIXTURE_DIR...` with a serialized `DetectionSettings` baseline and extracted fixture directories. The command writes one `berd-call-evaluation/1` JSON document containing grouped comparisons, source/start metadata, fixture provenance, rejected fixtures and trial eligibility. It uses the default acceptance policy and changes no saved profiles. A successful command means the report was produced; inspect `trial_eligible` and rejection reasons to determine the outcome. Session-start device identity alone keeps a corpus diagnostic-only even if replay accepts a candidate.
