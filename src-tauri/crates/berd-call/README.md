@@ -84,7 +84,9 @@ its own speech; headphone-like outputs retain barge-in.
 
 `speak` waits for delivery by default. Interrupted results contain
 `spokenThroughUtf8` and `estimatedSpokenText`, a best-effort prefix of the
-submitted text. To return without waiting for delivery, start the call with
+submitted text. Results of admitted speech also contain `heldMs`, how long the
+call held it while you were talking, and `firstAudioMs`, when its first audio
+was played, both in milliseconds from when the call was asked to say it. To return without waiting for delivery, start the call with
 `--stream --non-blocking`, or change the live session using
 `berd-call settings --non-blocking true`. Speak calls inherit this setting;
 they wait for pending speech before attempting admission. The command returns `status: accepted` and a
