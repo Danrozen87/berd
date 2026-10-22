@@ -208,7 +208,7 @@ pub(crate) fn with_spokesperson(arguments: &[String], on: bool, direct: bool) ->
         .filter(|pair| match pair[0].as_str() {
             "--mode" => false,
             "--realtime-url" => on,
-            "--stt-url" => !on,
+            "--stt-url" | "--capture" => !on,
             "--tts-url" => !on || direct,
             // The Spokesperson's speed follows the agents'.
             "--spokesperson-rate" => false,

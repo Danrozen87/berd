@@ -14206,6 +14206,30 @@ mod capture_argument_tests {
     use super::*;
 
     #[test]
+    fn enabling_spokesperson_drops_conventional_capture() {
+        let arguments = [
+            "--voice",
+            "Aaron",
+            "--language",
+            "en-US",
+            "--capture",
+            "/tmp/captures",
+        ]
+        .map(String::from);
+        for direct in [false, true] {
+            let changed = saved_settings::with_spokesperson(&arguments, true, direct);
+            let mut session = vec!["berd-call".into(), "session".into()];
+            session.extend(changed);
+            let config = parse_args(&session).unwrap();
+            assert_eq!(config.mode, SessionMode::ExpertSpokesperson);
+            assert_eq!(config.capture, None);
+        }
+        assert!(saved_settings::with_spokesperson(&arguments, false, false)
+            .iter()
+            .any(|arg| arg == "--capture"));
+    }
+
+    #[test]
     fn capture_records_only_conventional_sessions() {
         let args = |extra: &[&str]| {
             [
