@@ -2233,8 +2233,12 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
         input_progress.enter("voice_events");
         if let Some(events) = input_events.as_mut() {
             while let Ok(event) = events.try_recv() {
-                if let VoiceInputEvent::SpeakingChanged(speaking) = &event {
-                    status_sound_runtime.observe_speaking(*speaking)?;
+                match &event {
+                    VoiceInputEvent::SpeakingChanged(speaking) => {
+                        status_sound_runtime.observe_speaking(*speaking)?
+                    }
+                    VoiceInputEvent::SpeakingReset => status_sound_runtime.reset_speaking()?,
+                    _ => {}
                 }
                 handle_voice_input_event(
                     event,
@@ -4716,7 +4720,7 @@ fn run_expert_spokesperson_session(
             }
             Input::Pcm(frame) => {
                 if spokesperson_pcm_allowed(
-                    input_muted || cue_input_controls.is_muted(),
+                    input_muted || cue_input_controls.is_input_suppressed(),
                     active.is_some(),
                     input_during_tts_slot
                         .as_ref()
@@ -7850,6 +7854,11 @@ fn handle_voice_input_event(
     match event {
         VoiceInputEvent::Ready => {
             return Err("voice input emitted a duplicate readiness event".into())
+        }
+        VoiceInputEvent::SpeakingReset => {
+            core.set_user_speaking(false);
+            write_message(writer, &SessionMessage::InputSpeaking { active: false })?;
+            update_provisional_suspension(core, active)?;
         }
         VoiceInputEvent::SpeakingChanged(speaking) => {
             core.set_user_speaking(speaking);

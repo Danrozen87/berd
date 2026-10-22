@@ -134,6 +134,10 @@ impl StatusSoundRuntime {
         self.input_controls = controls;
     }
 
+    pub fn reset_speaking(&mut self) {
+        self.speaking = None;
+    }
+
     pub fn observe_speaking(&mut self, speaking: bool) -> Result<(), String> {
         let previous = self.speaking.replace(speaking);
         if debug_transition(
@@ -225,6 +229,7 @@ enum StatusSoundCommand {
     InputPolicy(crate::input::InputDuringTtsPolicy),
     InputControls(crate::input::VoiceInputControls),
     Speaking(bool),
+    ResetSpeaking,
     Shutdown,
 }
 
@@ -301,6 +306,10 @@ impl ManagedStatusSoundRuntime {
                             runtime.set_input_controls(Some(controls));
                             None
                         }
+                        Ok(StatusSoundCommand::ResetSpeaking) => {
+                            runtime.reset_speaking();
+                            None
+                        }
                         Ok(StatusSoundCommand::Speaking(speaking)) => {
                             if let Err(message) = runtime.observe_speaking(speaking) {
                                 eprintln!("VAD debug sound failed: {message}");
@@ -346,6 +355,10 @@ impl ManagedStatusSoundRuntime {
         controls: crate::input::VoiceInputControls,
     ) -> Result<(), String> {
         self.send(StatusSoundCommand::InputControls(controls))
+    }
+
+    pub fn reset_speaking(&self) -> Result<(), String> {
+        self.send(StatusSoundCommand::ResetSpeaking)
     }
 
     pub fn observe_speaking(&self, speaking: bool) -> Result<(), String> {
@@ -557,7 +570,7 @@ struct ActiveStatusSound {
     player: Box<dyn crate::PcmAudioOutput>,
     drain_deadline: Instant,
     output_tail_deadline: Option<Instant>,
-    _input_activity: Option<crate::input::AssistantActivityGuard>,
+    _input_activity: Option<crate::input::CueInputActivityGuard>,
 }
 
 #[cfg(target_os = "macos")]
@@ -654,7 +667,7 @@ impl StatusSoundPlayer {
             asset,
             volume,
             input_controls,
-            input_policy,
+            input_policy.resolve(output_device),
         )
     }
 
@@ -672,7 +685,7 @@ impl StatusSoundPlayer {
             .map(|sample| sample * volume)
             .collect::<Vec<_>>();
         let input_activity = input_controls
-            .map(|controls| controls.begin_assistant_activity(0.65, input_policy))
+            .map(|controls| controls.begin_cue_activity(input_policy, None))
             .transpose()?;
         player.write(&samples)?;
         *active = Some(ActiveStatusSound {
@@ -808,11 +821,11 @@ mod tests {
                 );
                 assert_eq!(result.is_err(), fail);
                 assert_eq!(
-                    controls.is_muted(),
+                    controls.is_input_suppressed(),
                     !fail && policy == InputDuringTtsPolicy::SuppressInput
                 );
                 drop(active);
-                assert!(!controls.is_muted());
+                assert!(!controls.is_input_suppressed());
             }
         }
     }
@@ -833,7 +846,7 @@ mod tests {
                     .play_debug(speaking, None, Some(&controls), policy)
                     .unwrap();
                 assert_eq!(
-                    controls.is_muted(),
+                    controls.is_input_suppressed(),
                     policy == InputDuringTtsPolicy::SuppressInput
                 );
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -842,9 +855,29 @@ mod tests {
                     player.reap();
                     thread::sleep(Duration::from_millis(10));
                 }
-                assert!(!controls.is_muted());
+                assert!(!controls.is_input_suppressed());
             }
         }
+    }
+
+    #[test]
+    fn restored_speech_after_reset_is_silent() {
+        let mut runtime = StatusSoundRuntime::default();
+        runtime.update(
+            ConversationStatus::Waiting,
+            StatusSoundSettings {
+                mode: StatusSoundMode::Off,
+                vad_debug_sounds: true,
+                ..Default::default()
+            },
+        );
+        runtime.speaking = Some(true);
+        runtime.reset_speaking();
+        runtime.observe_speaking(false).unwrap();
+        assert!(!runtime.debug_player.is_active());
+        runtime.reset_speaking();
+        runtime.observe_speaking(true).unwrap();
+        assert!(!runtime.debug_player.is_active());
     }
 
     fn settings(mode: StatusSoundMode) -> StatusSoundSettings {
@@ -1161,7 +1194,7 @@ mod tests {
             }
             fn cancel(&self) {
                 assert!(
-                    self.controls.is_muted(),
+                    self.controls.is_input_suppressed(),
                     "cancel before releasing input suppression"
                 );
                 self.cancelled.store(true, Ordering::SeqCst);
@@ -1200,21 +1233,21 @@ mod tests {
                     output_tail_deadline: None,
                     _input_activity: Some(
                         controls
-                            .begin_assistant_activity(
-                                0.65,
+                            .begin_cue_activity(
                                 crate::input::InputDuringTtsPolicy::SuppressInput,
+                                None,
                             )
                             .unwrap(),
                     ),
                 }),
             };
-            assert!(controls.is_muted());
+            assert!(controls.is_input_suppressed());
             player.reap();
             assert_eq!(player.is_active(), !failed && !expired);
-            assert_eq!(controls.is_muted(), !failed && !expired);
+            assert_eq!(controls.is_input_suppressed(), !failed && !expired);
             assert_eq!(cancelled.load(Ordering::SeqCst), failed || expired);
             player.stop();
-            assert!(!controls.is_muted());
+            assert!(!controls.is_input_suppressed());
         }
     }
 
@@ -1238,9 +1271,9 @@ mod tests {
                 .unwrap();
         }
         assert!(player.active.is_some());
-        assert!(controls.is_muted());
+        assert!(controls.is_input_suppressed());
         player.stop();
-        assert!(!controls.is_muted());
+        assert!(!controls.is_input_suppressed());
     }
 
     #[cfg(target_os = "macos")]
@@ -1262,11 +1295,11 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while player.is_active() {
-            assert!(controls.is_muted());
+            assert!(controls.is_input_suppressed());
             assert!(Instant::now() < deadline, "status cue did not drain");
             player.reap();
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!controls.is_muted());
+        assert!(!controls.is_input_suppressed());
     }
 }
