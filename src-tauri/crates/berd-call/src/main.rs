@@ -2226,6 +2226,9 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
         input_progress.enter("voice_events");
         if let Some(events) = input_events.as_mut() {
             while let Ok(event) = events.try_recv() {
+                if let VoiceInputEvent::SpeakingChanged(speaking) = &event {
+                    status_sound_runtime.observe_speaking(*speaking)?;
+                }
                 handle_voice_input_event(
                     event,
                     &mut core,
@@ -2464,11 +2467,14 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     return Ok(());
                 }
                 input_progress.enter("hello_ready");
+                status_sound_runtime.set_input_controls(runtime.controls())?;
                 input_controls = Some(runtime.controls());
                 input_runtime = Some(runtime);
                 input_events = Some(events);
                 initialized = true;
                 status_sound_runtime.set_output_device(status_sound_output_device)?;
+                status_sound_runtime.set_input_policy(input_during_tts)?;
+                status_sound_runtime.observe_speaking(false)?;
                 let input_policy = InputDuringTtsSlot::new(input_during_tts);
                 let session = VoiceSessionSnapshot {
                     tts: slot.snapshot()?,
@@ -2587,6 +2593,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     Ok(snapshot) => (InputDuringTtsOutcome::Applied, snapshot),
                     Err(snapshot) => (InputDuringTtsOutcome::Rejected, snapshot),
                 };
+                status_sound_runtime.set_input_policy(snapshot.policy)?;
                 write_message(
                     &mut writer,
                     &SessionMessage::InputDuringTtsResult {
@@ -3614,7 +3621,11 @@ fn run_expert_spokesperson_session(
     let mut queued_tts_settings = VoiceUpdateQueue::<PendingSpokespersonSettingsUpdate>::default();
     let mut pending_voice_update: Option<VoiceUpdateTransaction> = None;
     input_progress.enter("status_assets");
-    let status_sound_runtime = ManagedStatusSoundRuntime::spawn(None)?;
+    let cue_input_controls = VoiceInputControls::default();
+    let status_sound_runtime = ManagedStatusSoundRuntime::spawn_with_input_controls(
+        None,
+        Some(cue_input_controls.clone()),
+    )?;
 
     loop {
         input_progress.enter("maintenance");
@@ -3842,6 +3853,7 @@ fn run_expert_spokesperson_session(
                         } else {
                             turn_gate.finish_user_speaking();
                         }
+                        status_sound_runtime.observe_speaking(speaking)?;
                         write_message(
                             &mut writer,
                             &SessionMessage::InputSpeaking { active: speaking },
@@ -4697,7 +4709,7 @@ fn run_expert_spokesperson_session(
             }
             Input::Pcm(frame) => {
                 if spokesperson_pcm_allowed(
-                    input_muted,
+                    input_muted || cue_input_controls.is_muted(),
                     active.is_some(),
                     input_during_tts_slot
                         .as_ref()
@@ -4778,6 +4790,8 @@ fn run_expert_spokesperson_session(
                         rate: spokesperson_config.speed(),
                     },
                 };
+                status_sound_runtime.set_input_policy(input_during_tts)?;
+                status_sound_runtime.observe_speaking(false)?;
                 let input_policy = InputDuringTtsSlot::new(input_during_tts);
                 let snapshot = VoiceSessionSnapshot {
                     tts: match &reply_tts {
@@ -5306,6 +5320,13 @@ fn run_expert_spokesperson_session(
                         .as_ref()
                         .expect("hello initialized input policy"),
                     &mut writer,
+                )?;
+                status_sound_runtime.set_input_policy(
+                    input_during_tts_slot
+                        .as_ref()
+                        .expect("initialized input policy")
+                        .snapshot()?
+                        .policy,
                 )?;
             }
             Input::Request(SessionRequest::SetTtsSettings {
