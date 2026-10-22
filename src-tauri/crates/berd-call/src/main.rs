@@ -2265,14 +2265,20 @@ fn capture_session(config: &SessionConfig, args: &[String]) -> serde_json::Value
         "default_input": berd_call::macos_audio_route::default_input_device_name(),
         "default_output": berd_call::macos_audio_route::default_output_device_name(),
     });
+    // The device UIDs whose detection profile the session loads at start.
+    #[cfg(target_os = "macos")]
+    let audio_setup = serde_json::json!(berd_call::macos_audio_route::default_audio_setup());
     #[cfg(not(target_os = "macos"))]
     let devices = serde_json::Value::Null;
+    #[cfg(not(target_os = "macos"))]
+    let audio_setup = serde_json::Value::Null;
     serde_json::json!({
         "arguments": &args[2..],
         "stt_backend": stt_backend,
         "continuous_recognition": continuous_recognition,
         "tts_backend": tts_backend,
         "devices": devices,
+        "audio_setup": audio_setup,
     })
 }
 

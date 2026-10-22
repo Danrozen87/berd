@@ -268,7 +268,7 @@ fn extraction_writes_offset_clips_with_verbatim_slices_and_explicit_partition() 
     let root = dir.path().join("capture");
     std::fs::create_dir(&root).unwrap();
     let write = |name: &str, text: String| std::fs::write(root.join(name), text).unwrap();
-    write("manifest.json", json!({"schema":"berd-call-capture/1","started_unix_ms":42,"mic":{"sample_rate":48000},"session":{"stt_backend":"macos","continuous_recognition":true}}).to_string());
+    write("manifest.json", json!({"schema":"berd-call-capture/1","started_unix_ms":42,"mic":{"sample_rate":48000},"session":{"stt_backend":"macos","continuous_recognition":true,"audio_setup":{"input_uid":"mic-uid","output_uid":"speaker-uid","input_name":"Mic","output_name":"Speaker"}}}).to_string());
     // Quiet, then speech that releases and resumes within a second, then quiet.
     let probabilities: Vec<f64> = [0.0; 300]
         .into_iter()
@@ -358,6 +358,23 @@ fn extraction_writes_offset_clips_with_verbatim_slices_and_explicit_partition() 
     assert_eq!(report["held_out"], true);
     assert_eq!(report["scores"]["gap_ms"], 0);
     assert_eq!(report["decisions"][0]["end_ms"], 16);
+
+    // The written fixture loads back as one diagnostic corpus for its setup.
+    let loaded = berd_call::learning_corpus::load(
+        std::slice::from_ref(&clip),
+        &berd_call::learning_corpus::CorpusLimits::default(),
+    )
+    .unwrap();
+    assert!(loaded.rejected.is_empty(), "{:?}", loaded.rejected);
+    let [corpus] = loaded.corpora.as_slice() else {
+        panic!("{loaded:?}")
+    };
+    assert_eq!(corpus.devices.input_uid, "mic-uid");
+    assert_eq!(corpus.devices.output_uid, "speaker-uid");
+    assert_eq!(corpus.source_sessions, ["capture-42"]);
+    assert_eq!(corpus.inputs[0].session_id, fixture["session_id"]);
+    assert!(corpus.inputs[0].held_out);
+    assert!(!corpus.trial_ineligible.is_empty());
 
     // Re-extraction never overwrites, and labels must agree with the partition.
     assert!(!extract("held-out").status.success());

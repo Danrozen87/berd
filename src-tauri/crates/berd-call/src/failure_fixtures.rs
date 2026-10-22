@@ -3,7 +3,7 @@
 //! and a clip never spans a capture gap or starts from a gate state it cannot reproduce.
 use crate::capture_replay::{convert, Annotations, SampleLabel};
 use crate::vad_replay::ReplayInput;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -37,7 +37,7 @@ impl Default for ExtractPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// The recorded gate released and became active again within fragment_ms.
@@ -53,7 +53,8 @@ pub enum Kind {
     FalseActivity,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     pub kind: Kind,
     pub source_start_sample: u64,
@@ -61,8 +62,8 @@ pub struct Finding {
 }
 
 /// Why a fresh replay gate equals the live gate at the clip's first frame.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Start {
     CaptureStart,
     /// A recognizer generation or mute epoch boundary, given the recorded reset schedule.
@@ -75,11 +76,38 @@ pub enum Start {
     },
 }
 
-#[derive(Debug, Serialize)]
+/// The stable default-device identities that key detection profiles.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioDevices {
+    pub input_uid: String,
+    pub output_uid: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupBasis {
+    /// Read when the session started. Routes can change during a call, so this
+    /// does not establish the devices behind any particular clip.
+    SessionStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioSetup {
+    pub devices: AudioDevices,
+    pub basis: SetupBasis,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// Stable across recuts and later labelling of the same capture.
     pub source_session: String,
     pub held_out: bool,
+    /// Absent when the session could not read both default device UIDs, including
+    /// captures that predate recording them.
+    pub audio_setup: Option<AudioSetup>,
     /// The source mic.wav sample at clip sample 0 and clip time 0; a multiple of 48.
     pub source_sample_offset: u64,
     pub source_sample_end: u64,
@@ -158,6 +186,19 @@ pub fn extract(
             .as_u64()
             .ok_or("capture manifest needs started_unix_ms")?
     );
+    let setup = &manifest["session"]["audio_setup"];
+    let audio_setup = match (setup["input_uid"].as_str(), setup["output_uid"].as_str()) {
+        (Some(input), Some(output)) if !input.is_empty() && !output.is_empty() => {
+            Some(AudioSetup {
+                devices: AudioDevices {
+                    input_uid: input.into(),
+                    output_uid: output.into(),
+                },
+                basis: SetupBasis::SessionStart,
+            })
+        }
+        _ => None,
+    };
     let mut settings = HashMap::new();
     let mut frames = Vec::new();
     for (line, row) in rows.iter().enumerate() {
@@ -479,6 +520,7 @@ pub fn extract(
                 provenance: Provenance {
                     source_session: source.clone(),
                     held_out,
+                    audio_setup: audio_setup.clone(),
                     source_sample_offset: offset,
                     source_sample_end: end,
                     source_start_us: head.us,
