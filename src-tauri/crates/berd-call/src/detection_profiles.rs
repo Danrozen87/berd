@@ -142,13 +142,17 @@ mod tests {
     }
     #[test]
     fn explicit_start_and_restart_flags_override_only_their_profile_choices() {
-        let mut profile = DetectionSettings::default();
-        profile.pending_utterance_timeout_ms = 12345;
+        let mut profile = DetectionSettings {
+            pending_utterance_timeout_ms: 12345,
+            ..Default::default()
+        };
         profile.listening.value = 0.73;
         profile.listening.dynamic = true;
         profile.interruption.value = 0.82;
-        let mut configured = DetectionSettings::default();
-        configured.pending_utterance_timeout_ms = 750;
+        let mut configured = DetectionSettings {
+            pending_utterance_timeout_ms: 750,
+            ..Default::default()
+        };
         configured.listening.value = 0.8;
         configured.interruption.dynamic = true;
         let arguments = [
@@ -204,12 +208,16 @@ mod tests {
         let path = dir.path().join("profiles.json");
         let airpods = setup("airpods-mic", "airpods-output");
         let mixed = setup("mac-mic", "airpods-output");
-        let mut first = DetectionSettings::default();
-        first.pending_utterance_timeout_ms = 12345;
+        let mut first = DetectionSettings {
+            pending_utterance_timeout_ms: 12345,
+            ..Default::default()
+        };
         first.listening.value = 0.71;
         first.listening.dynamic = true;
-        let mut second = DetectionSettings::default();
-        second.pending_utterance_timeout_ms = 750;
+        let mut second = DetectionSettings {
+            pending_utterance_timeout_ms: 750,
+            ..Default::default()
+        };
         second.interruption.value = 0.83;
         save(&path, &airpods, first).unwrap();
         save(&path, &mixed, second).unwrap();
