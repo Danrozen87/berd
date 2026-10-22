@@ -49,7 +49,6 @@ pub(crate) trait HostControl: Send + Sync + 'static {
         mode: Option<berd_call::StatusSoundMode>,
         status: Option<berd_call::ConversationStatus>,
     ) -> Result<Value, String>;
-    fn set_vad_debug_sounds(&self, enabled: bool) -> Result<Value, String>;
     fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String>;
     /// Restarts the call's session with the Spokesperson on or off.
     fn set_spokesperson_mode(&self, on: bool) -> Result<Value, String>;
@@ -159,9 +158,6 @@ pub(crate) enum ControlRequest {
     Muted {
         muted: bool,
     },
-    VadDebugSounds {
-        enabled: bool,
-    },
     StatusSounds {
         mode: Option<berd_call::StatusSoundMode>,
         status: Option<berd_call::ConversationStatus>,
@@ -223,7 +219,6 @@ fn read_timeout(request: &ControlRequest) -> Result<Option<Duration>, String> {
                 | ControlRequest::Rate { .. }
                 | ControlRequest::Voice { .. }
                 | ControlRequest::Spokesperson { .. }
-                | ControlRequest::VadDebugSounds { .. }
                 | ControlRequest::StatusSounds { .. }
                 | ControlRequest::Restart { .. }
                 | ControlRequest::SpokespersonMode { .. }
@@ -300,7 +295,6 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                 ControlRequest::NonBlocking { enabled } => control.set_non_blocking(enabled),
                 ControlRequest::InputDuringTts { policy } => control.set_input_during_tts(policy),
                 ControlRequest::Muted { muted } => control.set_muted(muted),
-                ControlRequest::VadDebugSounds { enabled } => control.set_vad_debug_sounds(enabled),
                 ControlRequest::StatusSounds { mode, status } => {
                     control.set_status_sounds(mode, status)
                 }
@@ -452,9 +446,6 @@ mod tests {
             status: Option<berd_call::ConversationStatus>,
         ) -> Result<Value, String> {
             Ok(json!({"statusSounds": mode, "conversationStatus": status}))
-        }
-        fn set_vad_debug_sounds(&self, enabled: bool) -> Result<Value, String> {
-            Ok(json!({"vadDebugSounds": enabled}))
         }
         fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
             Ok(json!({"sessionArguments": session_arguments}))
