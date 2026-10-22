@@ -78,3 +78,4 @@ pub use tts::{
 };
 
 pub mod capture_replay;
+pub mod failure_fixtures;

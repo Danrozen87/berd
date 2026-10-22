@@ -22,7 +22,7 @@ Pending recognition can hold replies after VAD clears. The Apple worker currentl
 
 ## Captured detector frames
 
-Run `berd-call vad-replay convert CAPTURE_DIR > fixture.json`, then compare `fixture.json` with the usual replay command. Conversion reads `manifest.json`, `vad.jsonl`, `events.jsonl`, `mic.wav` and a companion `labels.json`. It never changes capture files or live profiles. Only macOS continuous recognition is supported. Missing settings, missing detector rows, inconsistent decisions, unsupported backends and explicit capture gaps/pauses/limits fail before emitting a fixture. Captures containing gaps need segmentation support before directory conversion can score them.
+Run `berd-call vad-replay convert CAPTURE_DIR > fixture.json`, then compare `fixture.json` with the usual replay command. Conversion reads `manifest.json`, `vad.jsonl`, `events.jsonl`, `mic.wav` and a companion `labels.json`. It never changes capture files or live profiles. Only macOS continuous recognition is supported. Missing settings, missing detector rows, inconsistent decisions, unsupported backends and explicit capture gaps/pauses/limits fail before emitting a fixture. Use `vad-replay extract` to score captures containing gaps.
 
 Create `labels.json` with an explicit session identity and held-out membership:
 
@@ -37,3 +37,40 @@ Detector `mic_sample` is the end-exclusive source sample index. Conversion floor
 Converted fixtures deliberately contain no `reply_waiting` intervals. Use `vad-replay events` for observed protocol waiting on the processing clock. Its intervals cannot be projected onto source samples without measuring input buffering and worker latency; a zero `silent_reply_held_ms` from a converted fixture therefore does not establish an absence of waiting. Counterfactual recognition-policy trials against original audio remain separate work.
 
 The resampler may produce a leading detector frame whose audio ends before sample 768 (for example, sample 513). Replay retains its full gate observation, but clamps its scored interval to recording time zero. The detector frame includes padding; correctness and coverage totals include only its recorded audio span. Subsequent frames remain 16 ms apart or have explicitly missing coverage.
+
+## Failure fixtures
+
+Run `berd-call vad-replay extract CAPTURE_DIR OUT_DIR --partition train|held-out` to cut a capture into short fixtures around likely detection failures. The partition has no default. When `labels.json` exists, its `held_out` must match it; without one, fixtures carry no labels. Every fixture inherits the partition and a `source_session` of `capture-<manifest started_unix_ms>`, which stays the same across recuts and later labelling. Evaluation must group fixtures by source session, so one capture can never supply both training and held-out evidence.
+
+Findings are hints for review, never labels:
+
+- `fragment`: the recorded gate released and became active again within one second.
+- `interruption`: the gate became active while the agent was speaking.
+- `reply_held`: a `prepare_speak` request waited at least a second. It is located by the capture's frame count when each message was processed, so its audio position is approximate.
+- `missed_speech` and `false_activity`: the recorded gate disagrees with a human-checked label.
+
+Each finding gets up to three seconds of context on each side, and overlapping clips merge. A clip may reach back up to six seconds for a reproducible start, and a `reply_held` clip spans the whole wait.
+
+**Gaps.** Clips never touch a gap or limit record, frames lost from `mic.wav`, missing detector rows, or trace beyond `mic.wav`.
+
+- A pause splits the capture where it occurs, and the detector frame containing it is dropped.
+- Records dropped behind a full capture queue cut everything up to 1025 mic frames (20.5 s) after the marker, because the lost records follow it.
+- Gap and limit intervals are listed as `excluded`. Missing detector rows only split the capture.
+- None of these intervals is ever scored.
+
+**Clip starts.** A clip may start only where a fresh replay gate equals the live one. `provenance.start` records which kind of start was used:
+
+- `capture_start`.
+- `gate_reset`: a recognizer generation or mute epoch boundary. This is exact for any candidate, given the recorded reset schedule.
+- `quiet`: the recorded gate was inactive, and the preceding second of frames was undetected with probability at most 0.1. This is exact only for settings whose listening and interruption thresholds are both at least `max_probability` and whose `release_ms` is at most `ms`.
+
+A finding without such a start in its context window is excluded rather than cut from an unknown state. Speech labels that begin before their clip are dropped from it (and reported), because truncating them would score a false onset. Other labels are clipped with their provenance unchanged. `missed_speech` is reported only where detector frames cover the whole label.
+
+**Output.** Each `OUT_DIR/<session_id>/` directory contains:
+
+- `fixture.json`: provenance (including `held_out`) and findings.
+- `input.json`: a replay input on the clip's own timeline, for the replay command above.
+- `mic.wav`: begins at `provenance.source_sample_offset`, which is a multiple of 48 samples, so clip milliseconds are source milliseconds minus `offset / 48`.
+- `vad.jsonl` and `events.jsonl`: verbatim source lines, still on the source sample and processing clocks. `vad.jsonl` is preceded by the settings records it references.
+
+Extraction refuses to overwrite an existing fixture directory, checking every destination before it writes any. It prints a summary including every exclusion and its reason.
