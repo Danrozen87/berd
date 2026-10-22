@@ -282,7 +282,7 @@ mod tests {
         tuner.snapshot.settings.listening.value = 0.5;
         tuner.reset_evidence();
         for n in 0..6 {
-            let time = now + Duration::from_secs(n);
+            let time = now + Duration::from_secs(1000 + n);
             tuner.observe(DetectionMode::Listening, true, time);
             tuner.no_result(time);
         }
