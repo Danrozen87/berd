@@ -76,3 +76,5 @@ pub use tts::{
     OpenAiTts, PocketTtsBackend, StreamingTextChunk, StreamingTextChunks, StreamingTtsText,
     TtsBackend, TtsOutcome, TtsPcmSpec, TtsSynthesisEvent,
 };
+
+pub mod capture_replay;

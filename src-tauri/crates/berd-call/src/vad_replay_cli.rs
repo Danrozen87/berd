@@ -17,6 +17,41 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().is_some_and(|value| value == "convert") {
+        if args.len() != 2 {
+            return Err("usage: berd-call vad-replay convert CAPTURE_DIR".into());
+        }
+        let root = Path::new(&args[1]);
+        let manifest = read_json(&root.join("manifest.json"))?;
+        let annotations = read_json(&root.join("labels.json"))?;
+        let rows = read_jsonl(&root.join("vad.jsonl"))?;
+        let events = read_jsonl(&root.join("events.jsonl"))?;
+        let input = berd_call::capture_replay::convert(&manifest, &rows, &events, annotations)?;
+        let wav =
+            hound::WavReader::open(root.join("mic.wav")).map_err(|error| error.to_string())?;
+        let spec = wav.spec();
+        if spec.sample_rate != 48000
+            || spec.channels != 1
+            || spec.bits_per_sample != 16
+            || spec.sample_format != hound::SampleFormat::Int
+        {
+            return Err("capture mic.wav must be mono 48 kHz PCM16".into());
+        }
+        let samples = u64::from(wav.duration());
+        if rows
+            .iter()
+            .filter_map(|row| row["mic_sample"].as_u64())
+            .any(|end| end > samples)
+            || input.labels.iter().any(|label| label.end_ms > samples / 48)
+        {
+            return Err("trace or labels extend beyond mic.wav".into());
+        }
+        serde_json::to_writer(std::io::stdout().lock(), &input)
+            .map_err(|error| error.to_string())?;
+        println!();
+        return Ok(());
+    }
+
     if args.first().is_some_and(|value| value == "events") {
         if args.len() != 2 {
             return Err("usage: berd-call vad-replay events CAPTURE_DIR".into());
@@ -83,4 +118,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
         output.write_all(b"\n").map_err(|error| error.to_string())?;
     }
     output.flush().map_err(|error| error.to_string())
+}
+
+fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut bytes = String::new();
+    file.take(MAX_INPUT + 1)
+        .read_to_string(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_INPUT {
+        return Err("capture trace exceeds 128 MiB".into());
+    }
+    bytes
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
