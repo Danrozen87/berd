@@ -228,7 +228,7 @@ _tauri-check-unix:
 _tauri-check-windows:
     just tauri-check-windows
 
-# Run the Rust plugin tests plus the app-crate suites for feature-gated
+# Run the Rust plugin and Berd Call tests plus app-crate suites for feature-gated
 # modules (telemetry consent, skill marketplace) with external sidecars
 # disabled. Gated lanes pass a name filter and their enabling Cargo feature —
 # e.g. `block-telemetry-enforced` swaps in the enforced-consent tests.
@@ -249,9 +249,10 @@ _tauri-test-skill-marketplace:
 [unix]
 _tauri-test-unix:
     # rust-cache can restore Sherpa's generated cache directory without its native libraries.
-    if [ "$(uname -s)" = "Linux" ]; then rm -rf src-tauri/target/sherpa-onnx-prebuilt; fi
+    rm -rf "$(bash ./scripts/resolve-tauri-cargo-target-dir.sh)/sherpa-onnx-prebuilt"
     just _tauri-cargo-unix test -p tauri-plugin-berdctl --features server
     just _tauri-cargo-unix test -p berdctl
+    just _tauri-cargo-unix test -p berd-call --locked
     just _tauri-cargo-unix test --lib services::acp::goose_serve::tests::storage_identity_guard
     just _tauri-cargo-unix test --lib services::goose_config::tests
     just _tauri-cargo-unix test --lib commands::message_search::tests

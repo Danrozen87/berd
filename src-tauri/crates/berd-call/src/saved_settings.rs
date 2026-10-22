@@ -240,6 +240,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_preferences_survive_without_losing_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let settings = SavedSettings {
+            arguments: vec!["--rate".into(), "1.5".into()],
+            tts: Some(TtsSettings::Siri {
+                voice: "Aaron".into(),
+                language: "en-GB".into(),
+                rate: 1.5,
+            }),
+            input_policy: Some(InputDuringTtsPolicy::SuppressInput),
+            status_sounds: Some(StatusSoundMode::WorkingAndWaiting),
+            vad_debug_sounds: true,
+        };
+        let expected = serde_json::to_value(&settings).unwrap();
+        let mut legacy = expected.clone();
+        legacy["vad_debug_sounds"] = serde_json::json!(true);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), expected);
+        save(&path, &restored).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["vad_debug_sounds"], true);
+        assert_eq!(written, expected);
+        assert_eq!(
+            serde_json::to_value(load(&path).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn auto_and_explicit_input_preferences_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
