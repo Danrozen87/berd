@@ -15,7 +15,8 @@ pub enum Mode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frame {
-    /// End of a complete 16 ms detector frame on the recording timeline.
+    /// End of a 16 ms detector frame on the recording timeline.
+    /// The first frame may begin before zero because of resampler padding.
     pub end_ms: u64,
     pub epoch: u64,
     pub confidence: f32,
@@ -137,9 +138,7 @@ impl ReplayInput {
             if !frame.confidence.is_finite() || !(0.0..=1.0).contains(&frame.confidence) {
                 return Err("frame confidence must be finite and between 0 and 1".into());
             }
-            if frame.end_ms < FRAME_MS
-                || previous.is_some_and(|end| frame.end_ms.saturating_sub(end) < FRAME_MS)
-            {
+            if previous.is_some_and(|end| frame.end_ms.saturating_sub(end) < FRAME_MS) {
                 return Err("detector frames must be ordered and nonoverlapping".into());
             }
             previous = Some(frame.end_ms);
@@ -177,7 +176,7 @@ pub fn replay(input: &ReplayInput, candidate: Option<&Candidate>) -> Result<Repo
     let mut waiting_index = 0;
     for frame in &input.frames {
         let settings = candidate.map_or(frame.settings, |value| value.settings);
-        let gap = previous.map_or(frame.end_ms - FRAME_MS, |prior| {
+        let gap = previous.map_or(frame.end_ms.saturating_sub(FRAME_MS), |prior| {
             frame.end_ms - prior.end_ms - FRAME_MS
         });
         if gap > 0 {
@@ -215,7 +214,8 @@ pub fn replay(input: &ReplayInput, candidate: Option<&Candidate>) -> Result<Repo
             uncertain = false;
         }
         let active = gate.observe(detected, settings.timing);
-        let start = frame.end_ms - FRAME_MS;
+        let start = frame.end_ms.saturating_sub(FRAME_MS);
+        let duration = frame.end_ms - start;
         while label_index < input.labels.len() && input.labels[label_index].end_ms <= start {
             label_index += 1;
         }
@@ -225,7 +225,7 @@ pub fn replay(input: &ReplayInput, candidate: Option<&Candidate>) -> Result<Repo
             waiting_index += 1;
         }
         if uncertain {
-            report.scores.uncertain_ms += FRAME_MS;
+            report.scores.uncertain_ms += duration;
         } else {
             let mut labelled_ms = 0;
             for label in input.labels[label_index..]
@@ -256,7 +256,7 @@ pub fn replay(input: &ReplayInput, candidate: Option<&Candidate>) -> Result<Repo
                     }
                 }
             }
-            report.scores.unlabelled_ms += FRAME_MS - labelled_ms;
+            report.scores.unlabelled_ms += duration - labelled_ms;
         }
         report.decisions.push(Decision {
             end_ms: frame.end_ms,
@@ -287,7 +287,7 @@ fn score_utterances(input: &ReplayInput, report: &mut Report) {
         // Full speech annotation must have uninterrupted detector coverage.
         let covered = decisions
             .first()
-            .is_some_and(|value| value.end_ms - FRAME_MS <= label.start_ms)
+            .is_some_and(|value| value.end_ms.saturating_sub(FRAME_MS) <= label.start_ms)
             && decisions
                 .last()
                 .is_some_and(|value| value.end_ms >= label.end_ms)
