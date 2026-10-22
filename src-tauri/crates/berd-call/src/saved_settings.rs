@@ -139,14 +139,16 @@ pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
     arguments
         .chunks_exact(2)
         .filter(|pair| {
-            !matches!(
-                pair[0].as_str(),
-                "--realtime-url"
-                    | "--stt-url"
-                    | "--tts-url"
-                    | "--spokesperson-options"
-                    | "--stt-hint"
-            )
+            !berd_call::detection::is_detection_flag(&pair[0])
+                && !matches!(
+                    pair[0].as_str(),
+                    "--realtime-url"
+                        | "--stt-url"
+                        | "--tts-url"
+                        | "--spokesperson-options"
+                        | "--stt-hint"
+                        | "--capture"
+                )
         })
         .flatten()
         .cloned()
@@ -402,6 +404,15 @@ mod speech_hint_tests {
             "Zack",
         ]
         .map(String::from);
+        assert_eq!(super::persistable_arguments(&args), ["--voice", "Aaron"]);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    #[test]
+    fn capture_is_not_saved_for_other_calls() {
+        let args = ["--voice", "Aaron", "--capture", "/tmp/captures"].map(String::from);
         assert_eq!(super::persistable_arguments(&args), ["--voice", "Aaron"]);
     }
 }

@@ -9,6 +9,10 @@ use crate::{
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionRequest {
+    SetDetectionSettings {
+        id: u64,
+        settings: crate::detection::DetectionSettings,
+    },
     Hello {
         id: u64,
         input_during_tts: InputDuringTtsPolicy,
@@ -173,6 +177,8 @@ pub enum OutputReadyOutcome {
 pub struct VoiceSessionSnapshot {
     /// The voice that speaks replies: the conventional backend, or the
     /// Spokesperson's own voice when it reads them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<crate::detection::DetectionSnapshot>,
     pub tts: TtsConfigurationSnapshot,
     pub input_during_tts: InputDuringTtsSnapshot,
     /// The Spokesperson's voice, when replies have their own.
@@ -213,6 +219,11 @@ pub enum ExpertTurnOutcome {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMessage {
+    DetectionSettingsResult {
+        id: Option<u64>,
+        snapshot: Option<crate::detection::DetectionSnapshot>,
+        message: Option<String>,
+    },
     Ready {
         id: u64,
         protocol: u32,
@@ -384,7 +395,7 @@ mod tests {
 
     #[test]
     fn host_decodes_realtime_ready_snapshot() {
-        let message = r#"{"type":"ready","id":1,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-realtime-2.1","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#;
+        let message = r#"{"type":"ready","id":1,"protocol":7,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-realtime-2.1","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#;
         let decoded = serde_json::from_str::<SessionMessage>(message).unwrap();
         assert!(matches!(decoded, SessionMessage::Ready { id: 1, .. }));
     }
@@ -410,8 +421,9 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionMessage::Ready {
                 id: 4,
-                protocol: 5,
+                protocol: 7,
                 session: VoiceSessionSnapshot {
+                    detection: None,
                     tts: TtsConfigurationSnapshot {
                         revision: 1,
                         settings: TtsSettings::OpenAi {
@@ -435,7 +447,7 @@ mod tests {
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
+            r#"{"type":"ready","id":4,"protocol":7,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(

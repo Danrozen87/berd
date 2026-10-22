@@ -9,6 +9,27 @@ management, synthesis and benchmark tools described below. Desktop Berd keeps
 its persisted settings and user interface. The standalone command includes a
 small macOS host for default-device capture, playback, and transcript delivery.
 
+### Local speech detection
+
+Conventional calls accept independent `--listening-threshold 0..1` (default `0.5`) and `--interruption-threshold 0..1` (default `0.65`) at `start` or `session`. Higher values require stronger evidence of speech. Listening controls detection before agent playback, including the gate that holds replies while input is speaking or awaiting recognition. Interruption controls detection during agent playback. These local thresholds do not change provider endpointing or Spokesperson server VAD.
+
+On macOS, a local speech detection also marks recognition pending. After local speech ends, admission continues waiting for recognition to settle, with a five-second no-result fallback. Raising the listening threshold can reduce false starts in background noise; it does not shorten that fallback or prove a particular microphone's false detections are resolved.
+
+Device profiles retain both values independently; legacy saved call arguments are accepted during migration. To change a running call, supply its complete session configuration, for example `settings --restart --voice Aaron --language en-US --listening-threshold 0.8 --interruption-threshold 0.7`. Restart replaces the session options; include the existing backend, model, rate and other choices you want to retain.
+
+### Experimental dynamic tuning and audio profiles
+
+With macOS speech recognition, `--dynamic-listening true` and `--dynamic-interruption true` independently opt into outcome-based tuning. Both default to false. Each enabled threshold moves one 0.01 tick after each qualifying unmatched outcome, without a cooldown. Dynamic values start and remain within 0.10 to 0.95; manual thresholds still accept 0 to 1.
+
+Apple recognition also supports per-audio-setup `timing` settings through `detection-profile --settings`: `onset_ms` (16 to 1000, default 16) and `release_ms` (16 to 3000, default 300). Timings round up to 16 ms audio frames and apply only to local activity detection. Finalized transcripts are forwarded immediately, independently of release timing. The recognizer continues to receive all microphone audio during onset gating. Other recognition backends retain their existing segmentation timing.
+
+
+A local detection that settles without a nonempty transcript suggests raising sensitivity's threshold. A nonempty transcript after at least five seconds without local detection suggests lowering it. Recognized speech clears false-trigger evidence. Split-result grace periods, mode changes, mute/reset epochs and device changes discard ambiguous evidence. These are experimental heuristics: recognition failure and playback leakage can still mislead them. They do not establish an optimal threshold or replace acoustic echo cancellation.
+
+The standalone macOS host saves applied thresholds and dynamic choices in `detection-profiles.json` beside its saved settings, keyed by the stable input/output device UID pair. It restores the pair on call startup and checks for device changes once per second. Explicit threshold or dynamic flags override the matching profile choice; unspecified choices retain their saved values. Detection flags are removed from inherited session arguments so a later voice-only restart restores learned values. A new pair starts with defaults during a call. Profile files contain settings, not audio recordings or transcript text. An explicit profile edit takes precedence over a late automatic update.
+
+`berd-call detection-profile` reports the default audio setup and saved choices without starting capture. `berd-call detection-profile --settings '{"listening":{"value":0.70,"dynamic":true},"interruption":{"value":0.80,"dynamic":false}}'` saves choices for that pair. During a call, `berd-call status` exposes applied values and evidence counters in `session.detection`, plus `audioSetup`. Saving a profile alone affects its next restoration; the plugin restarts the call session when a user changes a control. Dynamic adjustments apply during the current session.
+
 ## Command-line interface
 
 On macOS, install [Berd](https://github.com/block/berd/releases) first. Its
@@ -62,6 +83,15 @@ berd-call stop
 ```
 
 Apple speech recognition accepts repeated `--stt-hint PHRASE` options on `start` or `session`. Pass agent names or domain terms to bias its vocabulary without restricting normal transcription, for example `berd-call start --stt-hint Nora --stt-hint Zack`. Up to 100 nonempty phrases of 256 bytes each are accepted. Hints apply to macOS speech recognition and survive recognition restarts within the call; other speech backends ignore them.
+
+`--capture DIR` on `start` or `session` records a conventional call for offline speech-detection replay. Each call gets a new `DIR/<UTC start>/` holding `manifest.json`, `mic.wav`, `events.jsonl` and `agent-<speech id>.sent.wav`:
+
+- `mic.wav` is every 48 kHz microphone frame the session received, as 16-bit mono, before muting. Frame `n` starts at sample `n × 960`.
+- `events.jsonl` has one JSON object per line, each with `us` (microseconds since capture start, on one monotonic clock) and `frame` (microphone frames received before it). `type` is `in` or `out` for a protocol message received or sent, with the message verbatim in `message`; `agent` for each Begin, chunk, End or Cancel record sent on the audio pipe; `clock` once a second of microphone audio; `gap` when frames paused for over 100 ms (`input_paused`) or the capture fell behind (`capture_dropped`); and `limit` when audio stopped at the storage limit.
+- `agent-<speech id>.sent.wav` is the audio sent to the host for that speech. The host's playback acknowledgements in `events.jsonl` estimate when it was heard; they don't measure the output device.
+- `manifest.json` records the schema, berd-call version, wall-clock start, speech backends, whether recognition is continuous (Apple) or segmented, default audio devices, and session arguments.
+
+All captures in `DIR` together stay under 10 GB: the oldest are deleted first, and a capture that alone reaches the limit stops recording audio. Captures stay on this Mac. Saved settings never keep `--capture`, so `status` shows it among the session arguments only for a call started with it.
 
 `speak --voice` speaks one reply in another voice of the call's reply backend
 without changing the call's voice, so agents sharing a call can sound distinct.

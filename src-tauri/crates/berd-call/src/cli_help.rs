@@ -22,6 +22,7 @@ Speech and models:
   models                  Inspect or install speech models
 
 Diagnostics:
+  vad-replay              Compare offline continuous-recognition VAD fixtures
   benchmark tts           Benchmark a TTS backend
   benchmark stt           Benchmark an STT backend
 
@@ -147,17 +148,31 @@ Usage:
     --model-dir ABSOLUTE_PATH --voice ID
 
 Each form also accepts:
-    [--rate FLOAT]
+    [--rate FLOAT] [--listening-threshold 0..1] [--interruption-threshold 0..1]
+    [--dynamic-listening true|false] [--dynamic-interruption true|false]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--spokesperson-options JSON]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
+    [--capture DIR]
+
+--listening-threshold sets local speech detection before agent playback (default 0.5).
+--interruption-threshold sets local speech detection during agent playback (default 0.65).
+Higher values require stronger evidence of speech before pausing playback.
+Dynamic adjustment is experimental, off by default, and requires macOS STT.
+Each enabled threshold learns independently, moving by 0.01 within 0.10..0.95.
+Use detection-profile [--settings JSON] to read or save the default audio setup profile.
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
 contracts. Endpoint URL flags override only the matching service for this call
 and default to OpenAI when no environment override is set.
+
+--capture records a conventional session into a new directory under DIR for
+speech-detection replay: microphone audio, every protocol message, and the audio
+sent for each reply. It keeps all captures in DIR under 10 GB, deleting the
+oldest first. Saved settings don't keep it, so pass it on each start.
 
 In expert-spokesperson mode, the Expert speaks through the Spokesperson.
 --allow-direct-agent-speech also lets it speak to the user itself, through the
@@ -267,6 +282,7 @@ fn help_for(topic: &[&str]) -> Option<&'static str> {
         | ["models", "openai", "voices"]
         | ["models", "pocket", "status" | "install" | "voices"]
         | ["models", "parakeet", "status" | "install"] => Some(MODELS_HELP),
+        ["vad-replay"] => Some("Usage: berd-call vad-replay INPUT.json [--candidates CANDIDATES.json]\n       berd-call vad-replay events CAPTURE_DIR\n\nReplays continuous-recognition VAD fixtures without changing live profiles.\nWrites one JSON report per recorded/candidate profile. See VAD_REPLAY.md for the fixture schema and scoring limits."),
         ["benchmark"] => Some(BENCHMARK_HELP),
         ["benchmark", "tts"] => Some(BENCHMARK_TTS_HELP),
         ["benchmark", "stt"] => Some(BENCHMARK_STT_HELP),

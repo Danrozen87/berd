@@ -32,6 +32,10 @@ pub fn default_output_device_name() -> Option<String> {
     get_device_name(get_default_device_id(false)?).ok()
 }
 
+pub fn default_input_device_name() -> Option<String> {
+    get_device_name(get_default_device_id(true)?).ok()
+}
+
 pub fn output_device_is_builtin_speaker(output_device: Option<&str>) -> bool {
     let Some(device_id) = resolve_output_device(output_device) else {
         return false;
@@ -164,4 +168,52 @@ mod tests {
             0
         ));
     }
+}
+
+/// Stable default-device identities used to isolate local speech calibration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AudioSetup {
+    pub input_uid: String,
+    pub output_uid: String,
+    pub input_name: String,
+    pub output_name: String,
+}
+
+pub fn default_audio_setup() -> Option<AudioSetup> {
+    fn uid(device: AudioObjectID) -> Option<String> {
+        use objc2_core_audio::kAudioDevicePropertyDeviceUID;
+        use objc2_core_foundation::{CFRetained, CFString};
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value: *const CFString = null();
+        let mut size = mem::size_of_val(&value) as u32;
+        // SAFETY: CoreAudio writes one retained CFString pointer into a correctly
+        // sized live buffer. CFRetained owns and releases the returned reference.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+                NonNull::from(&mut value).cast(),
+            )
+        };
+        if status != kAudioHardwareNoError {
+            return None;
+        }
+        let pointer = NonNull::new(value.cast_mut())?;
+        Some(unsafe { CFRetained::from_raw(pointer) }.to_string())
+    }
+    let input = get_default_device_id(true)?;
+    let output = get_default_device_id(false)?;
+    Some(AudioSetup {
+        input_uid: uid(input)?,
+        output_uid: uid(output)?,
+        input_name: get_device_name(input).ok()?,
+        output_name: get_device_name(output).ok()?,
+    })
 }
