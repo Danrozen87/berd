@@ -20,6 +20,9 @@ pub fn settings_for_start(
     let mut settings = persisted.unwrap_or(configured);
     for pair in berd_call::detection::detection_arguments(arguments).chunks_exact(2) {
         match pair[0].as_str() {
+            "--pending-utterance-timeout-ms" => {
+                settings.pending_utterance_timeout_ms = configured.pending_utterance_timeout_ms
+            }
             "--listening-threshold" => settings.listening.value = configured.listening.value,
             "--interruption-threshold" => {
                 settings.interruption.value = configured.interruption.value
@@ -140,10 +143,12 @@ mod tests {
     #[test]
     fn explicit_start_and_restart_flags_override_only_their_profile_choices() {
         let mut profile = DetectionSettings::default();
+        profile.pending_utterance_timeout_ms = 12345;
         profile.listening.value = 0.73;
         profile.listening.dynamic = true;
         profile.interruption.value = 0.82;
         let mut configured = DetectionSettings::default();
+        configured.pending_utterance_timeout_ms = 750;
         configured.listening.value = 0.8;
         configured.interruption.dynamic = true;
         let arguments = [
@@ -155,6 +160,15 @@ mod tests {
         ]
         .map(str::to_string);
         let restored = settings_for_start(Some(profile), configured, &arguments).unwrap();
+        assert_eq!(restored.pending_utterance_timeout_ms, 12345);
+        let explicit = ["--pending-utterance-timeout-ms", "750"].map(str::to_string);
+        assert_eq!(
+            settings_for_start(Some(profile), configured, &explicit)
+                .unwrap()
+                .pending_utterance_timeout_ms,
+            750
+        );
+        assert!(berd_call::detection::without_detection_arguments(&explicit).is_empty());
         assert_eq!(restored.listening.value, 0.8);
         assert!(restored.listening.dynamic);
         assert_eq!(restored.interruption.value, 0.82);
@@ -191,9 +205,11 @@ mod tests {
         let airpods = setup("airpods-mic", "airpods-output");
         let mixed = setup("mac-mic", "airpods-output");
         let mut first = DetectionSettings::default();
+        first.pending_utterance_timeout_ms = 12345;
         first.listening.value = 0.71;
         first.listening.dynamic = true;
         let mut second = DetectionSettings::default();
+        second.pending_utterance_timeout_ms = 750;
         second.interruption.value = 0.83;
         save(&path, &airpods, first).unwrap();
         save(&path, &mixed, second).unwrap();

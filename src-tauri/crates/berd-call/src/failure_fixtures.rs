@@ -566,6 +566,7 @@ mod tests {
             dynamic: false,
         };
         DetectionSettings {
+            pending_utterance_timeout_ms: 5000,
             listening: threshold,
             interruption: threshold,
             timing: VadTiming {

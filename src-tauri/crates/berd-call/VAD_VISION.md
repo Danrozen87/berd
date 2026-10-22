@@ -9,3 +9,7 @@ For the initial experimental macOS recognizer, local detections that settle with
 Save independent values and dynamic choices by stable input/output device identity pair. AirPods input/output, another headset, and the built-in input/output pair retain separate profiles. Restoring a profile must discard old learning evidence so one setup cannot train another. No microphone recordings or transcript text are stored in these profiles.
 
 The host owns device identity and persistence. The shared input runtime owns thresholds, and the host-facing session protocol carries updates and reports applied values. Existing settings files remain readable by older binaries. Prefer a separate bounded, atomically replaced profile file to changing their strict schema.
+
+## Speech hold correction, October 22, 2026
+
+Product direction: bound the agent speech hold while transcription is pending, without cancelling recognition when the hold expires. Valid late transcripts remain accepted. New speech reasserts the hold. Keep hold accounting distinct from unresolved recognition and ignore expired or ambiguous outcomes for detector tuning. The configurable idle hold defaults to five seconds, bounded between 250 and 30000 milliseconds. This supersedes using the idle timeout as a no-result/reset signal.

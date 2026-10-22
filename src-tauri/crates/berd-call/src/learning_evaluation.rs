@@ -396,6 +396,16 @@ pub fn evaluate_grouped(
 mod tests {
     use super::*;
     use crate::vad_replay::{Frame, Label};
+    #[test]
+    fn candidates_preserve_speech_hold_timeout() {
+        let settings = DetectionSettings {
+            pending_utterance_timeout_ms: 12345,
+            ..baseline()
+        };
+        for candidate in candidates(settings).unwrap() {
+            assert_eq!(candidate.settings.pending_utterance_timeout_ms, 12345);
+        }
+    }
     fn baseline() -> DetectionSettings {
         let mut settings = DetectionSettings::default();
         settings.listening.value = 0.5;

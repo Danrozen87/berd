@@ -256,6 +256,7 @@ pub enum SessionMessage {
     InputSpeaking {
         active: bool,
     },
+    /// Admission hold only. Recognition can continue after this becomes false.
     RecognitionPending {
         active: bool,
     },
@@ -421,7 +422,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionMessage::Ready {
                 id: 4,
-                protocol: 7,
+                protocol: 8,
                 session: VoiceSessionSnapshot {
                     detection: None,
                     tts: TtsConfigurationSnapshot {
@@ -447,7 +448,7 @@ mod tests {
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":7,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
+            r#"{"type":"ready","id":4,"protocol":8,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(
