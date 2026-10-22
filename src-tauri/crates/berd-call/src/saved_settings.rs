@@ -104,6 +104,7 @@ fn validate_arguments(arguments: &[String]) -> Result<(), String> {
                     | "--stt-model-dir"
                     | "--spokesperson-voice"
                     | "--spokesperson-rate"
+                    | "--interruption-threshold"
             )
         })
     {

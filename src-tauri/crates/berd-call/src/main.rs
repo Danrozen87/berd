@@ -206,6 +206,7 @@ struct SessionConfig {
     /// The Spokesperson's own voice and speed when replies have theirs.
     spokesperson_voice: Option<String>,
     spokesperson_rate: Option<f32>,
+    interruption_threshold: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2518,7 +2519,12 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                         && current.speech_id == speech_id
                         && current.active.is_none()
                 }) {
-                    acknowledge_output_ready(current, input_controls.as_ref(), &mut writer)?;
+                    acknowledge_output_ready(
+                        current,
+                        input_controls.as_ref(),
+                        config.interruption_threshold,
+                        &mut writer,
+                    )?;
                     let playback_active = Arc::new(AtomicBool::new(true));
                     let output = Arc::new(RemotePcmAudioOutput::new(
                         speech_id,
@@ -5959,12 +5965,13 @@ fn expert_spoken_through_utf8(response: &LiveResponse) -> u64 {
 fn acknowledge_output_ready(
     current: &mut ActivePlayback,
     input_controls: Option<&VoiceInputControls>,
+    interruption_threshold: f32,
     writer: &mut impl Write,
 ) -> Result<(), String> {
     current.assistant_activity = input_controls.map(|controls| {
         controls
-            .begin_assistant_activity(0.65, current.input_during_tts.policy)
-            .expect("balanced assistant threshold is valid")
+            .begin_assistant_activity(interruption_threshold, current.input_during_tts.policy)
+            .expect("validated interruption threshold is valid")
     });
     write_message(
         writer,
@@ -6070,6 +6077,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut expert_tts = false;
     let mut spokesperson_voice = None;
     let mut spokesperson_rate = None;
+    let mut interruption_threshold = 0.65;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -6085,6 +6093,16 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
             .get(index + 1)
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag {
+            "--interruption-threshold" => {
+                interruption_threshold = value
+                    .parse::<f32>()
+                    .map_err(|_| "--interruption-threshold must be a number")?;
+                if !interruption_threshold.is_finite()
+                    || !(0.0..=1.0).contains(&interruption_threshold)
+                {
+                    return Err("--interruption-threshold must be between 0 and 1".into());
+                }
+            }
             "--tts-backend" => backend = value,
             "--voice" => voice = Some(value.clone()),
             "--language" => language = Some(value.clone()),
@@ -6177,6 +6195,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         expert_tts,
         spokesperson_voice,
         spokesperson_rate,
+        interruption_threshold,
     })
 }
 
@@ -8488,6 +8507,30 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
+    #[test]
+    fn interruption_threshold_is_bounded_and_defaults_to_balanced() {
+        let base = vec![
+            "berd-call".into(),
+            "session".into(),
+            "--tts-backend".into(),
+            "openai".into(),
+        ];
+        assert_eq!(parse_args(&base).unwrap().interruption_threshold, 0.65);
+        for value in ["0", "0.8", "1"] {
+            let mut args = base.clone();
+            args.extend(["--interruption-threshold".into(), value.into()]);
+            assert_eq!(
+                parse_args(&args).unwrap().interruption_threshold,
+                value.parse::<f32>().unwrap()
+            );
+        }
+        for value in ["-0.1", "1.1", "NaN", "inf", "quiet"] {
+            let mut args = base.clone();
+            args.extend(["--interruption-threshold".into(), value.into()]);
+            assert!(parse_args(&args).is_err(), "{value}");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn update_check_only_targets_the_owning_app_bundle() {
@@ -10772,6 +10815,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
 
@@ -10786,6 +10830,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
     }
@@ -10866,6 +10911,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
         assert!(parse_args(&args(&[
@@ -10925,6 +10971,7 @@ mod tests {
             expert_tts: false,
             spokesperson_voice: None,
             spokesperson_rate: None,
+            interruption_threshold: 0.65,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -11148,6 +11195,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
         assert!(parse_args(&args(&[
@@ -11213,6 +11261,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
         assert!(parse_args(&args(&[
@@ -11661,6 +11710,7 @@ mod tests {
                 expert_tts: false,
                 spokesperson_voice: None,
                 spokesperson_rate: None,
+                interruption_threshold: 0.65,
             }
         );
     }
@@ -12218,7 +12268,7 @@ mod tests {
             bytes: Vec::new(),
         };
 
-        acknowledge_output_ready(&mut current, Some(&controls), &mut writer).unwrap();
+        acknowledge_output_ready(&mut current, Some(&controls), 0.8, &mut writer).unwrap();
 
         assert!(current.assistant_activity.is_some());
         assert_eq!(
@@ -12242,7 +12292,7 @@ mod tests {
         };
         let controls = VoiceInputControls::default();
         let mut ignored = Vec::new();
-        acknowledge_output_ready(&mut current, Some(&controls), &mut ignored).unwrap();
+        acknowledge_output_ready(&mut current, Some(&controls), 0.65, &mut ignored).unwrap();
         assert!(controls.is_muted());
         let speech_id = current.speech_id;
         let mut active = Some(current);

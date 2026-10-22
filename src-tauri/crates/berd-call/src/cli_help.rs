@@ -147,11 +147,14 @@ Usage:
     --model-dir ABSOLUTE_PATH --voice ID
 
 Each form also accepts:
-    [--rate FLOAT]
+    [--rate FLOAT] [--interruption-threshold 0..1]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
+
+--interruption-threshold sets local speech detection during agent playback (default 0.65).
+Higher values require stronger evidence of speech before pausing playback.
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM
