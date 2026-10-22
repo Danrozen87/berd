@@ -278,7 +278,17 @@ impl ManagedStatusSoundRuntime {
         self.send(StatusSoundCommand::Update(status, settings))
     }
 
+    /// Queue activity without waiting for native audio operations. PCM-owning loops
+    /// must use this path so a slow output device cannot stop microphone draining.
+    pub fn queue_conversation_active(&self, active: bool) -> Result<(), String> {
+        self.update_explicit_activity(active, false)
+    }
+
     pub fn set_conversation_active(&self, active: bool) -> Result<(), String> {
+        self.update_explicit_activity(active, true)
+    }
+
+    fn update_explicit_activity(&self, active: bool, wait: bool) -> Result<(), String> {
         let mut activity = self
             .inner
             .activity
@@ -289,7 +299,12 @@ impl ManagedStatusSoundRuntime {
         activity.explicit_active = active;
         let current = activity.is_active();
         if previous != current {
-            if let Err(error) = self.apply_conversation_active(current) {
+            let result = if wait {
+                self.apply_conversation_active(current)
+            } else {
+                self.send_conversation_active(current, None)
+            };
+            if let Err(error) = result {
                 activity.explicit_active = previous_explicit;
                 let _ = self.send_conversation_active(previous, None);
                 return Err(error);
@@ -566,6 +581,38 @@ mod tests {
     fn assert_status(machine: &mut StatusSoundStateMachine, expected: ConversationStatus) {
         let actual = machine.tick(false).map(|cue| cue.status);
         assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn session_activity_does_not_wait_for_a_stalled_audio_worker() {
+        let (commands, receiver) = mpsc::channel();
+        let runtime = ManagedStatusSoundRuntime {
+            inner: Arc::new(StatusSoundWorker {
+                commands,
+                worker: Mutex::new(None),
+                activity: Mutex::new(StatusSoundActivityState::default()),
+            }),
+        };
+        let (done, result) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            let outcome = runtime.queue_conversation_active(true);
+            done.send(outcome).unwrap();
+        });
+        // The audio worker deliberately never services the command.
+        let outcome = result.recv_timeout(Duration::from_millis(100));
+        // Release the old blocking implementation before asserting the result.
+        if let Ok(StatusSoundCommand::ConversationActive {
+            applied: Some(applied),
+            ..
+        }) = receiver.try_recv()
+        {
+            let _ = applied.send(Ok(()));
+        }
+        caller.join().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "microphone processing waited for the audio worker"
+        );
     }
 
     #[test]
