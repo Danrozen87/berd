@@ -375,6 +375,7 @@ beforeEach(() => {
     hasHydratedSessions: false,
     sessionPageCursor: null,
     hasMoreSessions: false,
+    hasReachedSessionListEnd: false,
     isRightRailOpen: false,
     activeWorkspaceBySession: {},
   });

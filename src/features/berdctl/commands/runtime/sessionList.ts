@@ -5,6 +5,7 @@ import {
 } from "@/features/chat/lib/sessionActivity";
 import {
   type ChatSession,
+  type ChatSessionStore,
   useChatSessionStore,
 } from "@/features/chat/stores/chatSessionStore";
 import {
@@ -279,9 +280,7 @@ async function readSessionListPage(
 /**
  * Merge rows into the shared store. The shared pagination cursor advances
  * only when the store was waiting on this exact page, so a scan never
- * rewinds or skips the sidebar's own "load more" position. A store without
- * a cursor (never loaded, failed load, or at the end) takes the first
- * page's cursor, as a sidebar refresh would.
+ * rewinds or skips the sidebar's own "load more" position.
  */
 function mergePageIntoStore(
   page: AcpSessionsPage,
@@ -289,8 +288,7 @@ function mergePageIntoStore(
 ): void {
   useChatSessionStore.setState((state) => {
     const merged = mergeAcpSessionPage(state, page, requestCursor);
-    const isStoreWaitingOnThisPage = state.sessionPageCursor === requestCursor;
-    if (isStoreWaitingOnThisPage) {
+    if (isStoreWaitingOnPage(state, requestCursor)) {
       return { ...merged, hasHydratedSessions: true };
     }
     return {
@@ -299,6 +297,21 @@ function mergePageIntoStore(
       hasHydratedSessions: true,
     };
   });
+}
+
+/** A store without a cursor waits on the first page unless it read the
+ *  list to its end; a failed or never-run sidebar load leaves no cursor too. */
+function isStoreWaitingOnPage(
+  state: Pick<
+    ChatSessionStore,
+    "sessionPageCursor" | "hasReachedSessionListEnd"
+  >,
+  requestCursor: string | null,
+): boolean {
+  if (state.sessionPageCursor !== requestCursor) {
+    return false;
+  }
+  return requestCursor !== null || !state.hasReachedSessionListEnd;
 }
 
 function throwIfPastDeadline(deadlineMs: number | undefined): void {

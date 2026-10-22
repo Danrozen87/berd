@@ -112,6 +112,7 @@ function resetStore(sessions: ChatSession[] = []): void {
     hasHydratedSessions: false,
     sessionPageCursor: null,
     hasMoreSessions: false,
+    hasReachedSessionListEnd: false,
     archiveMutationBySessionId: {},
   });
 }
@@ -535,6 +536,63 @@ describe("shared store pagination", () => {
 
     const state = useChatSessionStore.getState();
     expect(state.sessionPageCursor).toBe("offset-50");
+    expect(state.hasMoreSessions).toBe(true);
+  });
+
+  it("keeps an exhausted sidebar at the end of the list", async () => {
+    pagedBackend();
+    const store = useChatSessionStore.getState();
+    await store.loadSessions();
+    while (useChatSessionStore.getState().hasMoreSessions) {
+      await store.loadMoreSessions();
+    }
+    expect(useChatSessionStore.getState().sessionPageCursor).toBeNull();
+
+    await listIds(unarchived, 1);
+
+    const state = useChatSessionStore.getState();
+    expect(state.sessionPageCursor).toBeNull();
+    expect(state.hasMoreSessions).toBe(false);
+  });
+
+  it("restores pagination after a failed load even when first-page rows are cached", async () => {
+    pagedBackend();
+    // Rows restored or fetched one by one, then a failed sidebar load.
+    useChatSessionStore.setState({
+      sessions: Array.from({ length: 50 }, (_, index) =>
+        cachedSession(`s-${String(index).padStart(3, "0")}`, 1000 - index),
+      ),
+      hasHydratedSessions: true,
+      sessionPageCursor: null,
+      hasMoreSessions: false,
+    });
+
+    await listIds(unarchived, 1);
+
+    const state = useChatSessionStore.getState();
+    expect(state.sessionPageCursor).toBe("offset-50");
+    expect(state.hasMoreSessions).toBe(true);
+  });
+
+  it("restores pagination after the sidebar stopped on a repeated cursor", async () => {
+    servePages(
+      { sessions: [acpSession("a", 9)], nextCursor: "page-2" },
+      { sessions: [acpSession("b", 8)], nextCursor: "page-2" },
+      {
+        sessions: [acpSession("a", 9), acpSession("b", 8)],
+        nextCursor: "page-2",
+      },
+    );
+    const store = useChatSessionStore.getState();
+    await store.loadSessions();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await store.loadMoreSessions();
+    expect(useChatSessionStore.getState().hasMoreSessions).toBe(false);
+
+    await listIds(unarchived, 1);
+
+    const state = useChatSessionStore.getState();
+    expect(state.sessionPageCursor).toBe("page-2");
     expect(state.hasMoreSessions).toBe(true);
   });
 
