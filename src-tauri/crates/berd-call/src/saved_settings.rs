@@ -146,7 +146,11 @@ pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
             !berd_call::detection::is_detection_flag(&pair[0])
                 && !matches!(
                     pair[0].as_str(),
-                    "--realtime-url" | "--stt-url" | "--tts-url" | "--stt-hint"
+                    "--realtime-url"
+                        | "--stt-url"
+                        | "--tts-url"
+                        | "--spokesperson-options"
+                        | "--stt-hint"
                 )
         })
         .flatten()
@@ -266,6 +270,27 @@ mod tests {
                 "0.9"
             ]
         );
+    }
+
+    #[test]
+    fn auto_and_explicit_input_preferences_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for policy in [
+            InputDuringTtsPolicy::Auto,
+            InputDuringTtsPolicy::AllowBargeIn,
+            InputDuringTtsPolicy::SuppressInput,
+        ] {
+            save(
+                &path,
+                &SavedSettings {
+                    input_policy: Some(policy),
+                    ..SavedSettings::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(load(&path).unwrap().input_policy, Some(policy));
+        }
     }
 
     #[test]

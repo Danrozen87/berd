@@ -28,6 +28,10 @@ pub fn playback_latency_safety_duration(output_device: Option<&str>) -> Duration
     )
 }
 
+pub fn default_output_device_name() -> Option<String> {
+    get_device_name(get_default_device_id(false)?).ok()
+}
+
 pub fn output_device_is_builtin_speaker(output_device: Option<&str>) -> bool {
     let Some(device_id) = resolve_output_device(output_device) else {
         return false;

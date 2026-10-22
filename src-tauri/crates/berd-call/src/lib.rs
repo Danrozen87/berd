@@ -35,6 +35,7 @@ pub mod realtime_host_lifecycle;
 pub mod realtime_pipe;
 pub mod session;
 pub mod siri;
+mod spokesperson_loudness;
 pub mod spokesperson_voice_update;
 mod status_sounds;
 mod synthesis;
@@ -61,6 +62,7 @@ pub use pocket::{
 };
 #[cfg(target_os = "macos")]
 pub use siri::SiriTts;
+pub use spokesperson_loudness::SpokespersonLoudness;
 pub use status_sounds::ConversationStatus;
 pub use status_sounds::ManagedStatusSoundRuntime;
 pub use status_sounds::StatusSoundActivityGuard;
