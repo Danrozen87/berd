@@ -19,3 +19,19 @@ Run `berd-call vad-replay events CAPTURE_DIR` to analyze a `berd-call-capture/1`
 Request-wait overlap is observational. It includes preparation and other scheduling, so it is not proof of delay caused solely by VAD or recognition. The event analyzer uses the capture clock; normalized frame fixtures use the audio timeline. Converting the per-frame capture trace into candidate fixtures requires explicit sample/clock and epoch mapping. It must never infer timestamps by concatenating across muted/dropped input.
 
 Pending recognition can hold replies after VAD clears. The Apple worker currently uses VAD end to start a five-second no-result deadline, then cancels and recreates recognition. Gate replay cannot prove transcript preservation under changed reset policies. Those trials require original audio, repeated recognition runs against the current-policy baseline, and omission/duplicate/late-result evaluation.
+
+## Captured detector frames
+
+Run `berd-call vad-replay convert CAPTURE_DIR > fixture.json`, then compare `fixture.json` with the usual replay command. Conversion reads `manifest.json`, `vad.jsonl`, `events.jsonl`, `mic.wav` and a companion `labels.json`. It never changes capture files or live profiles. Only macOS continuous recognition is supported. Missing settings, missing detector rows, inconsistent decisions, unsupported backends and explicit capture gaps/pauses/limits fail before emitting a fixture. Captures containing gaps need segmentation support before directory conversion can score them.
+
+Create `labels.json` with an explicit session identity and held-out membership:
+
+```json
+{"schema_version":1,"session_id":"desk-2026-10-22","held_out":true,"labels":[{"start_sample":0,"end_sample":48000,"speech":true,"provenance":"human_checked"}]}
+```
+
+Label bounds are start-inclusive, end-exclusive indices in the mono 48 kHz `mic.wav`, aligned to whole milliseconds (48 samples). Do not mark inferred labels as human checked. Empty labels are allowed and produce unlabelled coverage rather than correctness scores. The converter checks trace and label bounds against the WAV header. It does not verify every audio sample or establish that the recording contains the original microphone signal.
+
+Detector `mic_sample` is the end-exclusive source sample index. Conversion floors it to milliseconds, losing less than one millisecond of alignment precision. Processing `us` is validated separately and is never substituted for audio time. Effective settings revisions rebuild each frame; changes to either mute epoch or recognizer generation create a replay reset. For known gate states, recorded `active` must agree with the reconstructed baseline. Resampler history crossing resets remains part of the recorded probabilities.
+
+Converted fixtures deliberately contain no `reply_waiting` intervals. Use `vad-replay events` for observed protocol waiting on the processing clock. Its intervals cannot be projected onto source samples without measuring input buffering and worker latency; a zero `silent_reply_held_ms` from a converted fixture therefore does not establish an absence of waiting. Counterfactual recognition-policy trials against original audio remain separate work.

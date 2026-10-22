@@ -282,7 +282,7 @@ fn help_for(topic: &[&str]) -> Option<&'static str> {
         | ["models", "openai", "voices"]
         | ["models", "pocket", "status" | "install" | "voices"]
         | ["models", "parakeet", "status" | "install"] => Some(MODELS_HELP),
-        ["vad-replay"] => Some("Usage: berd-call vad-replay INPUT.json [--candidates CANDIDATES.json]\n       berd-call vad-replay events CAPTURE_DIR\n\nReplays continuous-recognition VAD fixtures without changing live profiles.\nWrites one JSON report per recorded/candidate profile. See VAD_REPLAY.md for the fixture schema and scoring limits."),
+        ["vad-replay"] => Some("Usage: berd-call vad-replay INPUT.json [--candidates CANDIDATES.json]\n       berd-call vad-replay events CAPTURE_DIR\n       berd-call vad-replay convert CAPTURE_DIR\n\nReplays continuous-recognition VAD fixtures without changing live profiles.\nWrites one JSON report per recorded/candidate profile. See VAD_REPLAY.md for the fixture schema and scoring limits."),
         ["benchmark"] => Some(BENCHMARK_HELP),
         ["benchmark", "tts"] => Some(BENCHMARK_TTS_HELP),
         ["benchmark", "stt"] => Some(BENCHMARK_STT_HELP),
