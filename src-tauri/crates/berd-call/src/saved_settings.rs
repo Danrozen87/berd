@@ -143,10 +143,11 @@ pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
     arguments
         .chunks_exact(2)
         .filter(|pair| {
-            !matches!(
-                pair[0].as_str(),
-                "--realtime-url" | "--stt-url" | "--tts-url" | "--stt-hint"
-            )
+            !berd_call::detection::is_detection_flag(&pair[0])
+                && !matches!(
+                    pair[0].as_str(),
+                    "--realtime-url" | "--stt-url" | "--tts-url" | "--stt-hint"
+                )
         })
         .flatten()
         .cloned()

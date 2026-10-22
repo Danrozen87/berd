@@ -12,6 +12,28 @@ struct Profiles {
     profiles: BTreeMap<String, DetectionSettings>,
 }
 
+pub fn settings_for_start(
+    persisted: Option<DetectionSettings>,
+    configured: DetectionSettings,
+    arguments: &[String],
+) -> Result<DetectionSettings, String> {
+    let mut settings = persisted.unwrap_or(configured);
+    for pair in berd_call::detection::detection_arguments(arguments).chunks_exact(2) {
+        match pair[0].as_str() {
+            "--listening-threshold" => settings.listening.value = configured.listening.value,
+            "--interruption-threshold" => {
+                settings.interruption.value = configured.interruption.value
+            }
+            "--dynamic-listening" => settings.listening.dynamic = configured.listening.dynamic,
+            "--dynamic-interruption" => {
+                settings.interruption.dynamic = configured.interruption.dynamic
+            }
+            _ => {}
+        }
+    }
+    settings.validate()
+}
+
 pub fn path() -> Result<PathBuf, String> {
     Ok(crate::saved_settings::path()?.with_file_name("detection-profiles.json"))
 }
@@ -115,6 +137,36 @@ mod tests {
             output_name: "same display name".into(),
         }
     }
+    #[test]
+    fn explicit_start_and_restart_flags_override_only_their_profile_choices() {
+        let mut profile = DetectionSettings::default();
+        profile.listening.value = 0.73;
+        profile.listening.dynamic = true;
+        profile.interruption.value = 0.82;
+        let mut configured = DetectionSettings::default();
+        configured.listening.value = 0.8;
+        configured.interruption.dynamic = true;
+        let arguments = [
+            "session",
+            "--listening-threshold",
+            "0.8",
+            "--dynamic-interruption",
+            "true",
+        ]
+        .map(str::to_string);
+        let restored = settings_for_start(Some(profile), configured, &arguments).unwrap();
+        assert_eq!(restored.listening.value, 0.8);
+        assert!(restored.listening.dynamic);
+        assert_eq!(restored.interruption.value, 0.82);
+        assert!(restored.interruption.dynamic);
+        let inherited = berd_call::detection::without_detection_arguments(&arguments);
+        assert_eq!(inherited, ["session"]);
+        assert_eq!(
+            settings_for_start(Some(profile), configured, &inherited).unwrap(),
+            profile
+        );
+    }
+
     #[test]
     fn late_learning_cannot_overwrite_an_explicit_profile_edit() {
         let dir = tempfile::tempdir().unwrap();

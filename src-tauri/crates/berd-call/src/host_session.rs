@@ -435,7 +435,7 @@ fn start_session(
         .store(muted.load(Ordering::SeqCst), Ordering::SeqCst);
     actor.capture_muted = muted;
     actor.capture_mute_epoch = mute_epoch;
-    actor.restore_detection_profile()?;
+    actor.restore_detection_profile(&arguments)?;
     actor.system_input_mute = system_input_mute;
     if actor.system_input_mute.is_none() {
         match crate::system_input_mute::SystemInputMute::install(
@@ -485,7 +485,7 @@ fn start_session(
             || arguments
                 .iter()
                 .any(|argument| argument == crate::DIRECT_AGENT_SPEECH),
-        session_arguments: arguments,
+        session_arguments: berd_call::detection::without_detection_arguments(&arguments),
     });
     Ok(StartedSession {
         child,
@@ -1190,7 +1190,7 @@ impl SessionActor {
         }
     }
 
-    fn restore_detection_profile(&mut self) -> Result<(), String> {
+    fn restore_detection_profile(&mut self, arguments: &[String]) -> Result<(), String> {
         let detection = self
             .session
             .lock()
@@ -1204,7 +1204,8 @@ impl SessionActor {
         };
         let path = crate::detection_profiles::path()?;
         let persisted = crate::detection_profiles::load(&path, &setup)?;
-        let settings = persisted.unwrap_or(snapshot.settings);
+        let settings =
+            crate::detection_profiles::settings_for_start(persisted, snapshot.settings, arguments)?;
         let id = self.next_id();
         send_request(
             &self.writer,
@@ -1231,6 +1232,19 @@ impl SessionActor {
         let Some(setup) = berd_call::macos_audio_route::default_audio_setup() else {
             return Ok(());
         };
+        self.switch_detection_profile(setup)
+    }
+
+    fn switch_detection_profile(
+        &mut self,
+        setup: berd_call::macos_audio_route::AudioSetup,
+    ) -> Result<(), String> {
+        let Some(profile) = self.detection_profile.as_mut() else {
+            return Ok(());
+        };
+        if profile.pending.is_some() {
+            return Ok(());
+        }
         if setup.input_uid == profile.setup.input_uid
             && setup.output_uid == profile.setup.output_uid
         {
@@ -3914,6 +3928,91 @@ mod tests {
             Arc::new(Transcript::Stdout { live: false }),
             false,
         )
+    }
+
+    #[test]
+    fn device_switch_restores_the_saved_pair_and_ignores_old_learning_before_ack() {
+        let setup = |name: &str| berd_call::macos_audio_route::AudioSetup {
+            input_uid: format!("{name}-mic"),
+            output_uid: format!("{name}-output"),
+            input_name: name.into(),
+            output_name: name.into(),
+        };
+        let first = setup("first");
+        let second = setup("second");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let mut first_settings = berd_call::detection::DetectionSettings::default();
+        first_settings.listening.value = 0.71;
+        let mut second_settings = first_settings;
+        second_settings.interruption.value = 0.84;
+        crate::detection_profiles::save(&path, &first, first_settings).unwrap();
+        crate::detection_profiles::save(&path, &second, second_settings).unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_event_tx, events) = mpsc::sync_channel(1);
+        let (_command_tx, commands) = mpsc::sync_channel(1);
+        let (audio, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio);
+        actor.detection_profile = Some(ActiveDetectionProfile {
+            setup: first.clone(),
+            path,
+            persisted: Some(first_settings),
+            next_check: Instant::now(),
+            pending: None,
+        });
+        actor.switch_detection_profile(second.clone()).unwrap();
+        let id = actor.detection_profile.as_ref().unwrap().pending;
+        actor
+            .handle_event(SessionMessage::DetectionSettingsResult {
+                id: None,
+                snapshot: Some(
+                    berd_call::detection::DetectionTuner::new(first_settings).snapshot(),
+                ),
+                message: None,
+            })
+            .unwrap();
+        assert!(actor.session.lock().unwrap().detection.is_none());
+        actor
+            .handle_event(SessionMessage::DetectionSettingsResult {
+                id,
+                snapshot: Some(
+                    berd_call::detection::DetectionTuner::new(second_settings).snapshot(),
+                ),
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(
+            actor.session.lock().unwrap().detection.unwrap().settings,
+            second_settings
+        );
+        actor.switch_detection_profile(first).unwrap();
+        assert_eq!(
+            actor.detection_profile.as_ref().unwrap().persisted,
+            Some(first_settings)
+        );
+        drop(actor);
+        let output = child.wait_with_output().unwrap().stdout;
+        let mut position = 0;
+        let mut settings = Vec::new();
+        while position < output.len() {
+            let length =
+                u32::from_le_bytes(output[position + 4..position + 8].try_into().unwrap()) as usize;
+            let request: SessionRequest =
+                serde_json::from_slice(&output[position + 8..position + 8 + length]).unwrap();
+            if let SessionRequest::SetDetectionSettings {
+                settings: applied, ..
+            } = request
+            {
+                settings.push(applied);
+            }
+            position += 8 + length;
+        }
+        assert_eq!(settings, [second_settings, first_settings]);
     }
 
     #[test]

@@ -17,6 +17,43 @@ pub struct DetectionSettings {
     pub interruption: Threshold,
 }
 
+pub fn is_detection_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--listening-threshold"
+            | "--interruption-threshold"
+            | "--dynamic-listening"
+            | "--dynamic-interruption"
+    )
+}
+
+pub fn without_detection_arguments(arguments: &[String]) -> Vec<String> {
+    filter_arguments(arguments, false)
+}
+
+pub fn detection_arguments(arguments: &[String]) -> Vec<String> {
+    filter_arguments(arguments, true)
+}
+
+fn filter_arguments(arguments: &[String], detection: bool) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let count = if flag == "session" || flag == "--allow-direct-agent-speech" {
+            1
+        } else {
+            2
+        };
+        let end = (index + count).min(arguments.len());
+        if is_detection_flag(flag) == detection {
+            result.extend_from_slice(&arguments[index..end]);
+        }
+        index = end;
+    }
+    result
+}
+
 impl Default for DetectionSettings {
     fn default() -> Self {
         Self {
@@ -212,6 +249,36 @@ mod tests {
             },
         })
     }
+    #[test]
+    fn detection_flags_do_not_consume_flag_shaped_hint_values() {
+        let arguments = [
+            "session",
+            "--stt-hint",
+            "--listening-threshold",
+            "--language",
+            "en-US",
+            "--listening-threshold",
+            "0.8",
+            "--allow-direct-agent-speech",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            detection_arguments(&arguments),
+            ["--listening-threshold", "0.8"]
+        );
+        assert_eq!(
+            without_detection_arguments(&arguments),
+            [
+                "session",
+                "--stt-hint",
+                "--listening-threshold",
+                "--language",
+                "en-US",
+                "--allow-direct-agent-speech"
+            ]
+        );
+    }
+
     #[test]
     fn repeated_no_result_moves_only_the_detecting_mode_one_tick() {
         let mut tuner = tuner();

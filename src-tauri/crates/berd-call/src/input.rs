@@ -283,6 +283,11 @@ impl VoiceInputControls {
 
     #[cfg(target_os = "macos")]
     fn observe_detection(&self, detected: bool, epoch: u64) {
+        self.observe_detection_at(detected, epoch, Instant::now());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn observe_detection_at(&self, detected: bool, epoch: u64, now: Instant) {
         let mode = if self.shared.assistant_speaking.load(Ordering::Acquire) {
             crate::detection::DetectionMode::Interruption
         } else {
@@ -293,22 +298,27 @@ impl VoiceInputControls {
                 return;
             }
             if let Some(tuner) = detection.as_mut() {
-                tuner.observe(mode, detected, Instant::now());
+                tuner.observe(mode, detected, now);
             }
         }
     }
 
     #[cfg(target_os = "macos")]
     fn detection_result(&self, recognized: bool, epoch: u64) {
+        self.detection_result_at(recognized, epoch, Instant::now());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn detection_result_at(&self, recognized: bool, epoch: u64, now: Instant) {
         if let Ok(mut detection) = self.shared.detection.lock() {
             if self.mute_epoch() != epoch {
                 return;
             }
             if let Some(tuner) = detection.as_mut() {
                 if recognized {
-                    tuner.final_transcript(Instant::now());
+                    tuner.final_transcript(now);
                 } else {
-                    tuner.no_result(Instant::now());
+                    tuner.no_result(now);
                 }
             }
         }
@@ -3153,6 +3163,36 @@ mod tests {
         finished.signal_shutdown(false);
         finished.cancel();
         assert!(!finished.discard_on_shutdown.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_feedback_changes_only_the_active_threshold_and_applies_without_restart() {
+        let controls = VoiceInputControls::default();
+        let mut settings = crate::detection::DetectionSettings::default();
+        settings.listening.dynamic = true;
+        settings.interruption.dynamic = true;
+        controls.set_detection(settings).unwrap();
+        let epoch = controls.mute_epoch();
+        let now = Instant::now();
+        for n in 0..3 {
+            let time = now + Duration::from_secs(n * 40);
+            controls.observe_detection_at(true, epoch, time);
+            controls.detection_result_at(false, epoch, time + Duration::from_secs(6));
+        }
+        assert_eq!(controls.vad_threshold(0.5), 0.51);
+        let playback = controls
+            .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
+            .unwrap();
+        for n in 0..3 {
+            let time = now + Duration::from_secs(120 + n * 40);
+            controls.observe_detection_at(false, epoch, time);
+            controls.detection_result_at(true, epoch, time + Duration::from_secs(6));
+        }
+        assert_eq!(controls.vad_threshold(0.5), 0.64);
+        assert_eq!(controls.detection().unwrap().settings.listening.value, 0.51);
+        drop(playback);
+        assert_eq!(controls.vad_threshold(0.5), 0.51);
     }
 
     #[cfg(target_os = "macos")]
