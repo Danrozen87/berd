@@ -15,6 +15,9 @@ pub(crate) struct SavedSettings {
     // Left out until chosen, so a file without one still opens in older berd-call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_sounds: Option<StatusSoundMode>,
+    // Read preferences written by the optional debug-sound build without saving its setting.
+    #[serde(default, rename = "vad_debug_sounds", skip_serializing)]
+    pub _legacy_debug_sounds: Option<serde::de::IgnoredAny>,
 }
 
 pub(crate) fn path() -> Result<PathBuf, String> {
@@ -236,6 +239,38 @@ pub(crate) fn with_spokesperson(arguments: &[String], on: bool, direct: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_preferences_are_ignored_without_losing_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let settings = SavedSettings {
+            arguments: vec!["--rate".into(), "1.5".into()],
+            tts: Some(TtsSettings::Siri {
+                voice: "Aaron".into(),
+                language: "en-GB".into(),
+                rate: 1.5,
+            }),
+            input_policy: Some(InputDuringTtsPolicy::SuppressInput),
+            status_sounds: Some(StatusSoundMode::WorkingAndWaiting),
+            ..Default::default()
+        };
+        let expected = serde_json::to_value(&settings).unwrap();
+        let mut legacy = expected.clone();
+        legacy["vad_debug_sounds"] = serde_json::json!(true);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), expected);
+        save(&path, &restored).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written.get("vad_debug_sounds").is_none());
+        assert_eq!(written, expected);
+        assert_eq!(
+            serde_json::to_value(load(&path).unwrap()).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn auto_and_explicit_input_preferences_survive_reopen() {
