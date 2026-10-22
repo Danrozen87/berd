@@ -2567,6 +2567,10 @@ fn run_session(
                             dynamic: config.dynamic_interruption,
                         },
                     },
+                    capture.clone().map(|capture| {
+                        std::sync::Arc::new(capture)
+                            as std::sync::Arc<dyn berd_call::input::DetectionTrace>
+                    }),
                 ) {
                     Ok(runtime) => runtime,
                     Err(message) => {
@@ -7236,7 +7240,7 @@ fn create_stt_benchmark_report(
         &pack,
         config.runs,
         config.mode,
-        || create_input_runtime(&config.stt, None, &[], Default::default()),
+        || create_input_runtime(&config.stt, None, &[], Default::default(), None),
     )))
 }
 
@@ -7578,6 +7582,7 @@ fn create_input_runtime(
     endpoint_override: Option<&str>,
     _hints: &[String],
     detection: berd_call::detection::DetectionSettings,
+    trace: Option<std::sync::Arc<dyn berd_call::input::DetectionTrace>>,
 ) -> Result<
     (
         VoiceInputRuntime,
@@ -7647,6 +7652,9 @@ fn create_input_runtime(
     }
     let controls = VoiceInputControls::default();
     controls.set_detection(detection)?;
+    if let Some(trace) = trace {
+        controls.set_trace(trace);
+    }
     VoiceInputRuntime::start(VoiceInputConfig {
         engine,
         speech_vad_threshold: detection.listening.value,

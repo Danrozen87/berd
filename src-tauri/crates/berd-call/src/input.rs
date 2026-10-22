@@ -10,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -92,6 +92,34 @@ pub enum VoiceInputEngineConfig {
     },
 }
 
+/// Receives the macOS worker's speech-detection decisions, for capture.
+pub trait DetectionTrace: Send + Sync {
+    /// Microphone frames received so far, including the one being pushed.
+    fn received_frames(&self) -> u64;
+    /// Effective detection settings, before the first frame using them.
+    fn settings(&self, revision: u64, settings: crate::detection::DetectionSettings);
+    fn frame(&self, frame: TracedFrame);
+    /// A recognizer generation began or ended, and why.
+    fn recognizer(&self, generation: u64, reason: &'static str);
+}
+
+/// One 16 ms detector frame.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct TracedFrame {
+    /// The 48 kHz microphone sample just past this frame's audio.
+    pub mic_sample: u64,
+    pub vad_frame: u64,
+    pub epoch: u64,
+    pub generation: u64,
+    pub mode: crate::vad_replay::Mode,
+    pub probability: f32,
+    pub threshold: f32,
+    pub detected: bool,
+    /// The onset/release gate's output, which starts and ends turns.
+    pub active: bool,
+    pub settings_revision: u64,
+}
+
 pub struct VoiceInputConfig {
     pub engine: VoiceInputEngineConfig,
     pub speech_vad_threshold: f32,
@@ -168,6 +196,7 @@ struct ControlState {
     mute_epoch: AtomicU64,
     assistant_speaking: AtomicBool,
     assistant_vad_threshold: AtomicU32,
+    trace: OnceLock<Arc<dyn DetectionTrace>>,
 }
 
 #[derive(Default)]
@@ -298,6 +327,7 @@ impl Default for VoiceInputControls {
                 mute_epoch: AtomicU64::new(0),
                 assistant_speaking: AtomicBool::new(false),
                 assistant_vad_threshold: AtomicU32::new(0.5_f32.to_bits()),
+                trace: OnceLock::new(),
             }),
         }
     }
@@ -317,6 +347,11 @@ impl VoiceInputControls {
         self.reset();
         *detection = Some(crate::detection::DetectionTuner::new(settings));
         Ok(())
+    }
+
+    /// Traces speech detection from runtimes started after this call.
+    pub fn set_trace(&self, trace: Arc<dyn DetectionTrace>) {
+        let _ = self.shared.trace.set(trace);
     }
 
     pub fn detection(&self) -> Option<crate::detection::DetectionSnapshot> {
@@ -483,18 +518,40 @@ impl VoiceInputControls {
     }
 
     fn vad_threshold(&self, speech_threshold: f32) -> f32 {
-        if let Some(snapshot) = self.detection() {
-            return if self.shared.assistant_speaking.load(Ordering::Acquire) {
-                snapshot.settings.interruption.value
-            } else {
-                snapshot.settings.listening.value
-            };
-        }
-        if self.shared.assistant_speaking.load(Ordering::Acquire) {
-            f32::from_bits(self.shared.assistant_vad_threshold.load(Ordering::Acquire))
+        let (settings, mode) = self.effective_detection(speech_threshold);
+        threshold(settings, mode)
+    }
+
+    /// The settings in effect, as configured or from the fixed thresholds, and
+    /// whether speech now would interrupt the assistant.
+    fn effective_detection(
+        &self,
+        speech_threshold: f32,
+    ) -> (crate::detection::DetectionSettings, crate::vad_replay::Mode) {
+        use crate::detection::{DetectionSettings, Threshold};
+        use crate::vad_replay::Mode;
+        let mode = if self.shared.assistant_speaking.load(Ordering::Acquire) {
+            Mode::Interruption
         } else {
-            speech_threshold
-        }
+            Mode::Listening
+        };
+        let settings = self.detection().map_or_else(
+            || DetectionSettings {
+                listening: Threshold {
+                    value: speech_threshold,
+                    dynamic: false,
+                },
+                interruption: Threshold {
+                    value: f32::from_bits(
+                        self.shared.assistant_vad_threshold.load(Ordering::Acquire),
+                    ),
+                    dynamic: false,
+                },
+                timing: Default::default(),
+            },
+            |snapshot| snapshot.settings,
+        );
+        (settings, mode)
     }
 
     fn publish_effective_mute(&self, transition: &ControlTransitionState) {
@@ -555,9 +612,18 @@ impl Drop for AssistantActivityGuard {
     }
 }
 
+fn threshold(settings: crate::detection::DetectionSettings, mode: crate::vad_replay::Mode) -> f32 {
+    match mode {
+        crate::vad_replay::Mode::Listening => settings.listening.value,
+        crate::vad_replay::Mode::Interruption => settings.interruption.value,
+    }
+}
+
 struct QueuedFrame {
     frame: VoiceInputFrame,
     mute_epoch: u64,
+    /// This frame's index among those the trace received.
+    mic_frame: u64,
 }
 
 pub struct VoiceInputRuntime {
@@ -673,7 +739,17 @@ impl VoiceInputRuntime {
         if self.controls.is_muted() || mute_epoch != self.controls.mute_epoch() {
             return Ok(());
         }
-        match self.frame_tx.try_send(QueuedFrame { frame, mute_epoch }) {
+        let mic_frame = self
+            .controls
+            .shared
+            .trace
+            .get()
+            .map_or(0, |trace| trace.received_frames().saturating_sub(1));
+        match self.frame_tx.try_send(QueuedFrame {
+            frame,
+            mute_epoch,
+            mic_frame,
+        }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(
                 "Voice input overrun: recognition could not keep up with 20 ms frames.".to_string(),
@@ -1540,6 +1616,81 @@ fn forward_mac_events(
     )
 }
 
+/// Numbers detector frames, recognizer generations and settings revisions for a trace.
+struct FrameTracer {
+    trace: Option<Arc<dyn DetectionTrace>>,
+    vad_frame: u64,
+    generation: u64,
+    settings: Option<(u64, crate::detection::DetectionSettings)>,
+}
+
+impl FrameTracer {
+    fn new(trace: Option<Arc<dyn DetectionTrace>>) -> Self {
+        Self {
+            trace,
+            vad_frame: 0,
+            generation: 0,
+            settings: None,
+        }
+    }
+
+    fn began(&mut self, reason: &'static str) {
+        self.generation += 1;
+        self.ended(reason);
+    }
+
+    fn ended(&self, reason: &'static str) {
+        if let Some(trace) = &self.trace {
+            trace.recognizer(self.generation, reason);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &mut self,
+        mic_sample: u64,
+        epoch: u64,
+        settings: crate::detection::DetectionSettings,
+        mode: crate::vad_replay::Mode,
+        probability: f32,
+        detected: bool,
+        active: bool,
+    ) {
+        let Some(trace) = &self.trace else { return };
+        let revision = match self.settings {
+            Some((revision, current)) if current == settings => revision,
+            previous => {
+                let revision = previous.map_or(0, |(revision, _)| revision + 1);
+                trace.settings(revision, settings);
+                self.settings = Some((revision, settings));
+                revision
+            }
+        };
+        trace.frame(TracedFrame {
+            mic_sample,
+            vad_frame: self.vad_frame,
+            epoch,
+            generation: self.generation,
+            mode,
+            probability,
+            threshold: threshold(settings, mode),
+            detected,
+            active,
+            settings_revision: revision,
+        });
+        self.vad_frame += 1;
+    }
+}
+
+/// The 48 kHz microphone sample just past a detector frame. `consumed` input and
+/// `produced` output samples, through the frame's end, count everything the
+/// resampler has seen; its output lags its input by `delay` output samples.
+fn detector_frame_end(chunk_end: u64, consumed: u64, produced: u64, delay: usize) -> u64 {
+    let ratio = (INPUT_SAMPLE_RATE / 16_000) as u64;
+    let lag = consumed.saturating_sub(ratio * produced.saturating_sub(delay as u64));
+    chunk_end.saturating_sub(lag)
+}
+
 #[cfg(target_os = "macos")]
 fn begin_mac_turn(
     pending: &mut PendingRecognitions,
@@ -1612,9 +1763,12 @@ fn mac_speech_worker(
     let mut pending = PendingRecognitions::new();
     let mut settle_deadline = None;
     let mut received_audio = false;
+    let mut tracer = FrameTracer::new(controls.shared.trace.get().cloned());
+    let (mut consumed, mut produced) = (0_u64, 0_u64);
     if events.blocking_send(VoiceInputEvent::Ready).is_err() {
         return;
     }
+    tracer.began("start");
 
     loop {
         if forward_mac_events_with_detection(
@@ -1646,6 +1800,7 @@ fn mac_speech_worker(
                     recognizer = next;
                     recognition_events = next_events;
                     received_audio = false;
+                    tracer.began("no_result_timeout");
                 }
                 Err(error) => {
                     let _ = events.blocking_send(VoiceInputEvent::Failed(error));
@@ -1677,13 +1832,15 @@ fn mac_speech_worker(
             settle_deadline = None;
             recognizer.cancel();
             if shutting_down {
-                break;
+                tracer.ended("cancel");
+                return;
             }
             match new_mac_recognizer(&hints) {
                 Ok((next, next_events)) => {
                     recognizer = next;
                     recognition_events = next_events;
                     received_audio = false;
+                    tracer.began("epoch_change");
                 }
                 Err(error) => {
                     let _ = events.blocking_send(VoiceInputEvent::Failed(error));
@@ -1709,19 +1866,35 @@ fn mac_speech_worker(
         received_audio = true;
 
         input_48k.extend_from_slice(frame.frame.samples());
+        let input_end = (frame.mic_frame + 1) * INPUT_FRAME_SAMPLES as u64;
         while input_48k.len() >= chunk_in {
             let chunk: Vec<f32> = input_48k.drain(..chunk_in).collect();
-            leftover_16k.extend_from_slice(&resample(&mut resampler, &chunk));
+            let resampled = resample(&mut resampler, &chunk);
+            consumed += chunk.len() as u64;
+            produced += resampled.len() as u64;
+            leftover_16k.extend_from_slice(&resampled);
+            let chunk_end = input_end.saturating_sub(input_48k.len() as u64);
             while leftover_16k.len() >= VAD_FRAME_SAMPLES {
                 let frame: Vec<f32> = leftover_16k.drain(..VAD_FRAME_SAMPLES).collect();
                 let clamped = clamp_vad_frame(&frame);
-                let detected =
-                    vad.predict_f32(&clamped) > controls.vad_threshold(speech_vad_threshold);
-                let timing = controls
-                    .detection()
-                    .map(|snapshot| snapshot.settings.timing)
-                    .unwrap_or_default();
-                let active = gate.observe(detected, timing);
+                let (settings, mode) = controls.effective_detection(speech_vad_threshold);
+                let probability = vad.predict_f32(&clamped);
+                let detected = probability > threshold(settings, mode);
+                let active = gate.observe(detected, settings.timing);
+                tracer.frame(
+                    detector_frame_end(
+                        chunk_end,
+                        consumed,
+                        produced - leftover_16k.len() as u64,
+                        resampler.output_delay(),
+                    ),
+                    observed_epoch,
+                    settings,
+                    mode,
+                    probability,
+                    detected,
+                    active,
+                );
                 controls.observe_detection(active && detected, observed_epoch);
                 if active != in_speech {
                     in_speech = active;
@@ -1755,9 +1928,11 @@ fn mac_speech_worker(
     }
     if discard_on_shutdown.load(Ordering::Acquire) || !received_audio {
         recognizer.cancel();
+        tracer.ended("cancel");
         let _ = pending.reset(&events);
         return;
     }
+    tracer.ended("finish");
     if let Err(error) = recognizer.finish() {
         let _ = pending.reset(&events);
         let _ = events.blocking_send(VoiceInputEvent::Failed(error));
@@ -2303,6 +2478,105 @@ mod tests {
 
     fn silence_frame() -> VoiceInputFrame {
         VoiceInputFrame::try_from_samples(&[0.0; INPUT_FRAME_SAMPLES]).unwrap()
+    }
+
+    #[derive(Default)]
+    struct RecordedTrace(Mutex<Vec<String>>);
+
+    impl DetectionTrace for RecordedTrace {
+        fn received_frames(&self) -> u64 {
+            0
+        }
+        fn settings(&self, revision: u64, settings: crate::detection::DetectionSettings) {
+            let listening = settings.listening.value;
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("settings {revision} {listening}"));
+        }
+        fn frame(&self, frame: TracedFrame) {
+            let TracedFrame {
+                vad_frame,
+                generation,
+                settings_revision,
+                threshold,
+                ..
+            } = frame;
+            self.0.lock().unwrap().push(format!(
+                "frame {vad_frame} {generation} {settings_revision} {threshold}"
+            ));
+        }
+        fn recognizer(&self, generation: u64, reason: &'static str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("recognizer {generation} {reason}"));
+        }
+    }
+
+    #[test]
+    fn traces_settings_before_the_frames_that_use_them_and_numbers_generations() {
+        use crate::detection::DetectionSettings;
+        use crate::vad_replay::Mode;
+        let trace = Arc::new(RecordedTrace::default());
+        let mut tracer = FrameTracer::new(Some(trace.clone()));
+        let initial = DetectionSettings::default();
+        let mut raised = initial;
+        raised.listening.value = 0.6;
+        tracer.began("start");
+        tracer.frame(768, 0, initial, Mode::Listening, 0.7, true, true);
+        tracer.frame(1_536, 0, initial, Mode::Interruption, 0.7, true, true);
+        tracer.began("no_result_timeout");
+        tracer.frame(2_304, 0, raised, Mode::Listening, 0.1, false, false);
+        tracer.ended("finish");
+
+        assert_eq!(
+            *trace.0.lock().unwrap(),
+            [
+                "recognizer 1 start",
+                "settings 0 0.5",
+                "frame 0 1 0 0.5",
+                "frame 1 1 0 0.65",
+                "recognizer 2 no_result_timeout",
+                "settings 1 0.6",
+                "frame 2 2 1 0.6",
+                "recognizer 2 finish",
+            ]
+        );
+    }
+
+    #[test]
+    fn locates_detector_frames_in_microphone_audio_through_resampling() {
+        use rubato::{Fft, FixedSync, Resampler};
+        let mut resampler =
+            Fft::<f32>::new(INPUT_SAMPLE_RATE, 16_000, 1024, 2, 1, FixedSync::Input).unwrap();
+        let impulse = 20_000;
+        let mut input = vec![0.0; INPUT_SAMPLE_RATE];
+        input[impulse] = 1.0;
+        let mut output: Vec<f32> = Vec::new();
+        let mut produced = Vec::new();
+        for chunk in input.chunks_exact(1024) {
+            output.extend(resample(&mut resampler, chunk));
+            produced.push(output.len());
+        }
+        let peak = (0..output.len())
+            .max_by(|&a, &b| output[a].abs().total_cmp(&output[b].abs()))
+            .unwrap();
+        let chunk = produced.iter().position(|&len| len > peak).unwrap();
+        // Offset the microphone timeline, as when earlier frames were skipped.
+        let skipped = 96_000;
+        let consumed = ((chunk + 1) * 1024) as u64;
+        let end = detector_frame_end(
+            skipped + consumed,
+            consumed,
+            peak as u64 + 1,
+            resampler.output_delay(),
+        );
+
+        assert!(
+            (skipped + impulse as u64 + 1).abs_diff(end) <= 3,
+            "impulse at {impulse}, located just before {end}"
+        );
     }
 
     #[cfg(target_os = "macos")]
