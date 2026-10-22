@@ -99,9 +99,10 @@ impl StatusSoundStateMachine {
 pub struct StatusSoundRuntime {
     machine: StatusSoundStateMachine,
     next_tick: Option<Instant>,
+    pending_status_cue: bool,
     player: StatusSoundPlayer,
+    input_policy: crate::input::InputDuringTtsPolicy,
     output_device: Option<String>,
-    conversation_active: bool,
     input_controls: Option<crate::input::VoiceInputControls>,
 }
 
@@ -110,9 +111,10 @@ impl Default for StatusSoundRuntime {
         Self {
             machine: StatusSoundStateMachine::default(),
             next_tick: None,
+            pending_status_cue: false,
             player: StatusSoundPlayer::new(),
+            input_policy: crate::input::InputDuringTtsPolicy::Auto,
             output_device: None,
-            conversation_active: false,
             input_controls: None,
         }
     }
@@ -131,6 +133,10 @@ impl StatusSoundRuntime {
     }
 
     pub fn update(&mut self, status: ConversationStatus, settings: StatusSoundSettings) {
+        self.pending_status_cue |= self
+            .machine
+            .current
+            .is_some_and(|(previous, _)| previous != status);
         let changed = self.machine.update(status, settings);
         if changed {
             self.player.stop();
@@ -143,29 +149,27 @@ impl StatusSoundRuntime {
     }
 
     fn update_conversation_activity(&mut self, conversation_active: bool) {
-        if conversation_active {
-            self.stop();
-        } else if self.conversation_active {
+        if !conversation_active && self.pending_status_cue {
             self.next_tick = Some(Instant::now());
+            self.pending_status_cue = false;
         }
-        self.conversation_active = conversation_active;
     }
 
     pub fn poll(&mut self, conversation_active: bool) -> Result<bool, String> {
         self.update_conversation_activity(conversation_active);
-        if conversation_active {
-            self.player.reap();
-            return Ok(false);
-        }
         self.player.reap();
         let now = Instant::now();
         if self.next_tick.is_some_and(|deadline| now >= deadline) {
-            self.next_tick = Some(now + STATUS_SOUND_INTERVAL);
+            let deadline = self.next_tick.unwrap();
+            let elapsed = now.duration_since(deadline).as_nanos();
+            let ticks = elapsed / STATUS_SOUND_INTERVAL.as_nanos() + 1;
+            self.next_tick = Some(deadline + STATUS_SOUND_INTERVAL.mul_f64(ticks as f64));
             if let Some(cue) = self.machine.tick(conversation_active) {
                 self.player.play(
                     cue,
                     self.output_device.as_deref(),
                     self.input_controls.as_ref(),
+                    self.input_policy,
                 )?;
             }
         }
@@ -180,6 +184,8 @@ enum StatusSoundCommand {
         applied: Option<Sender<Result<(), String>>>,
     },
     OutputDevice(Option<String>),
+    InputPolicy(crate::input::InputDuringTtsPolicy),
+    InputControls(crate::input::VoiceInputControls),
     Shutdown,
 }
 
@@ -248,6 +254,14 @@ impl ManagedStatusSoundRuntime {
                             runtime.set_output_device(device);
                             None
                         }
+                        Ok(StatusSoundCommand::InputPolicy(policy)) => {
+                            runtime.input_policy = policy;
+                            None
+                        }
+                        Ok(StatusSoundCommand::InputControls(controls)) => {
+                            runtime.set_input_controls(Some(controls));
+                            None
+                        }
                         Ok(StatusSoundCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                             runtime.stop();
                             break;
@@ -273,6 +287,20 @@ impl ManagedStatusSoundRuntime {
         })
     }
 
+    pub fn set_input_policy(
+        &self,
+        policy: crate::input::InputDuringTtsPolicy,
+    ) -> Result<(), String> {
+        self.send(StatusSoundCommand::InputPolicy(policy))
+    }
+
+    pub fn set_input_controls(
+        &self,
+        controls: crate::input::VoiceInputControls,
+    ) -> Result<(), String> {
+        self.send(StatusSoundCommand::InputControls(controls))
+    }
+
     pub fn update(
         &self,
         status: ConversationStatus,
@@ -282,7 +310,17 @@ impl ManagedStatusSoundRuntime {
         self.send(StatusSoundCommand::Update(status, settings))
     }
 
+    /// Queue activity without waiting for native audio operations. PCM-owning loops
+    /// must use this path so a slow output device cannot stop microphone draining.
+    pub fn queue_conversation_active(&self, active: bool) -> Result<(), String> {
+        self.update_explicit_activity(active, false)
+    }
+
     pub fn set_conversation_active(&self, active: bool) -> Result<(), String> {
+        self.update_explicit_activity(active, true)
+    }
+
+    fn update_explicit_activity(&self, active: bool, wait: bool) -> Result<(), String> {
         let mut activity = self
             .inner
             .activity
@@ -293,7 +331,12 @@ impl ManagedStatusSoundRuntime {
         activity.explicit_active = active;
         let current = activity.is_active();
         if previous != current {
-            if let Err(error) = self.apply_conversation_active(current) {
+            let result = if wait {
+                self.apply_conversation_active(current)
+            } else {
+                self.send_conversation_active(current, None)
+            };
+            if let Err(error) = result {
                 activity.explicit_active = previous_explicit;
                 let _ = self.send_conversation_active(previous, None);
                 return Err(error);
@@ -428,6 +471,7 @@ impl StatusSoundPlayer {
         _cue: StatusSoundCue,
         _output_device: Option<&str>,
         _input_controls: Option<&crate::input::VoiceInputControls>,
+        _input_policy: crate::input::InputDuringTtsPolicy,
     ) -> Result<(), String> {
         Err("status sound playback is only available on macOS".into())
     }
@@ -452,7 +496,7 @@ struct ActiveStatusSound {
     player: Box<dyn crate::PcmAudioOutput>,
     drain_deadline: Instant,
     output_tail_deadline: Option<Instant>,
-    _input_activity: Option<crate::input::AssistantActivityGuard>,
+    _input_activity: Option<crate::input::CueInputActivityGuard>,
 }
 
 #[cfg(target_os = "macos")]
@@ -477,6 +521,7 @@ impl StatusSoundPlayer {
         cue: StatusSoundCue,
         output_device: Option<&str>,
         input_controls: Option<&crate::input::VoiceInputControls>,
+        input_policy: crate::input::InputDuringTtsPolicy,
     ) -> Result<(), String> {
         self.reap();
         if self.active.is_some() {
@@ -488,27 +533,58 @@ impl StatusSoundPlayer {
         }
         .as_ref()
         .map_err(Clone::clone)?;
+        Self::play_asset(
+            &mut self.active,
+            asset,
+            cue.volume,
+            output_device,
+            input_controls,
+            input_policy,
+        )
+    }
+
+    fn play_asset(
+        active: &mut Option<ActiveStatusSound>,
+        asset: &StatusSoundAsset,
+        volume: f32,
+        output_device: Option<&str>,
+        input_controls: Option<&crate::input::VoiceInputControls>,
+        input_policy: crate::input::InputDuringTtsPolicy,
+    ) -> Result<(), String> {
         let player = crate::macos_audio_output::PocketAudioPlayer::new(
             asset.sample_rate,
             1.0,
             output_device,
         )?;
+        Self::enqueue_asset(
+            active,
+            Box::new(player),
+            asset,
+            volume,
+            input_controls,
+            input_policy.resolve(output_device),
+        )
+    }
+
+    fn enqueue_asset(
+        active: &mut Option<ActiveStatusSound>,
+        player: Box<dyn crate::PcmAudioOutput>,
+        asset: &StatusSoundAsset,
+        volume: f32,
+        input_controls: Option<&crate::input::VoiceInputControls>,
+        input_policy: crate::input::InputDuringTtsPolicy,
+    ) -> Result<(), String> {
         let samples = asset
             .samples
             .iter()
-            .map(|sample| sample * cue.volume)
+            .map(|sample| sample * volume)
             .collect::<Vec<_>>();
         let input_activity = input_controls
-            .map(|controls| {
-                controls.begin_assistant_activity(
-                    0.65,
-                    crate::input::InputDuringTtsPolicy::SuppressInput,
-                )
-            })
+            .map(|controls| controls.begin_cue_activity(input_policy, None))
             .transpose()?;
-        player.enqueue(&samples)?;
-        self.active = Some(ActiveStatusSound {
-            player: Box::new(player),
+        player.write(&samples)?;
+        *active = Some(ActiveStatusSound {
+            player,
             drain_deadline: Instant::now()
                 + Duration::from_secs_f64(samples.len() as f64 / f64::from(asset.sample_rate))
                 + STATUS_SOUND_DRAIN_GRACE,
@@ -570,6 +646,61 @@ fn load_system_sound(name: &str) -> Result<StatusSoundAsset, String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_cue_enqueue_obeys_policy_and_releases_guard_on_failure() {
+        struct Output {
+            fail: bool,
+        }
+        impl crate::PcmAudioOutput for Output {
+            fn write(&self, _: &[f32]) -> Result<(), String> {
+                if self.fail {
+                    Err("enqueue failed".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn cancel(&self) {}
+            fn is_drained(&self) -> bool {
+                false
+            }
+            fn check_health(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn played_frames(&self) -> u64 {
+                0
+            }
+        }
+        use crate::input::{InputDuringTtsPolicy, VoiceInputControls};
+        for policy in [
+            InputDuringTtsPolicy::AllowBargeIn,
+            InputDuringTtsPolicy::SuppressInput,
+        ] {
+            for fail in [false, true] {
+                let controls = VoiceInputControls::default();
+                let mut active = None;
+                let result = StatusSoundPlayer::enqueue_asset(
+                    &mut active,
+                    Box::new(Output { fail }),
+                    &StatusSoundAsset {
+                        sample_rate: 48000,
+                        samples: vec![0.01; 960],
+                    },
+                    0.08,
+                    Some(&controls),
+                    policy,
+                );
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(
+                    controls.is_input_suppressed(),
+                    !fail && policy == InputDuringTtsPolicy::SuppressInput
+                );
+                drop(active);
+                assert!(!controls.is_input_suppressed());
+            }
+        }
+    }
+
     fn settings(mode: StatusSoundMode) -> StatusSoundSettings {
         StatusSoundSettings {
             mode,
@@ -580,6 +711,38 @@ mod tests {
     fn assert_status(machine: &mut StatusSoundStateMachine, expected: ConversationStatus) {
         let actual = machine.tick(false).map(|cue| cue.status);
         assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn session_activity_does_not_wait_for_a_stalled_audio_worker() {
+        let (commands, receiver) = mpsc::channel();
+        let runtime = ManagedStatusSoundRuntime {
+            inner: Arc::new(StatusSoundWorker {
+                commands,
+                worker: Mutex::new(None),
+                activity: Mutex::new(StatusSoundActivityState::default()),
+            }),
+        };
+        let (done, result) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            let outcome = runtime.queue_conversation_active(true);
+            done.send(outcome).unwrap();
+        });
+        // The audio worker deliberately never services the command.
+        let outcome = result.recv_timeout(Duration::from_millis(100));
+        // Release the old blocking implementation before asserting the result.
+        if let Ok(StatusSoundCommand::ConversationActive {
+            applied: Some(applied),
+            ..
+        }) = receiver.try_recv()
+        {
+            let _ = applied.send(Ok(()));
+        }
+        caller.join().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "microphone processing waited for the audio worker"
+        );
     }
 
     #[test]
@@ -698,6 +861,7 @@ mod tests {
         let explicit = StatusSoundSettings {
             mode: StatusSoundMode::Working,
             volume: 0.25,
+            ..Default::default()
         };
         assert_eq!(explicit.validate().unwrap().volume, 0.25);
     }
@@ -708,6 +872,7 @@ mod tests {
             assert!(StatusSoundSettings {
                 mode: StatusSoundMode::Working,
                 volume,
+                ..Default::default()
             }
             .validate()
             .is_err());
@@ -740,27 +905,50 @@ mod tests {
     }
 
     #[test]
-    fn working_cue_is_due_immediately_after_speech() {
+    fn speech_preserves_the_existing_cue_schedule() {
+        for status in [ConversationStatus::Working, ConversationStatus::Waiting] {
+            let mut runtime = StatusSoundRuntime::default();
+            runtime.update(status, settings(StatusSoundMode::WorkingAndWaiting));
+            let deadline = Instant::now() + STATUS_SOUND_INTERVAL;
+            runtime.next_tick = Some(deadline);
+            runtime.poll(true).unwrap();
+            runtime.update_conversation_activity(false);
+            assert_eq!(runtime.next_tick, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn status_change_during_speech_is_announced_when_speech_finishes() {
+        for (before, after) in [
+            (ConversationStatus::Working, ConversationStatus::Waiting),
+            (ConversationStatus::Waiting, ConversationStatus::Working),
+        ] {
+            let mut runtime = StatusSoundRuntime::default();
+            let settings = settings(StatusSoundMode::WorkingAndWaiting);
+            runtime.update(before, settings);
+            runtime.poll(true).unwrap();
+            runtime.update(after, settings);
+            runtime.poll(true).unwrap();
+            runtime.update_conversation_activity(false);
+            assert!(runtime.next_tick.unwrap() <= Instant::now());
+        }
+    }
+
+    #[test]
+    fn cues_due_during_speech_are_skipped_without_catching_up() {
         let mut runtime = StatusSoundRuntime::default();
         runtime.update(
             ConversationStatus::Working,
             settings(StatusSoundMode::Working),
         );
-        runtime.update_conversation_activity(true);
-        runtime.update_conversation_activity(false);
-        assert!(runtime.next_tick.unwrap() <= Instant::now());
-    }
-
-    #[test]
-    fn waiting_cue_is_due_immediately_after_speech() {
-        let mut runtime = StatusSoundRuntime::default();
-        runtime.update(
-            ConversationStatus::Waiting,
-            settings(StatusSoundMode::WorkingAndWaiting),
-        );
-        runtime.update_conversation_activity(true);
-        runtime.update_conversation_activity(false);
-        assert!(runtime.next_tick.unwrap() <= Instant::now());
+        let deadline = Instant::now() - Duration::from_secs(1);
+        runtime.next_tick = Some(deadline);
+        assert!(!runtime.poll(true).unwrap());
+        let next = runtime.next_tick.unwrap();
+        assert!(next > Instant::now());
+        assert_eq!(next, deadline + STATUS_SOUND_INTERVAL);
+        assert!(!runtime.poll(false).unwrap());
+        assert_eq!(runtime.next_tick, Some(next));
     }
 
     #[test]
@@ -783,6 +971,37 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn speech_does_not_cancel_a_sample_already_playing() {
+        struct PendingOutput;
+        impl crate::PcmAudioOutput for PendingOutput {
+            fn write(&self, _: &[f32]) -> Result<(), String> {
+                Ok(())
+            }
+            fn cancel(&self) {}
+            fn is_drained(&self) -> bool {
+                false
+            }
+            fn check_health(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn played_frames(&self) -> u64 {
+                0
+            }
+        }
+        let mut runtime = StatusSoundRuntime::default();
+        runtime.player.active = Some(ActiveStatusSound {
+            player: Box::new(PendingOutput),
+            drain_deadline: Instant::now() + Duration::from_secs(10),
+            output_tail_deadline: None,
+            _input_activity: None,
+        });
+        assert!(runtime.poll(true).unwrap());
+        assert!(runtime.player.active.is_some());
+        runtime.stop();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn failed_or_expired_pending_cue_releases_microphone_suppression() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct PendingOutput {
@@ -796,7 +1015,7 @@ mod tests {
             }
             fn cancel(&self) {
                 assert!(
-                    self.controls.is_muted(),
+                    self.controls.is_input_suppressed(),
                     "cancel before releasing input suppression"
                 );
                 self.cancelled.store(true, Ordering::SeqCst);
@@ -835,21 +1054,21 @@ mod tests {
                     output_tail_deadline: None,
                     _input_activity: Some(
                         controls
-                            .begin_assistant_activity(
-                                0.65,
+                            .begin_cue_activity(
                                 crate::input::InputDuringTtsPolicy::SuppressInput,
+                                None,
                             )
                             .unwrap(),
                     ),
                 }),
             };
-            assert!(controls.is_muted());
+            assert!(controls.is_input_suppressed());
             player.reap();
             assert_eq!(player.is_active(), !failed && !expired);
-            assert_eq!(controls.is_muted(), !failed && !expired);
+            assert_eq!(controls.is_input_suppressed(), !failed && !expired);
             assert_eq!(cancelled.load(Ordering::SeqCst), failed || expired);
             player.stop();
-            assert!(!controls.is_muted());
+            assert!(!controls.is_input_suppressed());
         }
     }
 
@@ -868,13 +1087,14 @@ mod tests {
                     },
                     None,
                     Some(&controls),
+                    crate::input::InputDuringTtsPolicy::SuppressInput,
                 )
                 .unwrap();
         }
         assert!(player.active.is_some());
-        assert!(controls.is_muted());
+        assert!(controls.is_input_suppressed());
         player.stop();
-        assert!(!controls.is_muted());
+        assert!(!controls.is_input_suppressed());
     }
 
     #[cfg(target_os = "macos")]
@@ -891,15 +1111,16 @@ mod tests {
                 },
                 None,
                 Some(&controls),
+                crate::input::InputDuringTtsPolicy::SuppressInput,
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while player.is_active() {
-            assert!(controls.is_muted());
+            assert!(controls.is_input_suppressed());
             assert!(Instant::now() < deadline, "status cue did not drain");
             player.reap();
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!controls.is_muted());
+        assert!(!controls.is_input_suppressed());
     }
 }

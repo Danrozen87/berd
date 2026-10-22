@@ -165,6 +165,7 @@ struct ControlState {
     transition: Mutex<ControlTransitionState>,
     muted: AtomicBool,
     mute_epoch: AtomicU64,
+    cue_suppressions: AtomicU64,
     assistant_speaking: AtomicBool,
     assistant_vad_threshold: AtomicU32,
 }
@@ -294,6 +295,7 @@ impl Default for VoiceInputControls {
                 transition: Mutex::new(ControlTransitionState::default()),
                 muted: AtomicBool::new(false),
                 mute_epoch: AtomicU64::new(0),
+                cue_suppressions: AtomicU64::new(0),
                 assistant_speaking: AtomicBool::new(false),
                 assistant_vad_threshold: AtomicU32::new(0.5_f32.to_bits()),
             }),
@@ -302,6 +304,31 @@ impl Default for VoiceInputControls {
 }
 
 impl VoiceInputControls {
+    /// Pauses new captured frames without invalidating buffered speech or recognition.
+    pub fn begin_cue_activity(
+        &self,
+        policy: InputDuringTtsPolicy,
+        output_device: Option<&str>,
+    ) -> Result<CueInputActivityGuard, String> {
+        let suppress = policy.resolve(output_device) == InputDuringTtsPolicy::SuppressInput;
+        if suppress {
+            self.shared
+                .cue_suppressions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .map_err(|_| "Too many overlapping cue activity guards".to_string())?;
+        }
+        Ok(CueInputActivityGuard {
+            controls: self.clone(),
+            suppress,
+        })
+    }
+
+    pub fn is_input_suppressed(&self) -> bool {
+        self.is_muted() || self.shared.cue_suppressions.load(Ordering::Acquire) > 0
+    }
+
     pub fn is_muted(&self) -> bool {
         self.shared.muted.load(Ordering::Acquire)
     }
@@ -455,6 +482,23 @@ impl VoiceInputControls {
     }
 }
 
+#[must_use = "cue input suppression ends when the guard is dropped"]
+pub struct CueInputActivityGuard {
+    controls: VoiceInputControls,
+    suppress: bool,
+}
+
+impl Drop for CueInputActivityGuard {
+    fn drop(&mut self) {
+        if self.suppress {
+            self.controls
+                .shared
+                .cue_suppressions
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 #[must_use = "assistant activity ends when the guard is dropped"]
 pub struct AssistantActivityGuard {
     controls: VoiceInputControls,
@@ -590,11 +634,11 @@ impl VoiceInputRuntime {
         if self.shutdown.load(Ordering::Acquire) {
             return Err("Voice input recognition is no longer running.".to_string());
         }
-        if self.controls.is_muted() {
+        if self.controls.is_input_suppressed() {
             return Ok(());
         }
         let mute_epoch = self.controls.mute_epoch();
-        if self.controls.is_muted() || mute_epoch != self.controls.mute_epoch() {
+        if self.controls.is_input_suppressed() || mute_epoch != self.controls.mute_epoch() {
             return Ok(());
         }
         match self.frame_tx.try_send(QueuedFrame { frame, mute_epoch }) {
@@ -2167,6 +2211,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cue_auto_policy_uses_selected_speaker_route() {
+        let controls = VoiceInputControls::default();
+        let guard = controls
+            .begin_cue_activity(InputDuringTtsPolicy::Auto, Some("Test Speakers"))
+            .unwrap();
+        assert!(controls.is_input_suppressed());
+        assert_eq!(controls.mute_epoch(), 0);
+        drop(guard);
+        assert!(!controls.is_input_suppressed());
+    }
+
+    #[test]
+    fn cue_suppression_preserves_recognition_epoch_and_composes_with_host_mute() {
+        let controls = VoiceInputControls::default();
+        let epoch = controls.mute_epoch();
+        let first = controls
+            .begin_cue_activity(InputDuringTtsPolicy::SuppressInput, None)
+            .unwrap();
+        let second = controls
+            .begin_cue_activity(InputDuringTtsPolicy::SuppressInput, None)
+            .unwrap();
+        assert!(controls.is_input_suppressed());
+        assert!(!controls.is_muted());
+        assert_eq!(controls.mute_epoch(), epoch);
+        drop(first);
+        assert!(controls.is_input_suppressed());
+        drop(second);
+        assert!(!controls.is_input_suppressed());
+        assert_eq!(controls.mute_epoch(), epoch);
+        let allow = controls
+            .begin_cue_activity(InputDuringTtsPolicy::AllowBargeIn, None)
+            .unwrap();
+        assert!(!controls.is_input_suppressed());
+        controls.set_host_muted(true);
+        drop(allow);
+        assert!(controls.is_input_suppressed());
+    }
+
+    #[test]
     fn default_output_is_classified_by_its_name() {
         for name in ["USB Speakers", "Bluetooth SPEAKER", "Altavoces externos"] {
             assert!(
@@ -3102,6 +3185,34 @@ mod tests {
         let queued = frame_rx.try_recv().expect("queued pre-mute frame");
         assert_eq!(queued.mute_epoch, 0);
         assert_ne!(queued.mute_epoch, controls.mute_epoch());
+    }
+
+    #[test]
+    fn cue_pause_drops_only_new_pcm_and_keeps_recognition_epoch() {
+        let (frame_tx, frame_rx) = mpsc::sync_channel(INPUT_QUEUE_FRAMES);
+        let controls = VoiceInputControls::default();
+        let runtime = VoiceInputRuntime {
+            frame_tx,
+            controls: controls.clone(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            discard_on_shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_mute_epoch: Arc::new(AtomicU64::new(0)),
+            worker: None,
+        };
+        runtime.try_push_frame(silence_frame()).unwrap();
+        let before = frame_rx.try_recv().unwrap();
+        let cue = controls
+            .begin_cue_activity(InputDuringTtsPolicy::SuppressInput, None)
+            .unwrap();
+        runtime.try_push_frame(silence_frame()).unwrap();
+        assert!(frame_rx.try_recv().is_err());
+        assert_eq!(before.mute_epoch, controls.mute_epoch());
+        drop(cue);
+        runtime.try_push_frame(silence_frame()).unwrap();
+        let after = frame_rx.try_recv().unwrap();
+        assert_eq!(before.mute_epoch, after.mute_epoch);
+        runtime.signal_shutdown(false);
+        assert!(!runtime.discard_on_shutdown.load(Ordering::Acquire));
     }
 
     #[test]

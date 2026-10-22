@@ -5158,6 +5158,7 @@ mod tests {
             }),
             input_policy: Some(InputDuringTtsPolicy::SuppressInput),
             status_sounds: None,
+            ..Default::default()
         }
     }
 
