@@ -61,6 +61,10 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
             .and_then(|(_, saved)| saved.status_sounds)
             .unwrap_or_default(),
         status: None,
+        vad_debug_sounds: options
+            .saved
+            .as_ref()
+            .is_some_and(|(_, saved)| saved.vad_debug_sounds),
     }));
     let mut session = SessionStart {
         saved: options.saved.clone(),
@@ -530,6 +534,7 @@ fn tts_arguments(settings: &berd_call::TtsSettings, arguments: &[String]) -> Vec
 /// The call's status sounds, kept across session restarts.
 #[derive(Clone, Copy, Default)]
 struct StatusSounds {
+    vad_debug_sounds: bool,
     mode: berd_call::StatusSoundMode,
     // Unknown until a host reports it, so a call nothing reports on stays silent.
     status: Option<berd_call::ConversationStatus>,
@@ -554,6 +559,10 @@ enum ControlCommand {
     },
     Muted {
         muted: bool,
+        response: SyncSender<Result<Value, String>>,
+    },
+    VadDebugSounds {
+        enabled: bool,
         response: SyncSender<Result<Value, String>>,
     },
     StatusSounds {
@@ -822,6 +831,11 @@ impl HostControl for SessionControl {
         self.status()
     }
 
+    fn set_vad_debug_sounds(&self, enabled: bool) -> Result<Value, String> {
+        self.request(|response| ControlCommand::VadDebugSounds { enabled, response })?;
+        self.status()
+    }
+
     fn set_status_sounds(
         &self,
         mode: Option<berd_call::StatusSoundMode>,
@@ -896,6 +910,7 @@ impl HostControl for SessionControl {
             "nonBlocking": self.non_blocking.load(Ordering::SeqCst),
             "muted": self.muted.load(Ordering::SeqCst),
             "statusSounds": sounds.mode,
+            "vadDebugSounds": sounds.vad_debug_sounds,
             "conversationStatus": sounds.status,
             "sessionArguments": &self.session_arguments[1..],
         }))
@@ -972,6 +987,7 @@ enum SavedPreference {
     Spokesperson,
     InputPolicy,
     StatusSounds(berd_call::StatusSoundMode),
+    VadDebugSounds(bool),
 }
 
 struct SessionActor {
@@ -1003,7 +1019,14 @@ struct SessionActor {
     muted: Arc<AtomicBool>,
     status_sounds: Arc<Mutex<StatusSounds>>,
     // Requested sounds and any mode change, committed when the session applies them.
-    pending_status_sounds: BTreeMap<u64, (StatusSounds, Option<berd_call::StatusSoundMode>)>,
+    pending_status_sounds: BTreeMap<
+        u64,
+        (
+            StatusSounds,
+            Option<berd_call::StatusSoundMode>,
+            Option<bool>,
+        ),
+    >,
     suppress_startup_persist: bool,
     // Immediate requested mute gates capture before the child acknowledges it.
     // Native callbacks and manual controls write it; `muted` above holds only
@@ -1015,6 +1038,54 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    fn change_sounds(
+        &mut self,
+        mode: Option<berd_call::StatusSoundMode>,
+        status: Option<berd_call::ConversationStatus>,
+        debug: Option<bool>,
+        response: SyncSender<Result<Value, String>>,
+    ) -> Result<(), String> {
+        // Build on the newest request, since the session applies them in order.
+        let latest = match self.pending_status_sounds.last_key_value() {
+            Some((_, (sounds, _, _))) if !self.stopping => *sounds,
+            _ => *self
+                .status_sounds
+                .lock()
+                .map_err(|_| "status sounds lock failed")?,
+        };
+        let sounds = StatusSounds {
+            mode: mode.unwrap_or(latest.mode),
+            vad_debug_sounds: debug.unwrap_or(latest.vad_debug_sounds),
+            status: status.or(latest.status),
+        };
+        // A stopping child may already have exited; a restarted session
+        // is sent the committed status when it starts.
+        let sent = if self.stopping {
+            None
+        } else {
+            self.send_status_sounds(if debug.is_some() && sounds.status.is_none() {
+                StatusSounds {
+                    mode: berd_call::StatusSoundMode::Off,
+                    status: Some(berd_call::ConversationStatus::Waiting),
+                    ..sounds
+                }
+            } else {
+                sounds
+            })?
+        };
+        match sent {
+            Some(id) => {
+                self.pending_status_sounds.insert(id, (sounds, mode, debug));
+                self.pending_settings.insert(id, response);
+            }
+            None => {
+                self.commit_status_sounds(sounds, mode, debug);
+                let _ = response.send(Ok(json!({})));
+            }
+        }
+        Ok(())
+    }
+
     fn restore_input_mute(&mut self) -> Result<(), String> {
         // Restore current capture intent rather than stale acknowledged state.
         let (muted, mute_epoch) = crate::system_input_mute::mute_state_snapshot(
@@ -1038,9 +1109,12 @@ impl SessionActor {
 
     /// Tells the session its status sounds, once a host has said whether the agent is working.
     fn send_status_sounds(&mut self, sounds: StatusSounds) -> Result<Option<u64>, String> {
-        let Some(status) = sounds.status else {
+        if sounds.status.is_none() && !sounds.vad_debug_sounds {
             return Ok(None);
-        };
+        }
+        let status = sounds
+            .status
+            .unwrap_or(berd_call::ConversationStatus::Waiting);
         let id = self.next_id();
         send_request(
             &self.writer,
@@ -1048,7 +1122,12 @@ impl SessionActor {
                 id,
                 status,
                 settings: berd_call::StatusSoundSettings {
-                    mode: sounds.mode,
+                    mode: if sounds.status.is_some() {
+                        sounds.mode
+                    } else {
+                        berd_call::StatusSoundMode::Off
+                    },
+                    vad_debug_sounds: sounds.vad_debug_sounds,
                     ..Default::default()
                 },
             },
@@ -1060,9 +1139,13 @@ impl SessionActor {
         &mut self,
         sounds: StatusSounds,
         mode: Option<berd_call::StatusSoundMode>,
+        debug: Option<bool>,
     ) {
         if let Ok(mut committed) = self.status_sounds.lock() {
             *committed = sounds;
+        }
+        if let Some(enabled) = debug {
+            self.persist_settings(SavedPreference::VadDebugSounds(enabled));
         }
         if let Some(mode) = mode {
             self.persist_settings(SavedPreference::StatusSounds(mode));
@@ -1311,41 +1394,14 @@ impl SessionActor {
                 )?;
                 self.pending_settings.insert(id, response);
             }
+            ControlCommand::VadDebugSounds { enabled, response } => {
+                self.change_sounds(None, None, Some(enabled), response)?
+            }
             ControlCommand::StatusSounds {
                 mode,
                 status,
                 response,
-            } => {
-                // Build on the newest request, since the session applies them in order.
-                let latest = match self.pending_status_sounds.last_key_value() {
-                    Some((_, (sounds, _))) if !self.stopping => *sounds,
-                    _ => *self
-                        .status_sounds
-                        .lock()
-                        .map_err(|_| "status sounds lock failed")?,
-                };
-                let sounds = StatusSounds {
-                    mode: mode.unwrap_or(latest.mode),
-                    status: status.or(latest.status),
-                };
-                // A stopping child may already have exited; a restarted session
-                // is sent the committed status when it starts.
-                let sent = if self.stopping {
-                    None
-                } else {
-                    self.send_status_sounds(sounds)?
-                };
-                match sent {
-                    Some(id) => {
-                        self.pending_status_sounds.insert(id, (sounds, mode));
-                        self.pending_settings.insert(id, response);
-                    }
-                    None => {
-                        self.commit_status_sounds(sounds, mode);
-                        let _ = response.send(Ok(json!({})));
-                    }
-                }
-            }
+            } => self.change_sounds(mode, status, None, response)?,
             ControlCommand::TtsSettings {
                 settings,
                 expected_revision,
@@ -1576,8 +1632,8 @@ impl SessionActor {
                 }
             }
             SessionMessage::ConversationStatusApplied { id, .. } => {
-                if let Some((sounds, mode)) = self.pending_status_sounds.remove(&id) {
-                    self.commit_status_sounds(sounds, mode);
+                if let Some((sounds, mode, debug)) = self.pending_status_sounds.remove(&id) {
+                    self.commit_status_sounds(sounds, mode, debug);
                 }
                 if let Some(response) = self.pending_settings.remove(&id) {
                     let _ = response.send(Ok(json!({})));
@@ -1791,6 +1847,15 @@ impl SessionActor {
         let Ok(session) = self.session.lock() else {
             return;
         };
+        if let SavedPreference::VadDebugSounds(enabled) = changed {
+            saved.vad_debug_sounds = enabled;
+            if let Err(error) =
+                crate::saved_settings::update(path, |latest| latest.vad_debug_sounds = enabled)
+            {
+                eprintln!("berd-call: VAD debug sounds applied but could not be saved: {error}");
+            }
+            return;
+        }
         if let SavedPreference::StatusSounds(mode) = changed {
             saved.status_sounds = Some(mode);
             if let Err(error) =
@@ -1834,7 +1899,9 @@ impl SessionActor {
                 latest.tts = saved.tts.clone();
             }
             SavedPreference::InputPolicy => latest.input_policy = saved.input_policy,
-            SavedPreference::Spokesperson | SavedPreference::StatusSounds(_) => {
+            SavedPreference::Spokesperson
+            | SavedPreference::StatusSounds(_)
+            | SavedPreference::VadDebugSounds(_) => {
                 unreachable!("saved above")
             }
         }) {
@@ -3383,6 +3450,54 @@ mod tests {
     }
 
     #[test]
+    fn debug_sound_changes_wait_for_ack_and_preserve_unknown_host_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let (_commands_tx, commands) = mpsc::sync_channel(1);
+        let (audio, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio);
+        actor.saved = Some((path.clone(), Default::default()));
+        for enabled in [true, false] {
+            let (response, result) = mpsc::sync_channel(1);
+            actor
+                .handle_command(ControlCommand::VadDebugSounds { enabled, response })
+                .unwrap();
+            assert!(result.try_recv().is_err());
+            assert_eq!(
+                actor.status_sounds.lock().unwrap().vad_debug_sounds,
+                !enabled
+            );
+            let id = *actor.pending_settings.keys().next().unwrap();
+            actor
+                .handle_event(SessionMessage::ConversationStatusApplied {
+                    id,
+                    status: berd_call::ConversationStatus::Waiting,
+                    settings: berd_call::StatusSoundSettings {
+                        mode: berd_call::StatusSoundMode::Off,
+                        vad_debug_sounds: enabled,
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+            result.try_recv().unwrap().unwrap();
+            assert_eq!(
+                crate::saved_settings::load(&path).unwrap().vad_debug_sounds,
+                enabled
+            );
+            assert!(actor.status_sounds.lock().unwrap().status.is_none());
+        }
+        drop(actor);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
     fn status_sounds_wait_for_a_reported_status_and_save_their_mode() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
@@ -3455,6 +3570,7 @@ mod tests {
         let mut actor = test_actor(writer, events, commands, audio);
         actor.saved = Some((path.clone(), Default::default()));
         *actor.status_sounds.lock().unwrap() = StatusSounds {
+            vad_debug_sounds: false,
             mode: berd_call::StatusSoundMode::Working,
             status: Some(berd_call::ConversationStatus::Working),
         };
@@ -5159,6 +5275,7 @@ mod tests {
             }),
             input_policy: Some(InputDuringTtsPolicy::SuppressInput),
             status_sounds: None,
+            vad_debug_sounds: false,
         }
     }
 
