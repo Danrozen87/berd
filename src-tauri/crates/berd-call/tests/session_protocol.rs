@@ -2904,7 +2904,7 @@ fn siri_session_reaches_ready_without_openai_credentials() {
     stdin.flush().unwrap();
     let ready = receive();
     assert_eq!(ready["type"], "ready");
-    assert_eq!(ready["protocol"], 6);
+    assert_eq!(ready["protocol"], 7);
     assert_eq!(ready["session"]["tts"]["backend"], "siri");
     assert_eq!(ready["session"]["tts"]["voice"], voice);
     assert_eq!(ready["session"]["tts"]["language"], language);

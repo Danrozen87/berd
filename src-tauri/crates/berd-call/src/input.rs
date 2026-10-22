@@ -1515,7 +1515,7 @@ fn mac_speech_worker(
     let mut vad = earshot::Detector::new(earshot::DefaultPredictor::new());
     let mut input_48k = Vec::new();
     let mut leftover_16k = Vec::new();
-    let mut silence_frames = 0;
+    let mut gate = crate::detection::SpeechGate::default();
     let mut in_speech = false;
     let mut observed_epoch = controls.mute_epoch();
     let mut pending = PendingRecognitions::new();
@@ -1548,7 +1548,7 @@ fn mac_speech_worker(
             settle_deadline = None;
             input_48k.clear();
             leftover_16k.clear();
-            silence_frames = 0;
+            gate = crate::detection::SpeechGate::default();
             vad = earshot::Detector::new(earshot::DefaultPredictor::new());
             match new_mac_recognizer(&hints) {
                 Ok((next, next_events)) => {
@@ -1578,7 +1578,7 @@ fn mac_speech_worker(
             }
             input_48k.clear();
             leftover_16k.clear();
-            silence_frames = 0;
+            gate = crate::detection::SpeechGate::default();
             if std::mem::take(&mut in_speech) {
                 let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(false));
             }
@@ -1626,24 +1626,22 @@ fn mac_speech_worker(
                 let clamped = clamp_vad_frame(&frame);
                 let detected =
                     vad.predict_f32(&clamped) > controls.vad_threshold(speech_vad_threshold);
-                controls.observe_detection(detected, observed_epoch);
-                if detected {
-                    silence_frames = 0;
-                    if !in_speech {
-                        in_speech = true;
+                let timing = controls
+                    .detection()
+                    .map(|snapshot| snapshot.settings.timing)
+                    .unwrap_or_default();
+                let active = gate.observe(detected, timing);
+                controls.observe_detection(active && detected, observed_epoch);
+                if active != in_speech {
+                    in_speech = active;
+                    if active {
                         if begin_mac_turn(&mut pending, &events, &mut settle_deadline).is_err() {
                             return;
                         }
-                        let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(true));
-                    }
-                } else if in_speech {
-                    silence_frames += 1;
-                    if silence_frames >= SILENCE_FLUSH_FRAMES {
-                        silence_frames = 0;
-                        in_speech = false;
+                    } else {
                         end_mac_turn(&pending, &mut settle_deadline, Instant::now());
-                        let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(false));
                     }
+                    let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(active));
                 }
             }
         }
@@ -3217,6 +3215,7 @@ mod tests {
     fn applied_detection_settings_survive_playback_guards_and_reject_invalid_updates() {
         let controls = VoiceInputControls::default();
         let settings = crate::detection::DetectionSettings {
+            timing: Default::default(),
             listening: crate::detection::Threshold {
                 value: 0.81,
                 dynamic: true,

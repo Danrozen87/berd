@@ -2348,6 +2348,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     config.endpoints.stt.as_deref(),
                     &config.stt_hints,
                     berd_call::detection::DetectionSettings {
+                        timing: Default::default(),
                         listening: berd_call::detection::Threshold {
                             value: config.listening_threshold,
                             dynamic: config.dynamic_listening,

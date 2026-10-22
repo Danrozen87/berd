@@ -15,6 +15,51 @@ pub struct Threshold {
 pub struct DetectionSettings {
     pub listening: Threshold,
     pub interruption: Threshold,
+    #[serde(default)]
+    pub timing: VadTiming,
+}
+
+/// Apple recognition keeps receiving audio while these local activity gates settle.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VadTiming {
+    pub onset_ms: u32,
+    pub release_ms: u32,
+}
+
+impl Default for VadTiming {
+    fn default() -> Self {
+        Self {
+            onset_ms: 16,
+            release_ms: 300,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SpeechGate {
+    active: bool,
+    speech_frames: u32,
+    silence_frames: u32,
+}
+
+impl SpeechGate {
+    pub fn observe(&mut self, detected: bool, timing: VadTiming) -> bool {
+        if detected {
+            self.silence_frames = 0;
+            self.speech_frames = self.speech_frames.saturating_add(1);
+            if self.speech_frames >= timing.onset_ms.div_ceil(16).max(1) {
+                self.active = true;
+            }
+        } else {
+            self.speech_frames = 0;
+            self.silence_frames = self.silence_frames.saturating_add(1);
+            if self.silence_frames >= timing.release_ms.div_ceil(16).max(1) {
+                self.active = false;
+            }
+        }
+        self.active
+    }
 }
 
 pub fn is_detection_flag(flag: &str) -> bool {
@@ -57,6 +102,7 @@ fn filter_arguments(arguments: &[String], detection: bool) -> Vec<String> {
 impl Default for DetectionSettings {
     fn default() -> Self {
         Self {
+            timing: VadTiming::default(),
             listening: Threshold {
                 value: 0.5,
                 dynamic: false,
@@ -71,6 +117,11 @@ impl Default for DetectionSettings {
 
 impl DetectionSettings {
     pub fn validate(self) -> Result<Self, String> {
+        if !(16..=1000).contains(&self.timing.onset_ms)
+            || !(16..=3000).contains(&self.timing.release_ms)
+        {
+            return Err("VAD onset must be 16 to 1000 ms and release 16 to 3000 ms".into());
+        }
         for threshold in [self.listening, self.interruption] {
             if !threshold.value.is_finite() || !(0.0..=1.0).contains(&threshold.value) {
                 return Err("speech thresholds must be finite and between 0 and 1".into());
@@ -194,8 +245,45 @@ impl DetectionTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gate_requires_consecutive_onset_and_release_frames() {
+        let mut gate = SpeechGate::default();
+        let timing = VadTiming {
+            onset_ms: 32,
+            release_ms: 48,
+        };
+        assert!(!gate.observe(true, timing));
+        assert!(!gate.observe(false, timing));
+        assert!(!gate.observe(true, timing));
+        assert!(gate.observe(true, timing));
+        assert!(gate.observe(false, timing));
+        assert!(gate.observe(false, timing));
+        assert!(!gate.observe(false, timing));
+    }
+
+    #[test]
+    fn legacy_profiles_get_default_timing_and_invalid_timing_is_rejected() {
+        let settings: DetectionSettings =
+            serde_json::from_str(r#"{"listening":{"value":0.5},"interruption":{"value":0.65}}"#)
+                .unwrap();
+        assert_eq!(settings.timing, VadTiming::default());
+        for timing in [
+            VadTiming {
+                onset_ms: 0,
+                release_ms: 300,
+            },
+            VadTiming {
+                onset_ms: 16,
+                release_ms: 3001,
+            },
+        ] {
+            assert!(DetectionSettings { timing, ..settings }.validate().is_err());
+        }
+    }
+
     fn tuner() -> DetectionTuner {
         DetectionTuner::new(DetectionSettings {
+            timing: VadTiming::default(),
             listening: Threshold {
                 value: 0.5,
                 dynamic: true,
