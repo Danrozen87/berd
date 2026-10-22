@@ -102,7 +102,7 @@ pub fn candidates(baseline: DetectionSettings) -> Result<Vec<Candidate>, String>
     Ok(result)
 }
 
-fn losses(scores: &Scores) -> [u64; 8] {
+fn losses(scores: &Scores) -> [u64; 6] {
     [
         scores.missed_speech_ms,
         scores.speech_onset.missed,
@@ -110,20 +110,6 @@ fn losses(scores: &Scores) -> [u64; 8] {
         scores.speech_fragments,
         scores.false_activity_ms,
         scores.silent_reply_held_ms,
-        scores
-            .speech_onset
-            .samples_ms
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0),
-        scores
-            .interruption_detection
-            .samples_ms
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0),
     ]
 }
 
@@ -132,12 +118,12 @@ fn no_regression(before: &Scores, after: &Scores) -> bool {
         && before.speech_onset.excluded == after.speech_onset.excluded
         && before.interruption_detection.excluded == after.interruption_detection.excluded
         && after.uncertain_ms == 0
-        && losses(before).iter().zip(losses(after)).all(|(b, a)| a <= *b)
-        // Preserve every measured utterance, not merely the worst latency.
-        && before.speech_onset.samples_ms.len() == after.speech_onset.samples_ms.len()
-        && before.interruption_detection.samples_ms.len() == after.interruption_detection.samples_ms.len()
-        && before.speech_onset.samples_ms.iter().zip(&after.speech_onset.samples_ms).all(|(b,a)| a <= b)
-        && before.interruption_detection.samples_ms.iter().zip(&after.interruption_detection.samples_ms).all(|(b,a)| a <= b)
+        && losses(before)
+            .iter()
+            .zip(losses(after))
+            .all(|(b, a)| a <= *b)
+    // Comparison additionally preserves each baseline-active checked speech
+    // frame, preventing delayed onsets or lost utterances behind aggregate gains.
 }
 
 fn improvement(comparisons: &[Comparison], held_out: bool) -> u128 {
@@ -204,6 +190,8 @@ fn checked_duration(input: &ReplayInput, speech: bool, mode: Option<Mode>) -> u6
 /// Partition membership must be assigned before optimization, using independent
 /// recording sessions. Callers must also group inputs by device/profile identity.
 /// Inferred annotations are retained in reports but never count as checked truth.
+/// Baseline numeric thresholds are replayed statically; dynamic adaptation and
+/// counterfactual recognizer reset schedules are not simulated.
 pub fn evaluate(
     inputs: &[ReplayInput],
     baseline: DetectionSettings,
@@ -267,6 +255,7 @@ pub fn evaluate_grouped(
     let mut static_baseline = baseline;
     static_baseline.listening.dynamic = false;
     static_baseline.interruption.dynamic = false;
+    output.baseline = static_baseline;
     let reference = Candidate {
         name: "baseline".into(),
         settings: static_baseline,
