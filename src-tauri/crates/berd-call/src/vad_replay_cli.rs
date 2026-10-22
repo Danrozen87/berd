@@ -1,3 +1,5 @@
+use berd_call::capture_replay::Annotations;
+use berd_call::failure_fixtures;
 use berd_call::vad_replay::{replay, Candidate, ReplayInput};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -27,17 +29,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let rows = read_jsonl(&root.join("vad.jsonl"))?;
         let events = read_jsonl(&root.join("events.jsonl"))?;
         let input = berd_call::capture_replay::convert(&manifest, &rows, &events, annotations)?;
-        let wav =
-            hound::WavReader::open(root.join("mic.wav")).map_err(|error| error.to_string())?;
-        let spec = wav.spec();
-        if spec.sample_rate != 48000
-            || spec.channels != 1
-            || spec.bits_per_sample != 16
-            || spec.sample_format != hound::SampleFormat::Int
-        {
-            return Err("capture mic.wav must be mono 48 kHz PCM16".into());
-        }
-        let samples = u64::from(wav.duration());
+        let samples = u64::from(open_mic(root)?.duration());
         if rows
             .iter()
             .filter_map(|row| row["mic_sample"].as_u64())
@@ -50,6 +42,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         println!();
         return Ok(());
+    }
+
+    if args.first().is_some_and(|value| value == "extract") {
+        let held_out = match args {
+            [_, _, _, flag, partition] if flag == "--partition" => match partition.as_str() {
+                "train" => false,
+                "held-out" => true,
+                _ => return Err(EXTRACT_USAGE.into()),
+            },
+            _ => return Err(EXTRACT_USAGE.into()),
+        };
+        return extract(Path::new(&args[1]), Path::new(&args[2]), held_out);
     }
 
     if args.first().is_some_and(|value| value == "events") {
@@ -120,7 +124,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     output.flush().map_err(|error| error.to_string())
 }
 
-fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+fn read_text(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut bytes = String::new();
     file.take(MAX_INPUT + 1)
@@ -129,9 +133,139 @@ fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>, String> {
     if bytes.len() as u64 > MAX_INPUT {
         return Err("capture trace exceeds 128 MiB".into());
     }
-    bytes
-        .lines()
+    Ok(bytes)
+}
+
+fn parse_lines(path: &Path, text: &str) -> Result<Vec<serde_json::Value>, String> {
+    text.lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    parse_lines(path, &read_text(path)?)
+}
+
+fn open_mic(root: &Path) -> Result<hound::WavReader<std::io::BufReader<std::fs::File>>, String> {
+    let wav = hound::WavReader::open(root.join("mic.wav")).map_err(|error| error.to_string())?;
+    let spec = wav.spec();
+    if spec.sample_rate != 48000
+        || spec.channels != 1
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err("capture mic.wav must be mono 48 kHz PCM16".into());
+    }
+    Ok(wav)
+}
+
+const EXTRACT_USAGE: &str =
+    "usage: berd-call vad-replay extract CAPTURE_DIR OUT_DIR --partition train|held-out";
+
+/// Each fixture directory holds fixture.json (provenance and findings), input.json
+/// (clip-relative replay input), the clip's mic.wav from provenance.source_sample_offset,
+/// and verbatim source-timeline slices of vad.jsonl and events.jsonl.
+fn extract(root: &Path, out: &Path, held_out: bool) -> Result<(), String> {
+    let manifest = read_json(&root.join("manifest.json"))?;
+    let labels_path = root.join("labels.json");
+    let labels = if labels_path.exists() {
+        let annotations: Annotations = read_json(&labels_path)?;
+        if annotations.schema_version != 1 || annotations.held_out != held_out {
+            return Err("labels.json must be schema 1 and match --partition".into());
+        }
+        annotations.labels
+    } else {
+        vec![]
+    };
+    let (vad_path, events_path) = (root.join("vad.jsonl"), root.join("events.jsonl"));
+    let (vad, events) = (read_text(&vad_path)?, read_text(&events_path)?);
+    let rows = parse_lines(&vad_path, &vad)?;
+    let records = parse_lines(&events_path, &events)?;
+    let (vad, events): (Vec<&str>, Vec<&str>) = (vad.lines().collect(), events.lines().collect());
+    let mut mic = open_mic(root)?;
+    let extraction = failure_fixtures::extract(
+        &manifest,
+        &rows,
+        &records,
+        u64::from(mic.duration()),
+        held_out,
+        &labels,
+        &failure_fixtures::ExtractPolicy::default(),
+    )?;
+    let spec = mic.spec();
+    std::fs::create_dir_all(out).map_err(|error| error.to_string())?;
+    // Check every destination before writing any, so a rerun never leaves a partial set.
+    for fixture in &extraction.fixtures {
+        let id = &fixture.input.session_id;
+        if id.starts_with('.')
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_@".contains(&byte))
+        {
+            return Err(format!("unsafe fixture id {id:?}"));
+        }
+        if out.join(id).exists() {
+            return Err(format!("{} already exists", out.join(id).display()));
+        }
+    }
+    let mut summary = Vec::new();
+    for fixture in &extraction.fixtures {
+        let id = &fixture.input.session_id;
+        let dir = out.join(id);
+        let fail = |error: &dyn std::fmt::Display| format!("{}: {error}", dir.display());
+        std::fs::create_dir(&dir).map_err(|error| fail(&error))?;
+        for (name, json) in [
+            ("fixture.json", serde_json::to_vec_pretty(fixture)),
+            ("input.json", serde_json::to_vec(&fixture.input)),
+        ] {
+            let json = json.map_err(|error| fail(&error))?;
+            std::fs::write(dir.join(name), json).map_err(|error| fail(&error))?;
+        }
+        for (name, source, indices) in [
+            ("vad.jsonl", &vad, fixture.vad_lines.clone()),
+            (
+                "events.jsonl",
+                &events,
+                fixture.event_lines.clone().collect(),
+            ),
+        ] {
+            let text: String = indices
+                .iter()
+                .map(|&line| format!("{}\n", source[line]))
+                .collect();
+            std::fs::write(dir.join(name), text).map_err(|error| fail(&error))?;
+        }
+        let provenance = &fixture.provenance;
+        let offset =
+            u32::try_from(provenance.source_sample_offset).map_err(|error| fail(&error))?;
+        mic.seek(offset).map_err(|error| fail(&error))?;
+        let mut wav =
+            hound::WavWriter::create(dir.join("mic.wav"), spec).map_err(|error| fail(&error))?;
+        for sample in mic
+            .samples::<i16>()
+            .take((provenance.source_sample_end - provenance.source_sample_offset) as usize)
+        {
+            wav.write_sample(sample.map_err(|error| fail(&error))?)
+                .map_err(|error| fail(&error))?;
+        }
+        wav.finalize().map_err(|error| fail(&error))?;
+        summary.push(serde_json::json!({
+            "session_id": id,
+            "start": provenance.start,
+            "context_truncated": provenance.context_truncated,
+            "findings": fixture.findings.iter().map(|finding| finding.kind).collect::<Vec<_>>(),
+        }));
+    }
+    serde_json::to_writer(
+        std::io::stdout().lock(),
+        &serde_json::json!({
+            "source_session": extraction.source_session,
+            "fixtures": summary,
+            "excluded": extraction.excluded,
+        }),
+    )
+    .map_err(|error| error.to_string())?;
+    println!();
+    Ok(())
 }

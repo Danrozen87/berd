@@ -261,3 +261,111 @@ fn leading_partial_frame_preserves_gate_history_without_scoring_padding() {
     assert_eq!(report.scores.gap_ms, 0);
     assert_eq!(report.scores.speech_onset.samples_ms, vec![26]);
 }
+
+#[test]
+fn extraction_writes_offset_clips_with_verbatim_slices_and_explicit_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("capture");
+    std::fs::create_dir(&root).unwrap();
+    let write = |name: &str, text: String| std::fs::write(root.join(name), text).unwrap();
+    write("manifest.json", json!({"schema":"berd-call-capture/1","started_unix_ms":42,"mic":{"sample_rate":48000},"session":{"stt_backend":"macos","continuous_recognition":true}}).to_string());
+    // Quiet, then speech that releases and resumes within a second, then quiet.
+    let probabilities: Vec<f64> = [0.0; 300]
+        .into_iter()
+        .chain([0.9; 10])
+        .chain([0.3; 25])
+        .chain([0.9; 10])
+        .chain([0.0; 100])
+        .collect();
+    let mut rows = vec![json!({"us":0,"type":"settings","revision":0,"settings":settings(0.5)})];
+    // With 16 ms onset and release, the gate follows each detection.
+    for (index, &probability) in probabilities.iter().enumerate() {
+        let detected = probability > 0.5;
+        rows.push(json!({"us":index * 16000 + 1,"mic_sample":100 + 768 * (index + 1),"vad_frame":index,"epoch":0,"generation":1,"mode":"listening","probability":probability,"threshold":0.5,"detected":detected,"active":detected,"settings_revision":0}));
+    }
+    let samples = 100 + 768 * probabilities.len();
+    let events: Vec<Value> = (0..samples / 960)
+        .step_by(10)
+        .map(|frame| json!({"us":frame * 20000,"frame":frame,"type":"clock"}))
+        .collect();
+    let lines = |values: &[Value]| {
+        values
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>()
+    };
+    write("vad.jsonl", lines(&rows));
+    write("events.jsonl", lines(&events));
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 48000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut wav = hound::WavWriter::create(root.join("mic.wav"), spec).unwrap();
+    for sample in 0..samples {
+        wav.write_sample((sample % 30000) as i16).unwrap();
+    }
+    wav.finalize().unwrap();
+    let out = dir.path().join("fixtures");
+    let extract = |partition: &str| {
+        Command::new(env!("CARGO_BIN_EXE_berd-call"))
+            .args(["vad-replay", "extract"])
+            .args([&root, &out])
+            .args(["--partition", partition])
+            .output()
+            .unwrap()
+    };
+    let output = extract("held-out");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["source_session"], "capture-42");
+    let [fixture] = summary["fixtures"].as_array().unwrap().as_slice() else {
+        panic!("{summary}")
+    };
+    assert_eq!(fixture["findings"], json!(["fragment"]));
+    assert_eq!(fixture["start"]["kind"], "quiet");
+    let clip = out.join(fixture["session_id"].as_str().unwrap());
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(clip.join("fixture.json")).unwrap()).unwrap();
+    let offset = meta["provenance"]["source_sample_offset"].as_u64().unwrap();
+    let end = meta["provenance"]["source_sample_end"].as_u64().unwrap();
+    assert_eq!(offset % 48, 0);
+    let audio: Vec<i16> = hound::WavReader::open(clip.join("mic.wav"))
+        .unwrap()
+        .samples::<i16>()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(audio.len() as u64, end - offset);
+    assert_eq!(audio[0], (offset % 30000) as i16);
+    let source = std::fs::read_to_string(root.join("vad.jsonl")).unwrap();
+    let slice = std::fs::read_to_string(clip.join("vad.jsonl")).unwrap();
+    assert!(slice
+        .lines()
+        .all(|line| source.lines().any(|source| source == line)));
+    assert!(slice.starts_with(source.lines().next().unwrap()));
+    let replayed = Command::new(env!("CARGO_BIN_EXE_berd-call"))
+        .args(["vad-replay"])
+        .arg(clip.join("input.json"))
+        .output()
+        .unwrap();
+    assert!(replayed.status.success());
+    let report: Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(report["held_out"], true);
+    assert_eq!(report["scores"]["gap_ms"], 0);
+    assert_eq!(report["decisions"][0]["end_ms"], 16);
+
+    // Re-extraction never overwrites, and labels must agree with the partition.
+    assert!(!extract("held-out").status.success());
+    write(
+        "labels.json",
+        json!({"schema_version":1,"session_id":"other","held_out":true,"labels":[]}).to_string(),
+    );
+    let output = extract("train");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
