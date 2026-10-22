@@ -17,6 +17,35 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().is_some_and(|value| value == "events") {
+        if args.len() != 2 {
+            return Err("usage: berd-call vad-replay events CAPTURE_DIR".into());
+        }
+        let root = Path::new(&args[1]);
+        let manifest: serde_json::Value = read_json(&root.join("manifest.json"))?;
+        if manifest["schema"] != "berd-call-capture/1" {
+            return Err("unsupported capture schema".into());
+        }
+        let file =
+            std::fs::File::open(root.join("events.jsonl")).map_err(|error| error.to_string())?;
+        let mut bytes = String::new();
+        file.take(MAX_INPUT + 1)
+            .read_to_string(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_INPUT {
+            return Err("capture events exceed 128 MiB".into());
+        }
+        let events: Vec<serde_json::Value> = bytes
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        let metrics = berd_call::capture_metrics::measure(&events)?;
+        serde_json::to_writer(std::io::stdout().lock(), &metrics)
+            .map_err(|error| error.to_string())?;
+        println!();
+        return Ok(());
+    }
     if args.len() != 1 && !(args.len() == 3 && args[1] == "--candidates") {
         return Err("usage: berd-call vad-replay INPUT.json [--candidates CANDIDATES.json]".into());
     }

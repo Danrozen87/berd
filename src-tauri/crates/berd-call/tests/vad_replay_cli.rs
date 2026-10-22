@@ -67,3 +67,40 @@ fn malformed_or_unsupported_input_fails_without_reports() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn real_cli_reads_capture_events_and_reports_recognition_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        r#"{"schema":"berd-call-capture/1"}"#,
+    )
+    .unwrap();
+    let events = [
+        json!({"us":0,"frame":0,"type":"out","message":{"type":"recognition_pending","active":true}}),
+        json!({"us":10,"frame":0,"type":"in","message":{"type":"prepare_speak","id":1}}),
+        json!({"us":50,"frame":0,"type":"out","message":{"type":"recognition_pending","active":false}}),
+        json!({"us":60,"frame":0,"type":"out","message":{"type":"admitted","id":1}}),
+    ];
+    std::fs::write(
+        dir.path().join("events.jsonl"),
+        events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_berd-call"))
+        .args(["vad-replay", "events", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["request_wait_with_recognition_pending_us"], 40);
+    assert_eq!(report["admitted_request_delays_us"], json!([50]));
+}

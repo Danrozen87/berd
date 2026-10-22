@@ -1,6 +1,6 @@
 # Offline VAD replay
 
-Proposed integration, October 22, 2026. This command evaluates continuous-recognition activity gates. Capture-directory ingestion is being coordinated with the recording implementation; the current fixture entry point accepts normalized JSON.
+This command evaluates continuous-recognition activity gates from normalized JSON fixtures and measures observed waiting from call capture event logs.
 
 Run `berd-call vad-replay INPUT.json --candidates CANDIDATES.json`. It emits JSONL, one report for the recorded settings followed by each named candidate, without opening a microphone or reading/writing live profiles. Candidate settings must be static. Recorded settings may include dynamic values because each frame records the values actually applied; replay does not simulate recognizer-driven learning.
 
@@ -13,3 +13,9 @@ Scores report human-checked speech missed and false activity durations at 16 ms 
 These reports do not estimate a changed conversation's playback schedule. In particular, original reply-ready intervals and modes are fixed evidence. Replaying a stronger gate might change later playback in reality. Compare candidates on held-out sessions, inspect missed speech alongside latency, and trial improvements live before promoting them. No candidate is promoted by this command.
 
 Each input file is capped at 128 MiB and a comparison at 64 candidates. Split long recordings into fixtures with preserved context and epoch boundaries. Raw recordings and fixtures stay local unless separately shared.
+
+Run `berd-call vad-replay events CAPTURE_DIR` to analyze a `berd-call-capture/1` directory's `events.jsonl`. It measures the union of outstanding prepare-request intervals, their overlaps with VAD and pending recognition (reported separately and together), and admitted-request delay samples. Pending/not-admitted outcomes end a request interval without a successful admission sample. Gaps and capture limits censor outstanding requests; the interval immediately before a gap is excluded because its events may be missing. Requests left open at file end are reported unresolved. Logs must be ordered by monotonic microseconds; malformed/unknown-version input fails instead of producing a success score.
+
+Request-wait overlap is observational. It includes preparation and other scheduling, so it is not proof of delay caused solely by VAD or recognition. The event analyzer uses the capture clock; normalized frame fixtures use the audio timeline. Converting the per-frame capture trace into candidate fixtures requires explicit sample/clock and epoch mapping. It must never infer timestamps by concatenating across muted/dropped input.
+
+Pending recognition can hold replies after VAD clears. The Apple worker currently uses VAD end to start a five-second no-result deadline, then cancels and recreates recognition. Gate replay cannot prove transcript preservation under changed reset policies. Those trials require original audio, repeated recognition runs against the current-policy baseline, and omission/duplicate/late-result evaluation.
