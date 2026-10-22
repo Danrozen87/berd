@@ -58,12 +58,12 @@ initial policy; a host-specific `auto` mode must be resolved before the request.
 {"type":"hello","id":1,"input_during_tts":"allow_barge_in","status_sound_output_device":"MacBook Pro Speakers"}
 ```
 
-The response uses `protocol:5` as the exact session message-set version. The
+The response uses `protocol:6` as the exact session message-set version. The
 parent must reject a version it does not support; the JSON version is independent
 of the fixed binary framing marker described below:
 
 ```json
-{"type":"ready","id":1,"protocol":5,"session":{"tts":{"revision":1,"backend":"siri","voice":"Aaron","language":"en-US","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}
+{"type":"ready","id":1,"protocol":6,"session":{"tts":{"revision":1,"backend":"siri","voice":"Aaron","language":"en-US","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}
 ```
 
 The `session.tts` object is the authoritative, sanitized TTS configuration.
@@ -397,3 +397,12 @@ receipts, flushes, and exits. EOF, malformed framing, fatal
 input failure, or process death cancels both authorities without transparent
 restart. A fatal error is flushed exactly once and followed by no protocol
 output.
+
+
+## Local speech detection (protocol 6)
+
+Conventional session readiness includes an optional `session.detection` snapshot with `settings.listening` and `settings.interruption` (`value`, `dynamic`), plus `adjustments`, `no_result` and `missed_detection` counters. These local controls are separate from Realtime Spokesperson turn detection.
+
+A host sends `{"type":"set_detection_settings","id":42,"settings":{"listening":{"value":0.7,"dynamic":true},"interruption":{"value":0.8,"dynamic":false}}}` to replace both settings atomically and discard stale input/learning evidence. The session returns `detection_settings_result` with that ID and an applied `snapshot`, or `snapshot:null` and a `message` explaining rejection. Invalid settings leave the current values unchanged. Dynamic choices require macOS STT.
+
+During adaptive tuning, the session sends `detection_settings_result` with `id:null` and the new snapshot. Hosts must handle these unsolicited updates, report applied values, and keep profile persistence associated with their actual input/output device pair. Protocol 6 advances the exact message-set version because protocol 5 hosts cannot parse these new messages.

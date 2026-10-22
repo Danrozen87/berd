@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn host_decodes_realtime_ready_snapshot() {
-        let message = r#"{"type":"ready","id":1,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-realtime-2.1","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#;
+        let message = r#"{"type":"ready","id":1,"protocol":6,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-realtime-2.1","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#;
         let decoded = serde_json::from_str::<SessionMessage>(message).unwrap();
         assert!(matches!(decoded, SessionMessage::Ready { id: 1, .. }));
     }
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionMessage::Ready {
                 id: 4,
-                protocol: 5,
+                protocol: 6,
                 session: VoiceSessionSnapshot {
                     detection: None,
                     tts: TtsConfigurationSnapshot {
@@ -447,7 +447,7 @@ mod tests {
                 },
             })
             .unwrap(),
-            r#"{"type":"ready","id":4,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
+            r#"{"type":"ready","id":4,"protocol":6,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-4o-mini-tts","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"},"spokesperson":{"revision":1,"backend":"openai","model":"gpt-realtime","voice":"cedar","rate":1.0}}}"#
         );
         assert_eq!(
             serde_json::from_str::<SessionRequest>(
