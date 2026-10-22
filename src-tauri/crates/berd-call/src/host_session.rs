@@ -952,7 +952,7 @@ struct PendingSpeak {
     non_blocking: bool,
     response: Option<SyncSender<Result<Value, String>>>,
     /// When the voice session was asked to speak, then how long it held the
-    /// speech while you talked and until its first audio was played.
+    /// speech while you talked and until the player accepted its first audio.
     prepared: Instant,
     held_ms: Option<u64>,
     first_audio_ms: Option<u64>,
