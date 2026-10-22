@@ -141,7 +141,11 @@ pub(crate) fn persistable_arguments(arguments: &[String]) -> Vec<String> {
         .filter(|pair| {
             !matches!(
                 pair[0].as_str(),
-                "--realtime-url" | "--stt-url" | "--tts-url" | "--stt-hint"
+                "--realtime-url"
+                    | "--stt-url"
+                    | "--tts-url"
+                    | "--spokesperson-options"
+                    | "--stt-hint"
             )
         })
         .flatten()
@@ -230,6 +234,27 @@ pub(crate) fn with_spokesperson(arguments: &[String], on: bool, direct: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_and_explicit_input_preferences_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for policy in [
+            InputDuringTtsPolicy::Auto,
+            InputDuringTtsPolicy::AllowBargeIn,
+            InputDuringTtsPolicy::SuppressInput,
+        ] {
+            save(
+                &path,
+                &SavedSettings {
+                    input_policy: Some(policy),
+                    ..SavedSettings::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(load(&path).unwrap().input_policy, Some(policy));
+        }
+    }
 
     #[test]
     fn saved_settings_survive_reopen_and_explicit_backend_clears_dependent_flags() {
