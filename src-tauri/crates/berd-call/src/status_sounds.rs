@@ -101,7 +101,6 @@ pub struct StatusSoundRuntime {
     next_tick: Option<Instant>,
     player: StatusSoundPlayer,
     output_device: Option<String>,
-    conversation_active: bool,
     input_controls: Option<crate::input::VoiceInputControls>,
 }
 
@@ -112,7 +111,6 @@ impl Default for StatusSoundRuntime {
             next_tick: None,
             player: StatusSoundPlayer::new(),
             output_device: None,
-            conversation_active: false,
             input_controls: None,
         }
     }
@@ -145,22 +143,18 @@ impl StatusSoundRuntime {
     fn update_conversation_activity(&mut self, conversation_active: bool) {
         if conversation_active {
             self.stop();
-        } else if self.conversation_active {
-            self.next_tick = Some(Instant::now());
         }
-        self.conversation_active = conversation_active;
     }
 
     pub fn poll(&mut self, conversation_active: bool) -> Result<bool, String> {
         self.update_conversation_activity(conversation_active);
-        if conversation_active {
-            self.player.reap();
-            return Ok(false);
-        }
         self.player.reap();
         let now = Instant::now();
         if self.next_tick.is_some_and(|deadline| now >= deadline) {
-            self.next_tick = Some(now + STATUS_SOUND_INTERVAL);
+            let deadline = self.next_tick.unwrap();
+            let elapsed = now.duration_since(deadline).as_nanos();
+            let ticks = elapsed / STATUS_SOUND_INTERVAL.as_nanos() + 1;
+            self.next_tick = Some(deadline + STATUS_SOUND_INTERVAL.mul_f64(ticks as f64));
             if let Some(cue) = self.machine.tick(conversation_active) {
                 self.player.play(
                     cue,
@@ -740,27 +734,33 @@ mod tests {
     }
 
     #[test]
-    fn working_cue_is_due_immediately_after_speech() {
+    fn speech_preserves_the_existing_cue_schedule() {
+        for status in [ConversationStatus::Working, ConversationStatus::Waiting] {
+            let mut runtime = StatusSoundRuntime::default();
+            runtime.update(status, settings(StatusSoundMode::WorkingAndWaiting));
+            let deadline = Instant::now() + STATUS_SOUND_INTERVAL;
+            runtime.next_tick = Some(deadline);
+            runtime.poll(true).unwrap();
+            runtime.update_conversation_activity(false);
+            assert_eq!(runtime.next_tick, Some(deadline));
+        }
+    }
+
+    #[test]
+    fn cues_due_during_speech_are_skipped_without_catching_up() {
         let mut runtime = StatusSoundRuntime::default();
         runtime.update(
             ConversationStatus::Working,
             settings(StatusSoundMode::Working),
         );
-        runtime.update_conversation_activity(true);
-        runtime.update_conversation_activity(false);
-        assert!(runtime.next_tick.unwrap() <= Instant::now());
-    }
-
-    #[test]
-    fn waiting_cue_is_due_immediately_after_speech() {
-        let mut runtime = StatusSoundRuntime::default();
-        runtime.update(
-            ConversationStatus::Waiting,
-            settings(StatusSoundMode::WorkingAndWaiting),
-        );
-        runtime.update_conversation_activity(true);
-        runtime.update_conversation_activity(false);
-        assert!(runtime.next_tick.unwrap() <= Instant::now());
+        let deadline = Instant::now() - Duration::from_secs(1);
+        runtime.next_tick = Some(deadline);
+        assert!(!runtime.poll(true).unwrap());
+        let next = runtime.next_tick.unwrap();
+        assert!(next > Instant::now());
+        assert_eq!(next, deadline + STATUS_SOUND_INTERVAL);
+        assert!(!runtime.poll(false).unwrap());
+        assert_eq!(runtime.next_tick, Some(next));
     }
 
     #[test]
