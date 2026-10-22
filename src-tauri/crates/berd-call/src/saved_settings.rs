@@ -106,6 +106,8 @@ fn validate_arguments(arguments: &[String]) -> Result<(), String> {
                     | "--spokesperson-rate"
                     | "--interruption-threshold"
                     | "--listening-threshold"
+                    | "--dynamic-listening"
+                    | "--dynamic-interruption"
             )
         })
     {

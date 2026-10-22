@@ -148,6 +148,7 @@ Usage:
 
 Each form also accepts:
     [--rate FLOAT] [--listening-threshold 0..1] [--interruption-threshold 0..1]
+    [--dynamic-listening true|false] [--dynamic-interruption true|false]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
@@ -156,6 +157,9 @@ Each form also accepts:
 --listening-threshold sets local speech detection before agent playback (default 0.5).
 --interruption-threshold sets local speech detection during agent playback (default 0.65).
 Higher values require stronger evidence of speech before pausing playback.
+Dynamic adjustment is experimental, off by default, and requires macOS STT.
+Each enabled threshold learns independently, moving by 0.01 within 0.10..0.95.
+Use detection-profile [--settings JSON] to read or save the default audio setup profile.
 
 The host owns microphone capture, audio playback, transcript delivery, and
 agent integration. See PROTOCOL.md for the framed stdin, stdout, and PCM

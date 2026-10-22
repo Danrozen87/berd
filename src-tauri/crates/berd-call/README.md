@@ -17,6 +17,16 @@ On macOS, a local speech detection also marks recognition pending. After local s
 
 Saved call arguments retain both values independently. To change a running call, supply its complete session configuration, for example `settings --restart --voice Aaron --language en-US --listening-threshold 0.8 --interruption-threshold 0.7`. Restart replaces the session options; include the existing backend, model, rate and other choices you want to retain.
 
+### Experimental dynamic tuning and audio profiles
+
+With macOS speech recognition, `--dynamic-listening true` and `--dynamic-interruption true` independently opt into outcome-based tuning. Both default to false. Each enabled threshold moves one 0.01 tick after three unmatched observations, at most once every 30 seconds. Dynamic values start and remain within 0.10 to 0.95; manual thresholds still accept 0 to 1.
+
+A local detection that settles without a nonempty transcript suggests raising sensitivity's threshold. A nonempty transcript after at least five seconds without local detection suggests lowering it. Recognized speech clears false-trigger evidence. Split-result grace periods, mode changes, mute/reset epochs and device changes discard ambiguous evidence. These are experimental heuristics: recognition failure and playback leakage can still mislead them. They do not establish an optimal threshold or replace acoustic echo cancellation.
+
+The standalone macOS host saves applied thresholds and dynamic choices in `detection-profiles.json` beside its saved settings, keyed by the stable input/output device UID pair. It restores the pair on call startup and checks for device changes once per second. A new pair starts with defaults during a call. Profile files contain settings, not audio recordings or transcript text. An explicit profile edit takes precedence over a late automatic update.
+
+`berd-call detection-profile` reports the default audio setup and saved choices without starting capture. `berd-call detection-profile --settings '{"listening":{"value":0.70,"dynamic":true},"interruption":{"value":0.80,"dynamic":false}}'` saves choices for that pair. During a call, `berd-call status` exposes applied values and evidence counters in `session.detection`, plus `audioSetup`. Saving a profile alone affects its next restoration; the plugin restarts the call session when a user changes a control. Dynamic adjustments apply during the current session.
+
 ## Command-line interface
 
 On macOS, install [Berd](https://github.com/block/berd/releases) first. Its

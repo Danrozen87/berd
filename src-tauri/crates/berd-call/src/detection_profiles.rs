@@ -1,0 +1,155 @@
+use berd_call::{detection::DetectionSettings, macos_audio_route::AudioSetup};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Profiles {
+    profiles: BTreeMap<String, DetectionSettings>,
+}
+
+pub fn path() -> Result<PathBuf, String> {
+    Ok(crate::saved_settings::path()?.with_file_name("detection-profiles.json"))
+}
+
+fn key(setup: &AudioSetup) -> String {
+    serde_json::to_string(&[&setup.input_uid, &setup.output_uid]).expect("device strings serialize")
+}
+
+fn read(path: &Path) -> Result<Profiles, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Profiles::default())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = Vec::new();
+    file.take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 65536 {
+        return Err("speech profiles exceed 64 KiB".into());
+    }
+    let profiles: Profiles = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if profiles.profiles.len() > 64 {
+        return Err("too many speech profiles".into());
+    }
+    for settings in profiles.profiles.values() {
+        settings.validate()?;
+    }
+    Ok(profiles)
+}
+
+pub fn load(path: &Path, setup: &AudioSetup) -> Result<Option<DetectionSettings>, String> {
+    Ok(read(path)?.profiles.get(&key(setup)).copied())
+}
+
+pub fn save(path: &Path, setup: &AudioSetup, settings: DetectionSettings) -> Result<(), String> {
+    write(path, setup, settings, None).map(|_| ())
+}
+
+pub fn save_if_unchanged(
+    path: &Path,
+    setup: &AudioSetup,
+    expected: Option<DetectionSettings>,
+    settings: DetectionSettings,
+) -> Result<bool, String> {
+    write(path, setup, settings, Some(expected))
+}
+
+fn write(
+    path: &Path,
+    setup: &AudioSetup,
+    settings: DetectionSettings,
+    expected: Option<Option<DetectionSettings>>,
+) -> Result<bool, String> {
+    settings.validate()?;
+    let parent = path
+        .parent()
+        .ok_or("speech profiles need a parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("json.lock"))
+        .map_err(|error| error.to_string())?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|error| error.to_string())?;
+    let mut profiles = read(path)?;
+    if expected.is_some_and(|expected| profiles.profiles.get(&key(setup)).copied() != expected) {
+        return Ok(false);
+    }
+    profiles.profiles.insert(key(setup), settings);
+    if profiles.profiles.len() > 64 {
+        return Err("too many speech profiles".into());
+    }
+    let bytes = serde_json::to_vec_pretty(&profiles).map_err(|error| error.to_string())?;
+    if bytes.len() > 65536 {
+        return Err("speech profiles exceed 64 KiB".into());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    file.persist(path).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn setup(input: &str, output: &str) -> AudioSetup {
+        AudioSetup {
+            input_uid: input.into(),
+            output_uid: output.into(),
+            input_name: "same display name".into(),
+            output_name: "same display name".into(),
+        }
+    }
+    #[test]
+    fn late_learning_cannot_overwrite_an_explicit_profile_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "output");
+        let original = DetectionSettings::default();
+        save(&path, &setup, original).unwrap();
+        let mut edited = original;
+        edited.listening.value = 0.77;
+        save(&path, &setup, edited).unwrap();
+        let mut learned = original;
+        learned.listening.value = 0.51;
+        assert!(!save_if_unchanged(&path, &setup, Some(original), learned).unwrap());
+        assert_eq!(load(&path, &setup).unwrap(), Some(edited));
+        assert!(save_if_unchanged(&path, &setup, Some(edited), learned).unwrap());
+    }
+
+    #[test]
+    fn profiles_are_isolated_by_both_stable_device_ids_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let airpods = setup("airpods-mic", "airpods-output");
+        let mixed = setup("mac-mic", "airpods-output");
+        let mut first = DetectionSettings::default();
+        first.listening.value = 0.71;
+        first.listening.dynamic = true;
+        let mut second = DetectionSettings::default();
+        second.interruption.value = 0.83;
+        save(&path, &airpods, first).unwrap();
+        save(&path, &mixed, second).unwrap();
+        assert_eq!(load(&path, &airpods).unwrap(), Some(first));
+        assert_eq!(load(&path, &mixed).unwrap(), Some(second));
+        assert_eq!(
+            load(&path, &setup("headset-mic", "headset-output")).unwrap(),
+            None
+        );
+        assert!(!std::fs::read_to_string(path)
+            .unwrap()
+            .contains("same display name"));
+    }
+}

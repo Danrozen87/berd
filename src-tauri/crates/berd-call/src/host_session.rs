@@ -435,6 +435,7 @@ fn start_session(
         .store(muted.load(Ordering::SeqCst), Ordering::SeqCst);
     actor.capture_muted = muted;
     actor.capture_mute_epoch = mute_epoch;
+    actor.restore_detection_profile()?;
     actor.system_input_mute = system_input_mute;
     if actor.system_input_mute.is_none() {
         match crate::system_input_mute::SystemInputMute::install(
@@ -912,6 +913,7 @@ impl HostControl for SessionControl {
             "statusSounds": sounds.mode,
             "conversationStatus": sounds.status,
             "sessionArguments": &self.session_arguments[1..],
+            "audioSetup": berd_call::macos_audio_route::default_audio_setup(),
         }))
     }
 
@@ -987,7 +989,16 @@ enum SavedPreference {
     StatusSounds(berd_call::StatusSoundMode),
 }
 
+struct ActiveDetectionProfile {
+    persisted: Option<berd_call::detection::DetectionSettings>,
+    setup: berd_call::macos_audio_route::AudioSetup,
+    path: std::path::PathBuf,
+    next_check: Instant,
+    pending: Option<u64>,
+}
+
 struct SessionActor {
+    detection_profile: Option<ActiveDetectionProfile>,
     saved: Option<(std::path::PathBuf, crate::saved_settings::SavedSettings)>,
     input_speaking: bool,
     recognition_pending: bool,
@@ -1098,6 +1109,7 @@ impl SessionActor {
             audio_commands,
             next_id: 2,
             pending_speak: None,
+            detection_profile: None,
             pending_settings: std::collections::HashMap::new(),
             spokesperson_settings: HashSet::new(),
             waiting_speaks: VecDeque::new(),
@@ -1178,8 +1190,77 @@ impl SessionActor {
         }
     }
 
+    fn restore_detection_profile(&mut self) -> Result<(), String> {
+        let detection = self
+            .session
+            .lock()
+            .map_err(|_| "session settings lock failed")?
+            .detection;
+        let Some(snapshot) = detection else {
+            return Ok(());
+        };
+        let Some(setup) = berd_call::macos_audio_route::default_audio_setup() else {
+            return Ok(());
+        };
+        let path = crate::detection_profiles::path()?;
+        let persisted = crate::detection_profiles::load(&path, &setup)?;
+        let settings = persisted.unwrap_or(snapshot.settings);
+        let id = self.next_id();
+        send_request(
+            &self.writer,
+            &SessionRequest::SetDetectionSettings { id, settings },
+        )?;
+        self.detection_profile = Some(ActiveDetectionProfile {
+            persisted,
+            setup,
+            path,
+            next_check: Instant::now() + Duration::from_secs(1),
+            pending: Some(id),
+        });
+        Ok(())
+    }
+
+    fn poll_detection_profile(&mut self) -> Result<(), String> {
+        let Some(profile) = self.detection_profile.as_mut() else {
+            return Ok(());
+        };
+        if profile.pending.is_some() || Instant::now() < profile.next_check {
+            return Ok(());
+        }
+        profile.next_check = Instant::now() + Duration::from_secs(1);
+        let Some(setup) = berd_call::macos_audio_route::default_audio_setup() else {
+            return Ok(());
+        };
+        if setup.input_uid == profile.setup.input_uid
+            && setup.output_uid == profile.setup.output_uid
+        {
+            return Ok(());
+        }
+        let settings = match crate::detection_profiles::load(&profile.path, &setup) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("berd-call: could not restore speech profile: {error}");
+                return Ok(());
+            }
+        };
+        profile.persisted = settings;
+        let settings = settings.unwrap_or_default();
+        profile.setup = setup;
+        let id = self.next_id();
+        send_request(
+            &self.writer,
+            &SessionRequest::SetDetectionSettings { id, settings },
+        )?;
+        self.detection_profile
+            .as_mut()
+            .expect("profile exists")
+            .pending = Some(id);
+        Ok(())
+    }
+
     fn poll(&mut self) -> Result<(), String> {
         if !self.stopping {
+            self.poll_detection_profile()?;
             if let Some(muted) = self
                 .system_input_mute
                 .as_mut()
@@ -1440,6 +1521,45 @@ impl SessionActor {
 
     fn handle_event(&mut self, event: SessionMessage) -> Result<(), String> {
         match event {
+            SessionMessage::DetectionSettingsResult {
+                id,
+                snapshot,
+                message,
+            } => {
+                if let Some(profile) = self.detection_profile.as_mut() {
+                    if profile.pending.is_some() && profile.pending != id {
+                        return Ok(());
+                    }
+                    if profile.pending == id {
+                        profile.pending = None;
+                    }
+                    if let Some(snapshot) = snapshot {
+                        // A device switch observed before its ordered acknowledgement
+                        // cannot save the old setup's learning under the new pair.
+                        if berd_call::macos_audio_route::default_audio_setup().is_some_and(
+                            |setup| {
+                                setup.input_uid == profile.setup.input_uid
+                                    && setup.output_uid == profile.setup.output_uid
+                            },
+                        ) {
+                            match crate::detection_profiles::save_if_unchanged(&profile.path, &profile.setup, profile.persisted, snapshot.settings) {
+                                Ok(true) => profile.persisted = Some(snapshot.settings),
+                                Ok(false) => {},
+                                Err(error) => eprintln!("berd-call: speech detection applied but could not be saved: {error}"),
+                            }
+                        }
+                    }
+                }
+                if let Some(snapshot) = snapshot {
+                    self.session
+                        .lock()
+                        .map_err(|_| "session settings lock failed")?
+                        .detection = Some(snapshot);
+                }
+                if let Some(message) = message {
+                    eprintln!("berd-call: speech detection update rejected: {message}");
+                }
+            }
             SessionMessage::InputSpeaking { active } => self.input_speaking = active,
             SessionMessage::RecognitionPending { active } => self.recognition_pending = active,
             SessionMessage::State {
@@ -3761,6 +3881,7 @@ mod tests {
 
     fn test_snapshot() -> VoiceSessionSnapshot {
         VoiceSessionSnapshot {
+            detection: None,
             spokesperson: None,
             tts: berd_call::TtsConfigurationSnapshot {
                 revision: 1,

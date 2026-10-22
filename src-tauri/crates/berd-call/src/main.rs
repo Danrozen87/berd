@@ -66,6 +66,8 @@ use serde::Serialize;
 mod cli_help;
 #[cfg(target_os = "macos")]
 mod codex;
+#[cfg(target_os = "macos")]
+mod detection_profiles;
 mod host_control;
 #[cfg(target_os = "macos")]
 mod host_session;
@@ -208,6 +210,8 @@ struct SessionConfig {
     spokesperson_rate: Option<f32>,
     interruption_threshold: f32,
     listening_threshold: f32,
+    dynamic_listening: bool,
+    dynamic_interruption: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -526,6 +530,32 @@ fn main() {
         None => {}
     }
     match args.get(1).map(String::as_str) {
+        #[cfg(target_os = "macos")]
+        Some("detection-profile") => {
+            let result = (|| -> Result<serde_json::Value, String> {
+                let setup = berd_call::macos_audio_route::default_audio_setup()
+                    .ok_or("audio setup is unavailable")?;
+                let path = detection_profiles::path()?;
+                if args.len() > 2 {
+                    if args.len() != 4 || args[2] != "--settings" {
+                        return Err("usage: berd-call detection-profile [--settings JSON]".into());
+                    }
+                    let settings: berd_call::detection::DetectionSettings =
+                        serde_json::from_str(&args[3]).map_err(|error| error.to_string())?;
+                    detection_profiles::save(&path, &setup, settings)?;
+                }
+                Ok(
+                    serde_json::json!({"audioSetup": setup, "settings": detection_profiles::load(&path, &setup)?.unwrap_or_default()}),
+                )
+            })();
+            match result {
+                Ok(value) => println!("{value}"),
+                Err(error) => {
+                    eprintln!("berd-call detection-profile failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("start") => {
             let options = parse_or_exit(parse_saved_start_args(&args), &args);
             #[cfg(target_os = "macos")]
@@ -2090,6 +2120,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
     let mut next_tts_update_attempt = 1_u64;
     let mut input_runtime: Option<VoiceInputRuntime> = None;
     let mut input_events: Option<tokio::sync::mpsc::Receiver<VoiceInputEvent>> = None;
+    let mut last_detection = None;
     let mut input_controls: Option<VoiceInputControls> = None;
     let mut next_input_token = 1_u64;
     let mut pending_control = None;
@@ -2144,6 +2175,22 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
             &mut tts_update,
             &mut writer,
         )?;
+        if let Some(snapshot) = input_controls
+            .as_ref()
+            .and_then(|controls| controls.detection())
+        {
+            if last_detection != Some(snapshot) {
+                write_message(
+                    &mut writer,
+                    &SessionMessage::DetectionSettingsResult {
+                        id: None,
+                        snapshot: Some(snapshot),
+                        message: None,
+                    },
+                )?;
+                last_detection = Some(snapshot);
+            }
+        }
         reevaluate_held(
             &mut held,
             &mut core,
@@ -2300,7 +2347,16 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     &config.stt,
                     config.endpoints.stt.as_deref(),
                     &config.stt_hints,
-                    config.listening_threshold,
+                    berd_call::detection::DetectionSettings {
+                        listening: berd_call::detection::Threshold {
+                            value: config.listening_threshold,
+                            dynamic: config.dynamic_listening,
+                        },
+                        interruption: berd_call::detection::Threshold {
+                            value: config.interruption_threshold,
+                            dynamic: config.dynamic_interruption,
+                        },
+                    },
                 ) {
                     Ok(runtime) => runtime,
                     Err(message) => {
@@ -2332,10 +2388,14 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                 status_sound_runtime.set_output_device(status_sound_output_device);
                 let input_policy = InputDuringTtsSlot::new(input_during_tts);
                 let session = VoiceSessionSnapshot {
+                    detection: input_controls
+                        .as_ref()
+                        .and_then(|controls| controls.detection()),
                     tts: slot.snapshot()?,
                     input_during_tts: input_policy.snapshot()?,
                     spokesperson: None,
                 };
+                last_detection = session.detection;
                 tts_slot = Some(slot);
                 input_during_tts_slot = Some(input_policy);
                 write_message(
@@ -2435,6 +2495,36 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                         });
                     });
                 }
+            }
+            Input::Request(SessionRequest::SetDetectionSettings { id, settings }) => {
+                let result = if (settings.listening.dynamic || settings.interruption.dynamic)
+                    && !matches!(config.stt, SttBackendConfig::Macos)
+                {
+                    Err(
+                        "dynamic speech detection currently requires macOS speech recognition"
+                            .to_string(),
+                    )
+                } else {
+                    input_controls
+                        .as_ref()
+                        .ok_or_else(|| "speech input is not ready".to_string())
+                        .and_then(|controls| controls.set_detection(settings))
+                };
+                let snapshot = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|_| input_controls.as_ref()?.detection());
+                if snapshot.is_some() {
+                    last_detection = snapshot;
+                }
+                write_message(
+                    &mut writer,
+                    &SessionMessage::DetectionSettingsResult {
+                        id: Some(id),
+                        snapshot,
+                        message: result.err(),
+                    },
+                )?;
             }
             Input::Request(SessionRequest::SetInputDuringTts {
                 id,
@@ -4578,6 +4668,7 @@ fn run_expert_spokesperson_session(
                 };
                 let input_policy = InputDuringTtsSlot::new(input_during_tts);
                 let snapshot = VoiceSessionSnapshot {
+                    detection: None,
                     tts: match &reply_tts {
                         Some(slot) => slot.snapshot()?,
                         None => tts.clone(),
@@ -5078,6 +5169,18 @@ fn run_expert_spokesperson_session(
                     true,
                     || runtime.as_ref().expect("initialized runtime").reset_input(),
                     &mut writer,
+                )?;
+            }
+            Input::Request(SessionRequest::SetDetectionSettings { id, .. }) => {
+                write_message(
+                    &mut writer,
+                    &SessionMessage::DetectionSettingsResult {
+                        id: Some(id),
+                        snapshot: None,
+                        message: Some(
+                            "local speech detection controls require a conventional call".into(),
+                        ),
+                    },
                 )?;
             }
             Input::Request(SessionRequest::SetInputDuringTts {
@@ -6081,6 +6184,8 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut spokesperson_rate = None;
     let mut interruption_threshold = 0.65;
     let mut listening_threshold = 0.5;
+    let mut dynamic_listening = false;
+    let mut dynamic_interruption = false;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -6107,6 +6212,16 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     listening_threshold = threshold;
                 } else {
                     interruption_threshold = threshold;
+                }
+            }
+            "--dynamic-listening" | "--dynamic-interruption" => {
+                let enabled = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("{flag} must be true or false"))?;
+                if flag == "--dynamic-listening" {
+                    dynamic_listening = enabled;
+                } else {
+                    dynamic_interruption = enabled;
                 }
             }
             "--tts-backend" => backend = value,
@@ -6203,6 +6318,8 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         spokesperson_rate,
         interruption_threshold,
         listening_threshold,
+        dynamic_listening,
+        dynamic_interruption,
     })
 }
 
@@ -6822,7 +6939,7 @@ fn create_stt_benchmark_report(
         &pack,
         config.runs,
         config.mode,
-        || create_input_runtime(&config.stt, None, &[], 0.5),
+        || create_input_runtime(&config.stt, None, &[], Default::default()),
     )))
 }
 
@@ -7161,7 +7278,7 @@ fn create_input_runtime(
     config: &SttBackendConfig,
     endpoint_override: Option<&str>,
     _hints: &[String],
-    listening_threshold: f32,
+    detection: berd_call::detection::DetectionSettings,
 ) -> Result<
     (
         VoiceInputRuntime,
@@ -7225,10 +7342,17 @@ fn create_input_runtime(
             }
         }
     };
+    if (detection.listening.dynamic || detection.interruption.dynamic)
+        && !matches!(config, SttBackendConfig::Macos)
+    {
+        return Err("dynamic speech detection currently requires macOS speech recognition".into());
+    }
+    let controls = VoiceInputControls::default();
+    controls.set_detection(detection)?;
     VoiceInputRuntime::start(VoiceInputConfig {
         engine,
-        speech_vad_threshold: listening_threshold,
-        controls: VoiceInputControls::default(),
+        speech_vad_threshold: detection.listening.value,
+        controls,
     })
     .map_err(|error| match config {
         SttBackendConfig::Macos => format!(
@@ -8229,7 +8353,8 @@ fn decode_framed_input(reader: &mut impl Read, header: [u8; FRAME_HEADER_BYTES])
 
 fn validate_request(request: SessionRequest) -> Result<SessionRequest, String> {
     let id = match &request {
-        SessionRequest::Hello { id, .. }
+        SessionRequest::SetDetectionSettings { id, .. }
+        | SessionRequest::Hello { id, .. }
         | SessionRequest::SetInputMuted { id, .. }
         | SessionRequest::SetConversationStatus { id, .. }
         | SessionRequest::SetTtsSettings { id, .. }
@@ -8514,6 +8639,23 @@ mod tests {
     use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
+
+    #[test]
+    fn dynamic_detection_switches_are_explicit_and_independent() {
+        let base: Vec<String> = ["berd-call", "session", "--tts-backend", "openai"]
+            .map(str::to_string)
+            .to_vec();
+        let config = parse_args(&base).unwrap();
+        assert!(!config.dynamic_listening && !config.dynamic_interruption);
+        let mut args = base.clone();
+        args.extend(["--dynamic-listening".into(), "true".into()]);
+        let config = parse_args(&args).unwrap();
+        assert!(config.dynamic_listening && !config.dynamic_interruption);
+        args.extend(["--dynamic-interruption".into(), "true".into()]);
+        assert!(parse_args(&args).unwrap().dynamic_interruption);
+        args.extend(["--dynamic-listening".into(), "maybe".into()]);
+        assert!(parse_args(&args).is_err());
+    }
 
     #[test]
     fn listening_threshold_is_independent_and_bounded() {
@@ -10252,6 +10394,7 @@ mod tests {
             id: 1,
             protocol: SESSION_PROTOCOL_VERSION,
             session: VoiceSessionSnapshot {
+                detection: None,
                 tts: snapshot.clone(),
                 input_during_tts: test_input_policy(),
                 spokesperson: None,
@@ -10849,6 +10992,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
 
@@ -10865,6 +11010,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
     }
@@ -10947,6 +11094,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
         assert!(parse_args(&args(&[
@@ -11008,6 +11157,8 @@ mod tests {
             spokesperson_rate: None,
             interruption_threshold: 0.65,
             listening_threshold: 0.5,
+            dynamic_listening: false,
+            dynamic_interruption: false,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -11233,6 +11384,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
         assert!(parse_args(&args(&[
@@ -11300,6 +11453,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
         assert!(parse_args(&args(&[
@@ -11750,6 +11905,8 @@ mod tests {
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
                 listening_threshold: 0.5,
+                dynamic_listening: false,
+                dynamic_interruption: false,
             }
         );
     }
