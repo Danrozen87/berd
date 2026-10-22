@@ -96,6 +96,7 @@ Usage:
   berd-call settings [--port PORT] --tts JSON
   berd-call settings [--port PORT] --input-during-tts auto|allow|suppress
   berd-call settings [--port PORT] --muted true|false
+  berd-call settings [--port PORT] --vad-debug-sounds on|off
   berd-call settings [--port PORT] --status-sounds off|working|working-and-waiting
   berd-call settings [--port PORT] --conversation-status working|waiting
   berd-call settings [--port PORT] --spokesperson true|false

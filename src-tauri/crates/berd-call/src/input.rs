@@ -150,6 +150,8 @@ impl FinalTranscriptStorageReceipt {
 pub enum VoiceInputEvent {
     Ready,
     SpeakingChanged(bool),
+    /// Detection state was discarded, rather than a measured speech edge.
+    SpeakingReset,
     RecognitionPendingChanged(bool),
     FinalTranscript {
         text: String,
@@ -1006,7 +1008,7 @@ fn clear_speech_state(
     leftover_16k.clear();
     *silence_frames = 0;
     if std::mem::take(in_speech) {
-        let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(false));
+        let _ = events.blocking_send(VoiceInputEvent::SpeakingReset);
     }
 }
 
@@ -1876,7 +1878,7 @@ fn mac_speech_worker(
             leftover_16k.clear();
             gate = crate::detection::SpeechGate::default();
             if std::mem::take(&mut in_speech) {
-                let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(false));
+                let _ = events.blocking_send(VoiceInputEvent::SpeakingReset);
             }
             let _ = pending.reset(&events);
             settle_deadline = None;
@@ -2276,7 +2278,7 @@ fn openai_worker(
             completed.clear();
             let _ = pending.reset(&events);
             if std::mem::take(&mut in_speech) {
-                let _ = events.blocking_send(VoiceInputEvent::SpeakingChanged(false));
+                let _ = events.blocking_send(VoiceInputEvent::SpeakingReset);
             }
             send_operation!(client.clear(), "clear reset OpenAI transcription audio", {
                 break 'worker;
@@ -2540,6 +2542,23 @@ mod tests {
         controls.set_host_muted(true);
         drop(allow);
         assert!(controls.is_input_suppressed());
+    }
+
+    #[test]
+    fn clearing_speech_reports_a_reset_instead_of_a_vad_edge() {
+        let (events, mut receiver) = tokio_mpsc::channel(2);
+        clear_speech_state(
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut 0,
+            &mut true,
+            &events,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(VoiceInputEvent::SpeakingReset)
+        ));
     }
 
     #[test]
@@ -3118,7 +3137,9 @@ mod tests {
             match event {
                 VoiceInputEvent::Ready => observed.push("ready"),
                 VoiceInputEvent::SpeakingChanged(true) => observed.push("speaking:true"),
-                VoiceInputEvent::SpeakingChanged(false) => observed.push("speaking:false"),
+                VoiceInputEvent::SpeakingChanged(false) | VoiceInputEvent::SpeakingReset => {
+                    observed.push("speaking:false")
+                }
                 VoiceInputEvent::RecognitionPendingChanged(true) => observed.push("pending:true"),
                 VoiceInputEvent::RecognitionPendingChanged(false) => observed.push("pending:false"),
                 VoiceInputEvent::FinalTranscript {
