@@ -11,7 +11,7 @@ small macOS host for default-device capture, playback, and transcript delivery.
 
 ### Local interruption detection
 
-Conventional calls accept `--interruption-threshold 0..1` at `start` or `session` (default `0.65`). It controls the local speech detector while an agent's audio plays. Higher values require stronger evidence of speech before pausing playback; lower values make interruptions easier. It does not change the idle listening threshold or the transcription provider. Saved call arguments retain the value. Use `settings --restart --interruption-threshold 0.8` to change a running call; this restarts its session.
+Conventional calls accept `--interruption-threshold 0..1` at `start` or `session` (default `0.65`). It controls the local speech detector while an agent's audio plays. Higher values require stronger evidence of speech before pausing playback; lower values make interruptions easier. It does not change the idle listening threshold or the transcription provider. Saved call arguments retain the value. To change a running call, supply its complete session configuration, for example `settings --restart --voice Aaron --language en-US --interruption-threshold 0.8`. Restart replaces the session options; include the existing backend, model, rate and other choices you want to retain.
 
 ## Command-line interface
 
