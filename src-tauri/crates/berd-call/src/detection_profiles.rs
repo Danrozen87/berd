@@ -85,6 +85,9 @@ fn write(
     if expected.is_some_and(|expected| profiles.profiles.get(&key(setup)).copied() != expected) {
         return Ok(false);
     }
+    if profiles.profiles.get(&key(setup)) == Some(&settings) {
+        return Ok(true);
+    }
     profiles.profiles.insert(key(setup), settings);
     if profiles.profiles.len() > 64 {
         return Err("too many speech profiles".into());

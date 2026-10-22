@@ -109,6 +109,13 @@ impl DetectionTuner {
         self.snapshot
     }
     pub fn observe(&mut self, mode: DetectionMode, detected: bool, now: Instant) {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.mode != mode && !window.detected)
+        {
+            self.window = None;
+        }
         let window = self.window.get_or_insert(Observation {
             mode,
             began: now,
@@ -218,6 +225,24 @@ mod tests {
         assert_eq!(tuner.snapshot().settings.interruption.value, 0.65);
         assert_eq!(tuner.snapshot().adjustments, 1);
     }
+    #[test]
+    fn idle_mode_changes_do_not_disable_interruption_learning() {
+        let mut tuner = tuner();
+        let now = Instant::now();
+        for n in 0..3 {
+            let time = now + Duration::from_secs(n * 40);
+            tuner.observe(DetectionMode::Listening, false, time);
+            tuner.observe(
+                DetectionMode::Interruption,
+                true,
+                time + Duration::from_secs(1),
+            );
+            tuner.no_result(time + Duration::from_secs(7));
+        }
+        assert_eq!(tuner.snapshot().settings.interruption.value, 0.66);
+        assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
+    }
+
     #[test]
     fn manual_mode_never_learns() {
         let settings = DetectionSettings::default();
