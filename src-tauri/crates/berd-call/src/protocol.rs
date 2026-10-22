@@ -130,6 +130,28 @@ pub enum SessionRequest {
         speech_id: u64,
     },
     Shutdown,
+    /// What the host observed about its audio route. The session ignores it, and a
+    /// capture records it in order with the microphone frames around it.
+    AudioRoute {
+        /// Microseconds on the host's monotonic clock since its microphone capture began.
+        observed_us: u64,
+        observation: RouteObservation,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RouteObservation {
+    /// A microphone stream is open on this device. Sent before its first frame, so
+    /// every frame until the next `ResetInput` comes from it.
+    InputOpened { input_uid: String },
+    /// The default output device, and how many default-output change notifications
+    /// CoreAudio had delivered. Delivery latency is unbounded, so neither establishes
+    /// the device that played any particular audio.
+    Output {
+        output_uid: Option<String>,
+        changes: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

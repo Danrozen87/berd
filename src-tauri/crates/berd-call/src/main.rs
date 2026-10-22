@@ -2508,6 +2508,8 @@ fn run_session(
                     return Ok(());
                 }
             }
+            // Only a capture uses route observations, and it has recorded this one.
+            Input::Request(SessionRequest::AudioRoute { .. }) => {}
             Input::Request(SessionRequest::Shutdown) => {
                 reject_tts_configuration_update(
                     &mut tts_update,
@@ -4856,6 +4858,8 @@ fn run_expert_spokesperson_session(
                 input_resets.finish(&mut writer)?;
                 break;
             }
+            // Only a capture uses route observations, and it has recorded this one.
+            Input::Request(SessionRequest::AudioRoute { .. }) => {}
             Input::Request(SessionRequest::Shutdown) => {
                 input_resets.finish(&mut writer)?;
                 if let Some(request) = queued_tts_settings.take() {
@@ -8765,6 +8769,7 @@ fn validate_request(request: SessionRequest) -> Result<SessionRequest, String> {
         | SessionRequest::AudioDrained { .. }
         | SessionRequest::AudioFailed { .. }
         | SessionRequest::AudioCancelled { .. }
+        | SessionRequest::AudioRoute { .. }
         | SessionRequest::Shutdown => None,
     };
     if id == Some(0) {
