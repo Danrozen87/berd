@@ -106,11 +106,10 @@ pub fn convert(
         if previous_frame.is_some_and(|prior| index.checked_sub(prior) != Some(1)) {
             return Err("missing or unordered VAD frames".into());
         }
-        if sample < 768
-            || previous_sample
-                .is_some_and(|prior| sample.checked_sub(prior).is_none_or(|delta| delta < 768))
+        if previous_sample
+            .is_some_and(|prior| sample.checked_sub(prior).is_none_or(|delta| delta < 768))
         {
-            return Err("VAD audio frames must be complete and nonoverlapping".into());
+            return Err("VAD audio frames must be ordered and nonoverlapping".into());
         }
         if previous_reset.is_some_and(|prior| prior != reset) {
             replay_epoch += 1;

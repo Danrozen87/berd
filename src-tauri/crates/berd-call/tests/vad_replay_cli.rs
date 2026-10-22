@@ -226,3 +226,38 @@ fn directory_conversion_preserves_audio_clock_revisions_and_generation_resets() 
     );
     assert!(!run().status.success());
 }
+
+#[test]
+fn leading_partial_frame_preserves_gate_history_without_scoring_padding() {
+    let profile = json!({"listening":{"value":0.5,"dynamic":false},"interruption":{"value":0.65,"dynamic":false},"timing":{"onset_ms":32,"release_ms":16}});
+    let manifest = json!({"schema":"berd-call-capture/1","mic":{"sample_rate":48000},"session":{"stt_backend":"macos","continuous_recognition":true}});
+    let mut rows = vec![json!({"us":0,"type":"settings","revision":0,"settings":profile})];
+    for (index, sample) in [513, 1281, 2049].into_iter().enumerate() {
+        rows.push(json!({"us":index+1,"mic_sample":sample,"vad_frame":index,"epoch":0,"generation":1,"mode":"listening","probability":0.8,"threshold":0.5,"detected":true,"active":index>0,"settings_revision":0}));
+    }
+    let events = vec![json!({"us":0,"frame":0,"type":"clock"})];
+    let annotations = serde_json::from_value(json!({"schema_version":1,"session_id":"partial","held_out":true,"labels":[{"start_sample":0,"end_sample":2016,"speech":true,"provenance":"human_checked"}]})).unwrap();
+    let input = berd_call::capture_replay::convert(&manifest, &rows, &events, annotations).unwrap();
+    assert_eq!(
+        input
+            .frames
+            .iter()
+            .map(|frame| frame.end_ms)
+            .collect::<Vec<_>>(),
+        vec![10, 26, 42]
+    );
+    let report = berd_call::vad_replay::replay(&input, None).unwrap();
+    assert_eq!(
+        report
+            .decisions
+            .iter()
+            .map(|decision| decision.active)
+            .collect::<Vec<_>>(),
+        vec![Some(false), Some(true), Some(true)]
+    );
+    assert_eq!(report.scores.human_checked_ms, 42);
+    assert_eq!(report.scores.missed_speech_ms, 10);
+    assert_eq!(report.scores.unlabelled_ms, 0);
+    assert_eq!(report.scores.gap_ms, 0);
+    assert_eq!(report.scores.speech_onset.samples_ms, vec![26]);
+}
