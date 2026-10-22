@@ -262,7 +262,18 @@ pub fn load(dirs: &[PathBuf], limits: &CorpusLimits) -> Result<Loaded, String> {
             .any(|(fixture, _, _)| fixture.provenance.held_out != first.0.provenance.held_out)
         {
             Some("source appears in both partitions")
-        } else if fixtures.iter().any(|(_, _, devices)| *devices != first.2) {
+        } else if fixtures.iter().any(|(fixture, _, devices)| {
+            let basis = |fixture: &LoadedFixture| {
+                fixture
+                    .provenance
+                    .audio_setup
+                    .as_ref()
+                    .map(|setup| setup.basis)
+            };
+            basis(fixture) != basis(&first.0)
+                // A route can change within a capture, but its start setup cannot.
+                || basis(fixture) == Some(SetupBasis::SessionStart) && *devices != first.2
+        }) {
             Some("source has more than one audio setup")
         } else {
             None
@@ -284,16 +295,21 @@ pub fn load(dirs: &[PathBuf], limits: &CorpusLimits) -> Result<Loaded, String> {
                 starts: Vec::new(),
                 fixtures: Vec::new(),
             });
-            // host_session can switch profiles mid-call, so a start-time setup cannot
-            // vouch for each clip.
             let limitation = match fixture
                 .provenance
                 .audio_setup
                 .as_ref()
                 .map(|setup| setup.basis)
             {
+                // host_session can switch profiles mid-call, so a start-time setup cannot
+                // vouch for each clip.
                 Some(SetupBasis::SessionStart) | None => {
                     "audio setup was read at session start; devices behind each clip are unverified"
+                }
+                // Until playback reports its own device, or default-output changes have a
+                // bounded delivery, an observed default cannot vouch for the clip's output.
+                Some(SetupBasis::ObservedRoute) => {
+                    "output device was observed as the default around each clip, not measured from playback"
                 }
             };
             if !corpus
@@ -332,6 +348,7 @@ mod tests {
         end: u64,
         held_out: bool,
         input_uid: Option<&'static str>,
+        basis: &'static str,
         start: Value,
     }
 
@@ -342,6 +359,7 @@ mod tests {
             end,
             held_out: false,
             input_uid: Some("mic"),
+            basis: "session_start",
             start: json!({"kind":"capture_start"}),
         }
     }
@@ -352,9 +370,9 @@ mod tests {
         let id = format!("{source}@{}-{}", clip.offset, clip.end);
         let dir = root.join(&id);
         std::fs::create_dir(&dir).unwrap();
-        let setup = clip.input_uid.map(|uid| {
-            json!({"devices":{"input_uid":uid,"output_uid":"speaker"},"basis":"session_start"})
-        });
+        let setup = clip.input_uid.map(
+            |uid| json!({"devices":{"input_uid":uid,"output_uid":"speaker"},"basis":clip.basis}),
+        );
         let meta = json!({"schema":"berd-call-fixture/1","provenance":{
             "source_session":source,"held_out":clip.held_out,"audio_setup":setup,
             "source_sample_offset":clip.offset,"source_sample_end":clip.end,
@@ -485,6 +503,36 @@ mod tests {
         );
         assert_eq!(loaded.corpora.len(), 1);
         assert_eq!(loaded.corpora[0].source_sessions, ["capture-9"]);
+    }
+
+    #[test]
+    fn observed_routes_may_change_within_a_source_but_stay_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let observed = |source, offset, end, uid| Clip {
+            input_uid: Some(uid),
+            basis: "observed_route",
+            ..clip(source, offset, end)
+        };
+        let dirs = [
+            write(root.path(), &observed(1, 0, 1536, "mic"), 1536),
+            write(root.path(), &observed(1, 3072, 4608, "headset"), 1536),
+            write(root.path(), &observed(2, 0, 1536, "mic"), 1536),
+            write(root.path(), &clip(2, 3072, 4608), 1536),
+        ];
+        let loaded = load(&dirs, &CorpusLimits::default()).unwrap();
+        assert_eq!(
+            reasons(&loaded),
+            ["source has more than one audio setup"; 2]
+        );
+        let [headset, mic] = loaded.corpora.as_slice() else {
+            panic!("{loaded:?}")
+        };
+        assert_eq!(headset.source_sessions, ["capture-1"]);
+        assert_eq!(mic.source_sessions, ["capture-1"]);
+        assert_eq!(
+            mic.trial_ineligible,
+            ["output device was observed as the default around each clip, not measured from playback"]
+        );
     }
 
     fn edit(dir: &Path, name: &str, from: &str, to: &str) {

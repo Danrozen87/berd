@@ -20,8 +20,8 @@ use berd_call::openai_realtime_protocol::{
     RealtimeExpertDeliveryEvent, RealtimeExpertDeliveryRole,
 };
 use berd_call::protocol::{
-    NotAdmittedReason, OutputReadyOutcome, SessionMessage, SessionRequest, UtteranceOrigin,
-    VoiceSessionSnapshot,
+    NotAdmittedReason, OutputReadyOutcome, RouteObservation, SessionMessage, SessionRequest,
+    UtteranceOrigin, VoiceSessionSnapshot,
 };
 use berd_call::PocketAudioPlayer;
 
@@ -2381,6 +2381,72 @@ struct DefaultInputCapture {
     next_check: Instant,
     muted: Arc<AtomicBool>,
     mute_epoch: Arc<AtomicU64>,
+    route: RouteTelemetry,
+}
+
+const ROUTE_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Whether the main thread runs the run loop on which CoreAudio delivers property listeners.
+pub(crate) static MAIN_RUN_LOOP: AtomicBool = AtomicBool::new(false);
+
+/// Audio route observations for capture provenance, on one monotonic clock.
+struct RouteTelemetry {
+    started: Instant,
+    changes: Option<berd_call::macos_audio_route::DefaultOutputChanges>,
+    sent: Option<(Option<String>, u64)>,
+    next_heartbeat: Instant,
+}
+
+impl RouteTelemetry {
+    fn new() -> Self {
+        // Without a main run loop the change count would never advance, so it would prove nothing.
+        let changes = if MAIN_RUN_LOOP.load(Ordering::SeqCst) {
+            berd_call::macos_audio_route::DefaultOutputChanges::install()
+        } else {
+            Err("CoreAudio notifications need the menu bar's run loop".into())
+        }
+        .map_err(|error| eprintln!("berd-call: audio route provenance unavailable: {error}"))
+        .ok();
+        let started = Instant::now();
+        Self {
+            started,
+            changes,
+            sent: None,
+            next_heartbeat: started,
+        }
+    }
+
+    /// Sends the default output when it or its change count differs from the last
+    /// observation sent, and at least every heartbeat so a lost record is bracketed.
+    fn observe_output(&mut self, writer: &Arc<Mutex<ChildStdin>>) -> Result<(), String> {
+        let Some(changes) = &self.changes else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        // Counted first: a change between the two reads shows in the next observation.
+        let count = changes.count();
+        let observation = (berd_call::macos_audio_route::default_output_uid(), count);
+        if self.sent.as_ref() == Some(&observation) && now < self.next_heartbeat {
+            return Ok(());
+        }
+        send_request(
+            writer,
+            &SessionRequest::AudioRoute {
+                observed_us: route_us(self.started, now),
+                observation: RouteObservation::Output {
+                    output_uid: observation.0.clone(),
+                    changes: observation.1,
+                },
+            },
+        )?;
+        self.sent = Some(observation);
+        self.next_heartbeat = now + ROUTE_HEARTBEAT;
+        Ok(())
+    }
+}
+
+fn route_us(started: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(started).as_micros()).unwrap_or(u64::MAX)
 }
 
 fn default_input() -> Result<(String, cpal::Device), String> {
@@ -2409,6 +2475,9 @@ impl DefaultInputCapture {
         muted: Arc<AtomicBool>,
         mute_epoch: Arc<AtomicU64>,
     ) -> Result<Self, String> {
+        // Observing output before the first microphone frame brackets the capture's start.
+        let mut route = RouteTelemetry::new();
+        route.observe_output(&writer)?;
         let (key, device) = default_input()?;
         let capture = InputCapture::start(
             device,
@@ -2416,6 +2485,7 @@ impl DefaultInputCapture {
             failures.clone(),
             muted.clone(),
             mute_epoch.clone(),
+            route.started,
         )?;
         Ok(Self {
             recovery: crate::microphone_recovery::MicrophoneRecovery::new(key, capture),
@@ -2424,6 +2494,7 @@ impl DefaultInputCapture {
             next_check: Instant::now() + Duration::from_millis(500),
             muted,
             mute_epoch,
+            route,
         })
     }
 
@@ -2457,6 +2528,7 @@ impl DefaultInputCapture {
             .map_err(Clone::clone);
         let writer = &self.writer;
         let failures = &self.failures;
+        let route_started = self.route.started;
         let change = self
             .recovery
             .reconcile(now, key, failed, InputCapture::stop, || {
@@ -2470,12 +2542,13 @@ impl DefaultInputCapture {
                     failures.clone(),
                     self.muted.clone(),
                     self.mute_epoch.clone(),
+                    route_started,
                 )
             })?;
         if change.invalidated || change.opened {
             actor.reset_input_activity()?;
         }
-        Ok(())
+        self.route.observe_output(&self.writer)
     }
 }
 
@@ -2566,7 +2639,12 @@ impl InputCapture {
         failures: SyncSender<String>,
         muted: Arc<AtomicBool>,
         mute_epoch: Arc<AtomicU64>,
+        route_started: Instant,
     ) -> Result<Self, String> {
+        let input_uid = device
+            .id()
+            .map_err(|error| format!("could not identify microphone: {error}"))?
+            .1;
         let supported = device
             .default_input_config()
             .map_err(|error| format!("could not inspect the default microphone: {error}"))?;
@@ -2580,20 +2658,21 @@ impl InputCapture {
         let writer_failures = failures.clone();
         let forwarding_muted = muted.clone();
         let forwarding_mute_epoch = mute_epoch.clone();
+        let route_writer = writer.clone();
+        let (opened_tx, opened_rx) = mpsc::sync_channel(1);
         let forwarder = thread::Builder::new()
             .name("berd-call-microphone-writer".into())
             .spawn(move || {
-                while let Ok(frame) = frames_rx.recv() {
-                    if let Err(message) = send_captured_pcm(
+                forward_after_open(opened_rx, frames_rx, |frame| {
+                    let sent = send_captured_pcm(
                         &writer,
                         &frame,
                         &forwarding_muted,
                         &forwarding_mute_epoch,
-                    ) {
-                        report_failure(&writer_failures, message);
-                        break;
-                    }
-                }
+                    );
+                    sent.map_err(|message| report_failure(&writer_failures, message))
+                        .is_ok()
+                })
             })
             .map_err(|error| format!("could not start microphone forwarding: {error}"))?;
         let stream = match sample_format {
@@ -2652,12 +2731,38 @@ impl InputCapture {
         stream
             .play()
             .map_err(|error| format!("could not start the default microphone: {error}"))?;
+        // Only a playing stream establishes identity, and its frames wait for this record.
+        send_request(
+            &route_writer,
+            &SessionRequest::AudioRoute {
+                observed_us: route_us(route_started, Instant::now()),
+                observation: RouteObservation::InputOpened { input_uid },
+            },
+        )?;
+        let _ = opened_tx.send(());
         Ok(Self {
             stream: Some(stream),
             forwarder: Some(forwarder),
             errors,
             activity,
         })
+    }
+}
+
+/// Forwards frames only after `opened` fires, until `forward` declines one; frames
+/// queue meanwhile. Dropping `opened` unsent forwards nothing.
+fn forward_after_open<T>(
+    opened: Receiver<()>,
+    frames: Receiver<T>,
+    mut forward: impl FnMut(T) -> bool,
+) {
+    if opened.recv().is_err() {
+        return;
+    }
+    while let Ok(frame) = frames.recv() {
+        if !forward(frame) {
+            break;
+        }
     }
 }
 
@@ -3260,6 +3365,42 @@ fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_frames_wait_for_the_opened_route_record() {
+        let (opened, opened_rx) = mpsc::sync_channel(1);
+        let (frames, frames_rx) = mpsc::sync_channel(4);
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let sink = forwarded.clone();
+        let forwarder = thread::spawn(move || {
+            forward_after_open(opened_rx, frames_rx, |frame| {
+                sink.lock().unwrap().push(frame);
+                frame != 3
+            })
+        });
+        frames.send(1).unwrap();
+        frames.send(2).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(forwarded.lock().unwrap().is_empty());
+        opened.send(()).unwrap();
+        frames.send(3).unwrap();
+        // The forwarder may already have stopped and dropped its receiver.
+        let _ = frames.send(4);
+        forwarder.join().unwrap();
+        assert_eq!(*forwarded.lock().unwrap(), [1, 2, 3]);
+
+        // A stream that never opened forwards nothing it queued.
+        let (opened, opened_rx) = mpsc::sync_channel::<()>(1);
+        let (frames, frames_rx) = mpsc::sync_channel(1);
+        frames.send(1).unwrap();
+        drop(opened);
+        let mut forwarded = Vec::new();
+        forward_after_open(opened_rx, frames_rx, |frame| {
+            forwarded.push(frame);
+            true
+        });
+        assert!(forwarded.is_empty());
+    }
 
     #[test]
     fn expert_batches_leave_out_user_rows_already_streamed() {

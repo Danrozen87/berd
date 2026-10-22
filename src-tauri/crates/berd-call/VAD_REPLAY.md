@@ -68,12 +68,27 @@ A finding without such a start in its context window is excluded rather than cut
 
 **Output.** Each `OUT_DIR/<session_id>/` directory contains:
 
-- `fixture.json`: provenance (including `held_out` and `audio_setup`) and findings. `audio_setup` holds the default input and output device UIDs read when the session started, with `basis: "session_start"`. It is null when the session could not read both UIDs, including older captures that recorded only device names.
+- `fixture.json`: provenance (including `held_out` and `audio_setup`) and findings. `audio_setup` holds the clip's input and output device UIDs and their `basis`, described below.
 - `input.json`: a replay input on the clip's own timeline, for the replay command above.
 - `mic.wav`: begins at `provenance.source_sample_offset`, which is a multiple of 48 samples, so clip milliseconds are source milliseconds minus `offset / 48`.
 - `vad.jsonl` and `events.jsonl`: verbatim source lines, still on the source sample and processing clocks. `vad.jsonl` is preceded by the settings records it references.
 
 Extraction refuses to overwrite an existing fixture directory, checking every destination before it writes any. It prints a summary including every exclusion and its reason.
+
+**Audio setup.** On macOS the host sends `audio_route` requests, which the session ignores and a capture records in `events.jsonl` in order with the microphone frames around them. Each carries `observed_us` on the host's monotonic clock and one observation:
+
+- `input_opened`: a microphone stream is built and playing on `input_uid`. The host sends it before forwarding any of that stream's frames, and closes the stream before the `reset_input` that precedes any other device. A failed open sends nothing.
+- `output`: the default output's `output_uid` and `changes`, the number of default-output change notifications CoreAudio had delivered. The host sends one before the first microphone frame, whenever either value changes at its 500 ms poll, and at least every 5 seconds. CoreAudio delivers the notifications on the main run loop, so a host started with `--no-menu-bar` sends none, and its clips are excluded.
+
+In a capture with route records, a clip gets `basis: "observed_route"` only when:
+
+- it lies within one input stream, from its `input_opened` to the next `reset_input` or possible record loss (a `capture_dropped` gap or `limit`);
+- output observations at or before its start and at or after its end, and every one between, agree on `output_uid` and `changes`;
+- no possible record loss overlaps the span from the earlier of the stream's opening and the first of those observations to the later of the clip's end and the last. Records dropped behind a full queue may follow their marker by up to a queue of records, so that whole span counts as loss.
+
+Otherwise its findings are excluded. The input is then exact. The output is only observed: notification delivery has no established bound, and playback follows the system default rather than a device the host selects, so no observation establishes the device that played agent audio during the clip.
+
+Captures without route records keep the setup read when the session started, with `basis: "session_start"`, or null when the session could not read both UIDs, including older captures that recorded only device names.
 
 ## Loading fixtures for evaluation
 
@@ -88,10 +103,13 @@ A fixture is rejected, with its directory and reason, when:
 - its `mic.wav` is not mono 48 kHz PCM16, or its decoded samples (not its header length) differ from the provenance interval;
 - its capture recorded no device UIDs, or an empty one.
 
-A source session is rejected entirely when its fixtures overlap (including a recut under another policy), span both partitions, or disagree on audio setup. Fixture files must be regular files. `fixture.json`, `input.json`, the fixture count and the total bytes read are all bounded; exceeding the count or total fails the whole load.
+A source session is rejected entirely when its fixtures overlap (including a recut under another policy), span both partitions, mix setup bases, or disagree on a session-start setup. Observed routes may change within a source, whose fixtures then join each setup's corpus. Fixture files must be regular files. `fixture.json`, `input.json`, the fixture count and the total bytes read are all bounded; exceeding the count or total fails the whole load.
 
-Every corpus is currently diagnostic only, and lists why in `trial_ineligible`. The host can switch detection profiles when devices change during a call, so a setup read at session start does not establish the devices behind each clip. A corpus may authorize a live profile trial only once route continuity or per-clip setup is recorded.
+Every corpus is currently diagnostic only, and lists why in `trial_ineligible`:
+
+- `session_start`: the host can switch detection profiles when devices change during a call, so a setup read at session start does not establish the devices behind each clip.
+- `observed_route`: the input is exact, but the output is an observed default. A corpus can authorize a live profile trial only once playback reports the device it actually rendered each utterance on (including engine configuration changes mid-utterance), or default-output changes gain a defensible continuity mechanism.
 
 ## Grouped evaluation
 
-Run `berd-call vad-replay evaluate BASELINE.json FIXTURE_DIR...` with a serialized `DetectionSettings` baseline and extracted fixture directories. The command writes one `berd-call-evaluation/1` JSON document containing grouped comparisons, source/start metadata, fixture provenance, rejected fixtures and trial eligibility. It uses the default acceptance policy and changes no saved profiles. A successful command means the report was produced; inspect `trial_eligible` and rejection reasons to determine the outcome. Session-start device identity alone keeps a corpus diagnostic-only even if replay accepts a candidate.
+Run `berd-call vad-replay evaluate BASELINE.json FIXTURE_DIR...` with a serialized `DetectionSettings` baseline and extracted fixture directories. The command writes one `berd-call-evaluation/1` JSON document containing grouped comparisons, source/start metadata, fixture provenance, rejected fixtures and trial eligibility. It uses the default acceptance policy and changes no saved profiles. A successful command means the report was produced; inspect `trial_eligible` and rejection reasons to determine the outcome. Neither setup basis yet makes a corpus trial-eligible, even if replay accepts a candidate.

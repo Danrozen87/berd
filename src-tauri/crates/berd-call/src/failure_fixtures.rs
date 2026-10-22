@@ -90,6 +90,63 @@ pub enum SetupBasis {
     /// Read when the session started. Routes can change during a call, so this
     /// does not establish the devices behind any particular clip.
     SessionStart,
+    /// Recorded by the host around the clip. The input is exact: the clip lies within
+    /// one microphone stream, opened on this device before its first frame. The output
+    /// is only observed: the default output and its change count agree at observations
+    /// before and after the clip, with no capture loss between. Change notifications
+    /// have no established delivery bound, and playback follows the system default,
+    /// so this does not establish the device that played any agent audio in the clip.
+    ObservedRoute,
+}
+
+/// Route records from a capture whose host sent them, as source samples.
+#[derive(Default)]
+struct Routes {
+    /// Microphone streams: from their opening record to the next reset or loss.
+    inputs: Vec<(u64, u64, String)>,
+    outputs: Vec<(u64, Option<String>, u64)>,
+    /// Sample spans in which capture records may have been lost.
+    losses: Vec<(u64, u64)>,
+}
+
+impl Routes {
+    fn close_input(&mut self, at: u64) {
+        if let Some(input) = self.inputs.last_mut().filter(|input| input.1 == u64::MAX) {
+            input.1 = at;
+        }
+    }
+
+    fn setup(&self, offset: u64, end: u64) -> Option<AudioSetup> {
+        let (opened, _, input_uid) = self
+            .inputs
+            .iter()
+            .find(|(from, to, _)| *from <= offset && end <= *to)?;
+        let before = self.outputs.partition_point(|output| output.0 <= offset);
+        let after = self.outputs.partition_point(|output| output.0 < end);
+        let bracket = self.outputs.get(before.checked_sub(1)?..=after)?;
+        let (from, Some(output_uid), changes) = &bracket[0] else {
+            return None;
+        };
+        // A loss after the stream opened could hide its reset, and one within the bracket an output change.
+        let (from, to) = ((*opened).min(*from), bracket[bracket.len() - 1].0.max(end));
+        if bracket
+            .iter()
+            .any(|output| (&output.1, output.2) != (&bracket[0].1, *changes))
+            || self
+                .losses
+                .iter()
+                .any(|loss| loss.0 <= to && from <= loss.1)
+        {
+            return None;
+        }
+        Some(AudioSetup {
+            devices: AudioDevices {
+                input_uid: input_uid.clone(),
+                output_uid: output_uid.clone(),
+            },
+            basis: SetupBasis::ObservedRoute,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -230,14 +287,24 @@ pub fn extract(
         cuts.push((audio_samples, u64::MAX, "trace beyond mic.wav".to_string()));
     }
     let mut samples = Vec::with_capacity(events.len());
+    let mut routes = Routes::default();
+    let mut routed = false;
+    let loss = |routes: &mut Routes, span: (u64, u64)| {
+        routes.close_input(span.0);
+        routes.losses.push(span);
+    };
     for event in events {
         let at = number(event, "frame")? * MIC_FRAME_SAMPLES;
         if samples.last().is_some_and(|&last| at < last) {
             return Err("capture events must be ordered by frame".into());
         }
-        match event["type"].as_str() {
-            Some("limit") => cuts.push((at, u64::MAX, "capture limit".into())),
-            Some("gap") => {
+        let message = &event["message"];
+        match (event["type"].as_str(), message["type"].as_str()) {
+            (Some("limit"), _) => {
+                cuts.push((at, u64::MAX, "capture limit".into()));
+                loss(&mut routes, (at, u64::MAX));
+            }
+            (Some("gap"), _) => {
                 let reason = event["reason"].as_str().unwrap_or("unknown");
                 let (from, to) = match (reason, event["from_frame"].as_u64()) {
                     ("input_paused", _) => (at, at),
@@ -246,7 +313,34 @@ pub fn extract(
                     // marker by at most a queue of records, each advancing at most one mic frame.
                     _ => (at, at + (CAPTURE_QUEUE_RECORDS + 1) * MIC_FRAME_SAMPLES),
                 };
+                if reason != "input_paused" {
+                    loss(&mut routes, (from, to));
+                }
                 cuts.push((from, to, format!("capture gap: {reason}")));
+            }
+            (Some("in"), Some("reset_input")) => routes.close_input(at),
+            (Some("in"), Some("audio_route")) => {
+                routed = true;
+                let observation = &message["observation"];
+                match observation["kind"].as_str() {
+                    Some("input_opened") => {
+                        let uid = observation["input_uid"]
+                            .as_str()
+                            .filter(|uid| !uid.is_empty())
+                            .ok_or("input_opened route needs an input_uid")?;
+                        routes.close_input(at);
+                        routes.inputs.push((at, u64::MAX, uid.into()));
+                    }
+                    Some("output") => routes.outputs.push((
+                        at,
+                        observation["output_uid"]
+                            .as_str()
+                            .filter(|uid| !uid.is_empty())
+                            .map(Into::into),
+                        number(observation, "changes")?,
+                    )),
+                    _ => return Err("unknown audio route observation".into()),
+                }
             }
             _ => {}
         }
@@ -509,7 +603,15 @@ pub fn extract(
             held_out,
             labels: clipped,
         };
-        let converted = if event_lines.is_empty() {
+        // A capture with route records establishes each clip's setup from them alone.
+        let clip_setup = if routed {
+            routes.setup(offset, end)
+        } else {
+            audio_setup.clone()
+        };
+        let converted = if routed && clip_setup.is_none() {
+            Err("audio route is not established across the clip".into())
+        } else if event_lines.is_empty() {
             Err("clip contains no capture events".into())
         } else {
             convert(manifest, &sliced, &events[event_lines.clone()], annotations)
@@ -520,7 +622,7 @@ pub fn extract(
                 provenance: Provenance {
                     source_session: source.clone(),
                     held_out,
-                    audio_setup: audio_setup.clone(),
+                    audio_setup: clip_setup,
                     source_sample_offset: offset,
                     source_sample_end: end,
                     source_start_us: head.us,
@@ -555,6 +657,7 @@ pub fn extract(
 mod tests {
     use super::*;
     use crate::detection::{DetectionSettings, SpeechGate, Threshold, VadTiming};
+    use crate::protocol::{RouteObservation, SessionRequest};
     use crate::vad_replay::{replay, Candidate, Provenance as Label};
     use serde_json::json;
 
@@ -730,6 +833,139 @@ mod tests {
                 assert!(exact(&rows, &events, fixture, settings));
             }
         }
+    }
+
+    /// A host route request as a capture records it.
+    fn route(frame: u64, observation: RouteObservation) -> Value {
+        let message = serde_json::to_string(&SessionRequest::AudioRoute {
+            observed_us: frame * 20000,
+            observation,
+        })
+        .unwrap();
+        serde_json::from_str(&format!(
+            r#"{{"us":{},"frame":{frame},"type":"in","message":{message}}}"#,
+            frame * 20000
+        ))
+        .unwrap()
+    }
+
+    fn opened(frame: u64, uid: &str) -> Value {
+        route(
+            frame,
+            RouteObservation::InputOpened {
+                input_uid: uid.into(),
+            },
+        )
+    }
+
+    fn output(frame: u64, uid: &str, changes: u64) -> Value {
+        route(
+            frame,
+            RouteObservation::Output {
+                output_uid: Some(uid.into()),
+                changes,
+            },
+        )
+    }
+
+    #[test]
+    fn clips_take_their_setup_only_from_bracketing_route_records() {
+        let mut frames = vec![(0.0, 0, 1); 10];
+        frames.extend(fragment(0, 1));
+        frames.extend([(0.0, 0, 1); 120]);
+        frames.extend(fragment(0, 1));
+        frames.extend([(0.0, 0, 1); 10]);
+        let (rows, clock) = trace(&frames);
+        let legacy = run(&rows, &clock, &[], policy());
+        let [first, second] = legacy.fixtures.as_slice() else {
+            panic!("{:?}", legacy.excluded)
+        };
+        // Without route records a capture keeps its manifest setup, here none.
+        assert_eq!(first.provenance.audio_setup, None);
+        let clips = [
+            first.provenance.source_sample_offset,
+            second.provenance.source_sample_offset,
+        ];
+        let between = first.provenance.source_sample_end.div_ceil(960);
+        assert!((between + 4) * 960 < clips[1]);
+        let last = second.provenance.source_sample_end.div_ceil(960);
+        let setups = |routes: &[Value]| {
+            let mut events = clock.clone();
+            events.extend_from_slice(routes);
+            events.sort_by_key(|event| event["frame"].as_u64());
+            let extraction = run(&rows, &events, &[], policy());
+            clips.map(|offset| {
+                let Some(fixture) = extraction
+                    .fixtures
+                    .iter()
+                    .find(|fixture| fixture.provenance.source_sample_offset == offset)
+                else {
+                    assert!(extraction.excluded.iter().any(|excluded| excluded.source_start_sample
+                        == offset
+                        && excluded.reason
+                            == "clip does not replay: audio route is not established across the clip"));
+                    return None;
+                };
+                let setup = fixture.provenance.audio_setup.clone().unwrap();
+                assert_eq!(setup.basis, SetupBasis::ObservedRoute);
+                Some(format!(
+                    "{}/{}",
+                    setup.devices.input_uid, setup.devices.output_uid
+                ))
+            })
+        };
+        let observed = |a: &str, b: &str| [Some(a.to_string()), Some(b.to_string())];
+        let start = [opened(0, "mic"), output(0, "speakers", 0)];
+        let with = |extra: &[Value]| [&start[..], extra].concat();
+        let steady = with(&[output(between, "speakers", 0), output(last, "speakers", 0)]);
+        assert_eq!(setups(&steady), observed("mic/speakers", "mic/speakers"));
+        // An observed change, or a change notification alone, leaves the clip before it unbracketed.
+        assert_eq!(
+            setups(&with(&[
+                output(between, "headphones", 1),
+                output(last, "headphones", 1)
+            ])),
+            [None, Some("mic/headphones".into())]
+        );
+        assert_eq!(
+            setups(&with(&[
+                output(between, "speakers", 1),
+                output(last, "speakers", 1)
+            ])),
+            [None, Some("mic/speakers".into())]
+        );
+        // The last clip needs an observation after it.
+        assert_eq!(
+            setups(&with(&[output(between, "speakers", 0)])),
+            [Some("mic/speakers".into()), None]
+        );
+        // Frames before the first opened stream, or after a reset, have no known input.
+        assert_eq!(setups(&steady[1..]), [None, None]);
+        let reset =
+            json!({"us":0,"frame":between + 1,"type":"in","message":{"type":"reset_input","id":9}});
+        let mut reopened = [&steady[..], std::slice::from_ref(&reset)].concat();
+        assert_eq!(setups(&reopened), [Some("mic/speakers".into()), None]);
+        reopened.push(opened(between + 2, "usb"));
+        assert_eq!(setups(&reopened), observed("mic/speakers", "usb/speakers"));
+        // Possible record loss needs fresh input and output records after it.
+        let lost = json!({"us":0,"frame":between + 2,"type":"gap","reason":"capture_dropped","from_frame":between + 1});
+        let mut recovered = [&steady[..], &[lost]].concat();
+        assert_eq!(setups(&recovered), [Some("mic/speakers".into()), None]);
+        recovered.push(opened(between + 3, "mic"));
+        assert_eq!(setups(&recovered), [Some("mic/speakers".into()), None]);
+        recovered.push(output(between + 3, "speakers", 0));
+        assert_eq!(setups(&recovered), observed("mic/speakers", "mic/speakers"));
+        // Records dropped behind a full queue may follow their marker, so none in that span can recover.
+        let queued = |at: u64| Routes {
+            inputs: vec![(at, u64::MAX, "mic".into())],
+            outputs: vec![
+                (at, Some("speakers".into()), 0),
+                (900, Some("speakers".into()), 0),
+            ],
+            losses: vec![(100, 500)],
+        };
+        assert_eq!(queued(400).setup(600, 800), None);
+        assert!(queued(501).setup(600, 800).is_some());
     }
 
     #[test]
