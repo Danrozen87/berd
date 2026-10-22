@@ -951,11 +951,8 @@ struct PendingSpeak {
     text: String,
     non_blocking: bool,
     response: Option<SyncSender<Result<Value, String>>>,
-    /// When the voice session was asked to speak, then how long it held the
-    /// speech while you talked and until the player accepted its first audio.
+    /// When the voice session was asked to speak, for timing diagnostics.
     prepared: Instant,
-    held_ms: Option<u64>,
-    first_audio_ms: Option<u64>,
 }
 
 enum AudioCommand {
@@ -1427,8 +1424,6 @@ impl SessionActor {
                     non_blocking,
                     response: Some(response),
                     prepared: Instant::now(),
-                    held_ms: None,
-                    first_audio_ms: None,
                 });
             }
             ControlCommand::Restart {
@@ -1616,8 +1611,11 @@ impl SessionActor {
             SessionMessage::Admitted { id, speech_id, .. }
                 if self.pending_prepare_id() == Some(id) =>
             {
-                if let Some(pending) = self.pending_speak.as_mut() {
-                    pending.held_ms = Some(pending.prepared.elapsed().as_millis() as u64);
+                if let Some(pending) = &self.pending_speak {
+                    eprintln!(
+                        "berd-call: speech admitted after {} ms",
+                        pending.prepared.elapsed().as_millis()
+                    );
                 }
                 send_request(&self.writer, &SessionRequest::OutputReady { id, speech_id })?;
             }
@@ -1635,8 +1633,11 @@ impl SessionActor {
                 }
             }
             SessionMessage::SpeechStarted { id, .. } if self.pending_prepare_id() == Some(id) => {
-                if let Some(pending) = self.pending_speak.as_mut() {
-                    pending.first_audio_ms = Some(pending.prepared.elapsed().as_millis() as u64);
+                if let Some(pending) = &self.pending_speak {
+                    eprintln!(
+                        "berd-call: speech first audio accepted after {} ms",
+                        pending.prepared.elapsed().as_millis()
+                    );
                 }
             }
             SessionMessage::SpeechCompleted { id, .. } if self.pending_prepare_id() == Some(id) => {
@@ -1695,19 +1696,6 @@ impl SessionActor {
 
     fn respond_speak(&mut self, result: Result<Value, String>) {
         if let Some(pending) = self.pending_speak.take() {
-            let result = result.map(|mut value| {
-                if let Value::Object(fields) = &mut value {
-                    for (key, ms) in [
-                        ("heldMs", pending.held_ms),
-                        ("firstAudioMs", pending.first_audio_ms),
-                    ] {
-                        if let Some(ms) = ms {
-                            fields.insert(key.into(), ms.into());
-                        }
-                    }
-                }
-                value
-            });
             if let Some(response) = pending.response {
                 let _ = response.send(result);
             } else {
@@ -3939,8 +3927,6 @@ mod tests {
             non_blocking: false,
             response: Some(first_tx),
             prepared: Instant::now(),
-            held_ms: None,
-            first_audio_ms: None,
         });
         let (next_tx, next_rx) = mpsc::sync_channel(1);
         actor
@@ -4002,8 +3988,6 @@ mod tests {
             non_blocking: false,
             response: Some(playing_tx),
             prepared: Instant::now(),
-            held_ms: None,
-            first_audio_ms: None,
         });
         let (queued_tx, queued) = mpsc::sync_channel(1);
         actor
@@ -4082,8 +4066,6 @@ mod tests {
             non_blocking: false,
             response: Some(playing_tx),
             prepared: Instant::now(),
-            held_ms: None,
-            first_audio_ms: None,
         });
         let (restart, _restarted) = restart_command();
         actor.handle_command(restart).unwrap();
@@ -4373,8 +4355,6 @@ mod tests {
             non_blocking: false,
             response: Some(playing_tx),
             prepared: Instant::now(),
-            held_ms: None,
-            first_audio_ms: None,
         });
         let (restart, restarted) = restart_command();
         actor.handle_command(restart).unwrap();
@@ -4385,56 +4365,6 @@ mod tests {
             restarted.try_recv().unwrap().unwrap_err(),
             "voice call stopped"
         );
-        drop(actor);
-        assert!(child.wait().unwrap().success());
-    }
-
-    #[test]
-    fn speak_reports_how_long_speech_was_held_and_took_to_be_heard() {
-        let mut child = Command::new("/bin/cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
-        let (_events_tx, events) = mpsc::sync_channel(1);
-        let (_commands_tx, commands) = mpsc::sync_channel(1);
-        let (audio_commands, _audio_rx) = mpsc::sync_channel(1);
-        let mut actor = test_actor(writer, events, commands, audio_commands);
-        let (response, result) = mpsc::sync_channel(1);
-        actor
-            .handle_command(ControlCommand::Speak {
-                text: "hello".into(),
-                acknowledgement: None,
-                resolved_handoff_ids: Vec::new(),
-                voice: None,
-                language: None,
-                relay: false,
-                non_blocking: false,
-                response,
-            })
-            .unwrap();
-        let id = actor.pending_prepare_id().unwrap();
-        thread::sleep(Duration::from_millis(20));
-        actor
-            .handle_event(SessionMessage::Admitted {
-                id,
-                speech_id: 1,
-                confirmed_token: 0,
-            })
-            .unwrap();
-        thread::sleep(Duration::from_millis(20));
-        actor
-            .handle_event(SessionMessage::SpeechStarted { id, speech_id: 1 })
-            .unwrap();
-        actor
-            .handle_event(SessionMessage::SpeechCompleted { id, speech_id: 1 })
-            .unwrap();
-        let result = result.recv().unwrap().unwrap();
-        assert_eq!(result["status"], "completed");
-        let held = result["heldMs"].as_u64().unwrap();
-        assert!(held >= 20);
-        assert!(result["firstAudioMs"].as_u64().unwrap() >= held + 20);
         drop(actor);
         assert!(child.wait().unwrap().success());
     }
