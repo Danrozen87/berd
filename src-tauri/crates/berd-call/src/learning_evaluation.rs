@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StartConstraint {
     CaptureStart,
     GateReset,
@@ -643,5 +643,67 @@ mod tests {
             &AcceptancePolicy::default()
         )
         .is_err());
+    }
+    #[test]
+    fn extraction_start_json_is_internally_tagged() {
+        for (json, kind) in [
+            (serde_json::json!({"kind":"capture_start"}), "capture_start"),
+            (serde_json::json!({"kind":"gate_reset"}), "gate_reset"),
+            (
+                serde_json::json!({"kind":"quiet","max_probability":0.1,"ms":1000}),
+                "quiet",
+            ),
+        ] {
+            let start: StartConstraint = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&start).unwrap()["kind"], json["kind"]);
+            match (kind, start) {
+                ("capture_start", StartConstraint::CaptureStart)
+                | ("gate_reset", StartConstraint::GateReset) => (),
+                (
+                    "quiet",
+                    StartConstraint::Quiet {
+                        max_probability,
+                        ms,
+                    },
+                ) => {
+                    assert_eq!(max_probability, 0.1);
+                    assert_eq!(ms, 1000);
+                }
+                _ => panic!("wrong start constraint"),
+            }
+        }
+        assert!(serde_json::from_value::<StartConstraint>(
+            serde_json::json!({"kind":"quiet","ms":1000})
+        )
+        .is_err());
+        assert!(
+            serde_json::from_value::<StartConstraint>(serde_json::json!({"kind":"unknown"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reset_gap_is_reported_even_when_no_frames_are_uncertain() {
+        for reset in [false, true] {
+            let mut inputs = corpus();
+            for input in &mut inputs {
+                for frame in &mut input.frames[100..] {
+                    frame.end_ms += 32;
+                    frame.epoch = u64::from(reset);
+                }
+                input.labels[1].start_ms += 32;
+                input.labels[1].end_ms += 32;
+            }
+            let report = vad_replay::replay(&inputs[0], None).unwrap();
+            assert_eq!(report.scores.gap_ms, 32);
+            assert_eq!(report.scores.uncertain_ms, 0);
+            assert_eq!(report.scores.speech_onset.excluded, 0);
+            let result = evaluate(&inputs, baseline(), &AcceptancePolicy::default()).unwrap();
+            assert!(!result.accepted);
+            assert!(result
+                .reasons
+                .iter()
+                .any(|r| r.contains("incomplete detector")));
+        }
     }
 }
