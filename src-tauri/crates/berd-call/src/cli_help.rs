@@ -147,12 +147,13 @@ Usage:
     --model-dir ABSOLUTE_PATH --voice ID
 
 Each form also accepts:
-    [--rate FLOAT] [--interruption-threshold 0..1]
+    [--rate FLOAT] [--listening-threshold 0..1] [--interruption-threshold 0..1]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
     [--realtime-url WS_URL] [--stt-url WS_URL] [--tts-url HTTP_URL]
 
+--listening-threshold sets local speech detection before agent playback (default 0.5).
 --interruption-threshold sets local speech detection during agent playback (default 0.65).
 Higher values require stronger evidence of speech before pausing playback.
 

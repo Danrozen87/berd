@@ -3052,6 +3052,20 @@ mod tests {
     }
 
     #[test]
+    fn listening_threshold_applies_before_and_after_independent_playback_threshold() {
+        let controls = VoiceInputControls::default();
+        let listening = 0.8;
+        let probability = 0.7;
+        assert!(probability <= controls.vad_threshold(listening));
+        let playback = controls
+            .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
+            .unwrap();
+        assert!(probability > controls.vad_threshold(listening));
+        drop(playback);
+        assert!(probability <= controls.vad_threshold(listening));
+    }
+
+    #[test]
     fn silence_does_not_cross_the_default_earshot_threshold() {
         let mut vad = earshot::Detector::new(earshot::DefaultPredictor::new());
         assert!(vad.predict_f32(&[0.0; VAD_FRAME_SAMPLES]) <= 0.5);

@@ -105,6 +105,7 @@ fn validate_arguments(arguments: &[String]) -> Result<(), String> {
                     | "--spokesperson-voice"
                     | "--spokesperson-rate"
                     | "--interruption-threshold"
+                    | "--listening-threshold"
             )
         })
     {
@@ -231,6 +232,38 @@ pub(crate) fn with_spokesperson(arguments: &[String], on: bool, direct: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_thresholds_survive_reopen_and_override_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let settings = SavedSettings {
+            arguments: [
+                "--listening-threshold",
+                "0.8",
+                "--interruption-threshold",
+                "0.7",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            ..SavedSettings::default()
+        };
+        save(&path, &settings).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.arguments, settings.arguments);
+        assert_eq!(
+            merge_arguments(
+                &restored.arguments,
+                &["--interruption-threshold".into(), "0.9".into()]
+            ),
+            [
+                "--listening-threshold",
+                "0.8",
+                "--interruption-threshold",
+                "0.9"
+            ]
+        );
+    }
 
     #[test]
     fn saved_settings_survive_reopen_and_explicit_backend_clears_dependent_flags() {

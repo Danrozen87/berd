@@ -207,6 +207,7 @@ struct SessionConfig {
     spokesperson_voice: Option<String>,
     spokesperson_rate: Option<f32>,
     interruption_threshold: f32,
+    listening_threshold: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2299,6 +2300,7 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
                     &config.stt,
                     config.endpoints.stt.as_deref(),
                     &config.stt_hints,
+                    config.listening_threshold,
                 ) {
                     Ok(runtime) => runtime,
                     Err(message) => {
@@ -6078,6 +6080,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut spokesperson_voice = None;
     let mut spokesperson_rate = None;
     let mut interruption_threshold = 0.65;
+    let mut listening_threshold = 0.5;
     let mut index = 2;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -6093,14 +6096,17 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
             .get(index + 1)
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag {
-            "--interruption-threshold" => {
-                interruption_threshold = value
+            "--interruption-threshold" | "--listening-threshold" => {
+                let threshold = value
                     .parse::<f32>()
-                    .map_err(|_| "--interruption-threshold must be a number")?;
-                if !interruption_threshold.is_finite()
-                    || !(0.0..=1.0).contains(&interruption_threshold)
-                {
-                    return Err("--interruption-threshold must be between 0 and 1".into());
+                    .map_err(|_| format!("{flag} must be a number"))?;
+                if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                    return Err(format!("{flag} must be between 0 and 1").into());
+                }
+                if flag == "--listening-threshold" {
+                    listening_threshold = threshold;
+                } else {
+                    interruption_threshold = threshold;
                 }
             }
             "--tts-backend" => backend = value,
@@ -6196,6 +6202,7 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         spokesperson_voice,
         spokesperson_rate,
         interruption_threshold,
+        listening_threshold,
     })
 }
 
@@ -6815,7 +6822,7 @@ fn create_stt_benchmark_report(
         &pack,
         config.runs,
         config.mode,
-        || create_input_runtime(&config.stt, None, &[]),
+        || create_input_runtime(&config.stt, None, &[], 0.5),
     )))
 }
 
@@ -7154,6 +7161,7 @@ fn create_input_runtime(
     config: &SttBackendConfig,
     endpoint_override: Option<&str>,
     _hints: &[String],
+    listening_threshold: f32,
 ) -> Result<
     (
         VoiceInputRuntime,
@@ -7219,7 +7227,7 @@ fn create_input_runtime(
     };
     VoiceInputRuntime::start(VoiceInputConfig {
         engine,
-        speech_vad_threshold: 0.5,
+        speech_vad_threshold: listening_threshold,
         controls: VoiceInputControls::default(),
     })
     .map_err(|error| match config {
@@ -8506,6 +8514,30 @@ mod tests {
     use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
+
+    #[test]
+    fn listening_threshold_is_independent_and_bounded() {
+        let base: Vec<String> = ["berd-call", "session", "--tts-backend", "openai"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(parse_args(&base).unwrap().listening_threshold, 0.5);
+        for value in ["0", "0.8", "1"] {
+            let mut args = base.clone();
+            args.extend(["--listening-threshold".into(), value.into()]);
+            let config = parse_args(&args).unwrap();
+            assert_eq!(config.interruption_threshold, 0.65);
+            assert_eq!(config.listening_threshold, value.parse::<f32>().unwrap());
+            args.extend(["--interruption-threshold".into(), "0.7".into()]);
+            let config = parse_args(&args).unwrap();
+            assert_eq!(config.interruption_threshold, 0.7);
+            assert_eq!(config.listening_threshold, value.parse::<f32>().unwrap());
+        }
+        for value in ["-0.1", "1.1", "NaN", "inf", "quiet"] {
+            let mut args = base.clone();
+            args.extend(["--listening-threshold".into(), value.into()]);
+            assert!(parse_args(&args).is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn interruption_threshold_is_bounded_and_defaults_to_balanced() {
@@ -10816,6 +10848,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
 
@@ -10831,6 +10864,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
     }
@@ -10912,6 +10946,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
         assert!(parse_args(&args(&[
@@ -10972,6 +11007,7 @@ mod tests {
             spokesperson_voice: None,
             spokesperson_rate: None,
             interruption_threshold: 0.65,
+            listening_threshold: 0.5,
         };
         let mut realtime = OpenAiSpokespersonConfig {
             endpoint: "ws://localhost".into(),
@@ -11196,6 +11232,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
         assert!(parse_args(&args(&[
@@ -11262,6 +11299,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
         assert!(parse_args(&args(&[
@@ -11711,6 +11749,7 @@ mod tests {
                 spokesperson_voice: None,
                 spokesperson_rate: None,
                 interruption_threshold: 0.65,
+                listening_threshold: 0.5,
             }
         );
     }
@@ -11940,6 +11979,60 @@ mod tests {
             wait_for_input_ready(&mut receiver, Duration::from_millis(10)),
             Err("voice input readiness timed out".into())
         );
+    }
+
+    #[test]
+    fn false_speech_hold_releases_only_after_speaking_and_recognition_settle() {
+        let mut core = SessionCore::default();
+        let mut active = None;
+        let mut held = None;
+        let mut output = Vec::new();
+        let mut next_token = 1;
+        for event in [
+            VoiceInputEvent::RecognitionPendingChanged(true),
+            VoiceInputEvent::SpeakingChanged(true),
+        ] {
+            handle_voice_input_event(event, &mut core, &mut active, &mut next_token, &mut output)
+                .unwrap();
+        }
+        process_prepare(
+            PrepareRequest {
+                id: 4,
+                acknowledgement: None,
+                text: "reply".into(),
+            },
+            None,
+            &mut core,
+            &test_tts_slot(),
+            &test_input_policy_slot(),
+            &mut active,
+            &mut held,
+            &mut output,
+        )
+        .unwrap();
+        assert!(held.is_some());
+        assert!(active.is_none());
+        for pending in [true, false] {
+            let event = if pending {
+                VoiceInputEvent::SpeakingChanged(false)
+            } else {
+                VoiceInputEvent::RecognitionPendingChanged(false)
+            };
+            handle_voice_input_event(event, &mut core, &mut active, &mut next_token, &mut output)
+                .unwrap();
+            reevaluate_held(
+                &mut held,
+                &mut core,
+                Some(&test_tts_slot()),
+                Some(&test_input_policy_slot()),
+                &mut active,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(held.is_some(), pending);
+            assert_eq!(active.is_some(), !pending);
+        }
+        assert_eq!(messages(&output).last().unwrap()["type"], "admitted");
     }
 
     #[test]

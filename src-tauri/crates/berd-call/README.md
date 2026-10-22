@@ -9,9 +9,13 @@ management, synthesis and benchmark tools described below. Desktop Berd keeps
 its persisted settings and user interface. The standalone command includes a
 small macOS host for default-device capture, playback, and transcript delivery.
 
-### Local interruption detection
+### Local speech detection
 
-Conventional calls accept `--interruption-threshold 0..1` at `start` or `session` (default `0.65`). It controls the local speech detector while an agent's audio plays. Higher values require stronger evidence of speech before pausing playback; lower values make interruptions easier. It does not change the idle listening threshold or the transcription provider. Saved call arguments retain the value. To change a running call, supply its complete session configuration, for example `settings --restart --voice Aaron --language en-US --interruption-threshold 0.8`. Restart replaces the session options; include the existing backend, model, rate and other choices you want to retain.
+Conventional calls accept independent `--listening-threshold 0..1` (default `0.5`) and `--interruption-threshold 0..1` (default `0.65`) at `start` or `session`. Higher values require stronger evidence of speech. Listening controls detection before agent playback, including the gate that holds replies while input is speaking or awaiting recognition. Interruption controls detection during agent playback. These local thresholds do not change provider endpointing or Spokesperson server VAD.
+
+On macOS, a local speech detection also marks recognition pending. After local speech ends, admission continues waiting for recognition to settle, with a five-second no-result fallback. Raising the listening threshold can reduce false starts in background noise; it does not shorten that fallback or prove a particular microphone's false detections are resolved.
+
+Saved call arguments retain both values independently. To change a running call, supply its complete session configuration, for example `settings --restart --voice Aaron --language en-US --listening-threshold 0.8 --interruption-threshold 0.7`. Restart replaces the session options; include the existing backend, model, rate and other choices you want to retain.
 
 ## Command-line interface
 
