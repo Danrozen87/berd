@@ -623,6 +623,7 @@ struct QueuedFrame {
     frame: VoiceInputFrame,
     mute_epoch: u64,
     /// This frame's index among those the trace received.
+    #[cfg(target_os = "macos")]
     mic_frame: u64,
 }
 
@@ -739,6 +740,7 @@ impl VoiceInputRuntime {
         if self.controls.is_muted() || mute_epoch != self.controls.mute_epoch() {
             return Ok(());
         }
+        #[cfg(target_os = "macos")]
         let mic_frame = self
             .controls
             .shared
@@ -748,6 +750,7 @@ impl VoiceInputRuntime {
         match self.frame_tx.try_send(QueuedFrame {
             frame,
             mute_epoch,
+            #[cfg(target_os = "macos")]
             mic_frame,
         }) {
             Ok(()) => Ok(()),
@@ -1617,6 +1620,7 @@ fn forward_mac_events(
 }
 
 /// Numbers detector frames, recognizer generations and settings revisions for a trace.
+#[cfg(any(target_os = "macos", test))]
 struct FrameTracer {
     trace: Option<Arc<dyn DetectionTrace>>,
     vad_frame: u64,
@@ -1624,6 +1628,7 @@ struct FrameTracer {
     settings: Option<(u64, crate::detection::DetectionSettings)>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl FrameTracer {
     fn new(trace: Option<Arc<dyn DetectionTrace>>) -> Self {
         Self {
@@ -1685,6 +1690,7 @@ impl FrameTracer {
 /// The 48 kHz microphone sample just past a detector frame. `consumed` input and
 /// `produced` output samples, through the frame's end, count everything the
 /// resampler has seen; its output lags its input by `delay` output samples.
+#[cfg(any(target_os = "macos", test))]
 fn detector_frame_end(chunk_end: u64, consumed: u64, produced: u64, delay: usize) -> u64 {
     let ratio = (INPUT_SAMPLE_RATE / 16_000) as u64;
     let lag = consumed.saturating_sub(ratio * produced.saturating_sub(delay as u64));
