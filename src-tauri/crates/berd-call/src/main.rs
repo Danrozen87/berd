@@ -1135,6 +1135,13 @@ fn parse_host_settings_args(
             "--muted" => host_control::ControlRequest::Muted {
                 muted: parse_bool_setting(flag, args.get(index + 1))?,
             },
+            "--vad-debug-sounds" => host_control::ControlRequest::VadDebugSounds {
+                enabled: match args.get(index + 1).map(String::as_str) {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err("--vad-debug-sounds requires on or off".into()),
+                },
+            },
             "--status-sounds" => host_control::ControlRequest::StatusSounds {
                 mode: Some(match args.get(index + 1).map(String::as_str) {
                     Some("off") => berd_call::StatusSoundMode::Off,
@@ -1231,7 +1238,7 @@ fn parse_host_settings_args(
 }
 
 const SETTINGS_CHOICE_ERROR: &str =
-    "provide exactly one of --non-blocking, --rate, --voice, --spokesperson-voice, --spokesperson-rate, --tts, --input-during-tts, --muted, --status-sounds, --conversation-status, --spokesperson, or --restart";
+    "provide exactly one of --non-blocking, --rate, --voice, --spokesperson-voice, --spokesperson-rate, --tts, --input-during-tts, --muted, --vad-debug-sounds, --status-sounds, --conversation-status, --spokesperson, or --restart";
 
 fn parse_bool_setting(flag: &str, value: Option<&String>) -> Result<bool, String> {
     match value.map(String::as_str) {
@@ -8771,6 +8778,22 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
+    #[test]
+    fn debug_sound_cli_accepts_only_on_and_off() {
+        for (value, enabled) in [("on", true), ("off", false)] {
+            assert!(
+                matches!(parse_host_settings_args(&args(&["berd-call", "settings", "--vad-debug-sounds", value])).unwrap().1, host_control::ControlRequest::VadDebugSounds { enabled: actual } if actual == enabled)
+            );
+        }
+        assert!(parse_host_settings_args(&args(&[
+            "berd-call",
+            "settings",
+            "--vad-debug-sounds",
+            "true"
+        ]))
+        .is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn update_check_only_targets_the_owning_app_bundle() {
@@ -13483,6 +13506,7 @@ mod tests {
                 }),
                 input_policy: Some(berd_call::input::InputDuringTtsPolicy::SuppressInput),
                 status_sounds: None,
+                vad_debug_sounds: false,
             },
         )
         .unwrap();

@@ -15,6 +15,8 @@ pub(crate) struct SavedSettings {
     // Left out until chosen, so a file without one still opens in older berd-call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_sounds: Option<StatusSoundMode>,
+    #[serde(default)]
+    pub vad_debug_sounds: bool,
 }
 
 pub(crate) fn path() -> Result<PathBuf, String> {
