@@ -3175,7 +3175,7 @@ mod tests {
         controls.set_detection(settings).unwrap();
         let epoch = controls.mute_epoch();
         let now = Instant::now();
-        for n in 0..3 {
+        for n in 0..1 {
             let time = now + Duration::from_secs(n * 40);
             controls.observe_detection_at(true, epoch, time);
             controls.detection_result_at(false, epoch, time + Duration::from_secs(6));
@@ -3184,7 +3184,7 @@ mod tests {
         let playback = controls
             .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
             .unwrap();
-        for n in 0..3 {
+        for n in 0..1 {
             let time = now + Duration::from_secs(120 + n * 40);
             controls.observe_detection_at(false, epoch, time);
             controls.detection_result_at(true, epoch, time + Duration::from_secs(6));

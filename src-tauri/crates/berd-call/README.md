@@ -19,7 +19,7 @@ Device profiles retain both values independently; legacy saved call arguments ar
 
 ### Experimental dynamic tuning and audio profiles
 
-With macOS speech recognition, `--dynamic-listening true` and `--dynamic-interruption true` independently opt into outcome-based tuning. Both default to false. Each enabled threshold moves one 0.01 tick after three unmatched observations, at most once every 30 seconds. Dynamic values start and remain within 0.10 to 0.95; manual thresholds still accept 0 to 1.
+With macOS speech recognition, `--dynamic-listening true` and `--dynamic-interruption true` independently opt into outcome-based tuning. Both default to false. Each enabled threshold moves one 0.01 tick after each qualifying unmatched outcome, without a cooldown. Dynamic values start and remain within 0.10 to 0.95; manual thresholds still accept 0 to 1.
 
 A local detection that settles without a nonempty transcript suggests raising sensitivity's threshold. A nonempty transcript after at least five seconds without local detection suggests lowering it. Recognized speech clears false-trigger evidence. Split-result grace periods, mode changes, mute/reset epochs and device changes discard ambiguous evidence. These are experimental heuristics: recognition failure and playback leakage can still mislead them. They do not establish an optimal threshold or replace acoustic echo cancellation.
 

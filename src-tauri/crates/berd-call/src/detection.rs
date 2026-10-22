@@ -98,14 +98,12 @@ pub enum DetectionMode {
 }
 
 const STEP: f32 = 0.01;
-const COOLDOWN: Duration = Duration::from_secs(30);
 const RESULT_GRACE: Duration = Duration::from_secs(5);
 
 pub struct DetectionTuner {
     snapshot: DetectionSnapshot,
     window: Option<Observation>,
     grace_until: Option<Instant>,
-    evidence: [Evidence; 2],
 }
 
 struct Observation {
@@ -113,19 +111,6 @@ struct Observation {
     began: Instant,
     detected: bool,
     ambiguous: bool,
-}
-
-#[derive(Default)]
-struct Evidence {
-    no_result: u8,
-    missed: u8,
-    last_adjustment: Option<Instant>,
-}
-
-impl DetectionMode {
-    fn index(self) -> usize {
-        usize::from(self == Self::Interruption)
-    }
 }
 
 impl DetectionTuner {
@@ -139,7 +124,6 @@ impl DetectionTuner {
             },
             window: None,
             grace_until: None,
-            evidence: Default::default(),
         }
     }
     pub fn snapshot(&self) -> DetectionSnapshot {
@@ -164,47 +148,27 @@ impl DetectionTuner {
     }
     pub fn final_transcript(&mut self, now: Instant) {
         if let Some(window) = self.window.take().filter(|window| !window.ambiguous) {
-            let evidence = &mut self.evidence[window.mode.index()];
-            evidence.no_result = 0;
-            if window.detected {
-                evidence.missed = 0;
-            } else if now.duration_since(window.began) >= RESULT_GRACE
+            if !window.detected
+                && now.duration_since(window.began) >= RESULT_GRACE
                 && self.grace_until.is_none_or(|until| now >= until)
             {
                 self.snapshot.missed_detection += 1;
-                evidence.missed = evidence.missed.saturating_add(1);
-                self.adjust(window.mode, false, now);
+                self.adjust(window.mode, false);
             }
         }
         self.grace_until = Some(now + RESULT_GRACE);
     }
-    pub fn no_result(&mut self, now: Instant) {
+    pub fn no_result(&mut self, _now: Instant) {
         if let Some(window) = self
             .window
             .take()
             .filter(|window| window.detected && !window.ambiguous)
         {
             self.snapshot.no_result += 1;
-            let evidence = &mut self.evidence[window.mode.index()];
-            evidence.missed = 0;
-            evidence.no_result = evidence.no_result.saturating_add(1);
-            self.adjust(window.mode, true, now);
+            self.adjust(window.mode, true);
         }
     }
-    fn adjust(&mut self, mode: DetectionMode, increase: bool, now: Instant) {
-        let evidence = &mut self.evidence[mode.index()];
-        let count = if increase {
-            evidence.no_result
-        } else {
-            evidence.missed
-        };
-        if count < 3
-            || evidence
-                .last_adjustment
-                .is_some_and(|last| now.duration_since(last) < COOLDOWN)
-        {
-            return;
-        }
+    fn adjust(&mut self, mode: DetectionMode, increase: bool) {
         let threshold = match mode {
             DetectionMode::Listening => &mut self.snapshot.settings.listening,
             DetectionMode::Interruption => &mut self.snapshot.settings.interruption,
@@ -220,17 +184,10 @@ impl DetectionTuner {
         }
         threshold.value = next;
         self.snapshot.adjustments += 1;
-        evidence.last_adjustment = Some(now);
-        evidence.no_result = 0;
-        evidence.missed = 0;
     }
     pub fn reset_evidence(&mut self) {
         self.window = None;
         self.grace_until = None;
-        for evidence in &mut self.evidence {
-            evidence.no_result = 0;
-            evidence.missed = 0;
-        }
     }
 }
 
@@ -280,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_no_result_moves_only_the_detecting_mode_one_tick() {
+    fn each_no_result_moves_only_the_detecting_mode_one_tick() {
         let mut tuner = tuner();
         let now = Instant::now();
         for n in 0..3 {
@@ -288,9 +245,9 @@ mod tests {
             tuner.observe(DetectionMode::Listening, true, time);
             tuner.no_result(time + Duration::from_secs(6));
         }
-        assert_eq!(tuner.snapshot().settings.listening.value, 0.51);
+        assert_eq!(tuner.snapshot().settings.listening.value, 0.53);
         assert_eq!(tuner.snapshot().settings.interruption.value, 0.65);
-        assert_eq!(tuner.snapshot().adjustments, 1);
+        assert_eq!(tuner.snapshot().adjustments, 3);
     }
     #[test]
     fn idle_mode_changes_do_not_disable_interruption_learning() {
@@ -306,7 +263,7 @@ mod tests {
             );
             tuner.no_result(time + Duration::from_secs(7));
         }
-        assert_eq!(tuner.snapshot().settings.interruption.value, 0.66);
+        assert_eq!(tuner.snapshot().settings.interruption.value, 0.68);
         assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
     }
 
@@ -331,11 +288,11 @@ mod tests {
             tuner.observe(DetectionMode::Interruption, false, time);
             tuner.final_transcript(time + Duration::from_secs(6));
         }
-        assert_eq!(tuner.snapshot().settings.interruption.value, 0.64);
+        assert_eq!(tuner.snapshot().settings.interruption.value, 0.62);
         assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
     }
     #[test]
-    fn adjustments_are_rate_limited_and_stay_inside_dynamic_bounds() {
+    fn adjustments_have_no_cooldown_and_stay_inside_dynamic_bounds() {
         let mut tuner = tuner();
         tuner.snapshot.settings.listening.value = 0.94;
         let now = Instant::now();
@@ -353,7 +310,8 @@ mod tests {
             tuner.observe(DetectionMode::Listening, true, time);
             tuner.no_result(time);
         }
-        assert_eq!(tuner.snapshot().adjustments, 2);
+        assert_eq!(tuner.snapshot().adjustments, 7);
+        assert_eq!(tuner.snapshot().settings.listening.value, 0.56);
     }
 
     #[test]
