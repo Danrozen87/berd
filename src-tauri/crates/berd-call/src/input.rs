@@ -912,10 +912,12 @@ struct PendingRecognitions {
     /// Where each unresolved turn's speech ended, oldest first; None while it continues.
     ends: VecDeque<Option<u64>>,
     /// The latest recognizer sample with interim words.
+    #[cfg(target_os = "macos")]
     heard: u64,
     /// Apple's latest result was interim words rather than a final. Apple
     /// re-reports words a final left out, and interim results end where its
     /// audio does rather than at the last word, so order says more than samples.
+    #[cfg(any(target_os = "macos", test))]
     unfinalized: bool,
 }
 
