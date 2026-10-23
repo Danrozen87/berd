@@ -334,7 +334,7 @@ updates keep the prior configuration, and private credentials, endpoints, and
 bundle paths never enter the snapshot.
 
 The session also projects a separately revisioned `input_during_tts` snapshot.
-`allow_barge_in` keeps PCM flowing through assistant-sensitive VAD, while
+`allow_barge_in` keeps PCM flowing through the same VAD threshold, while
 `suppress_input` drops PCM at the shared runtime for the admitted utterance.
 Live policy updates apply to the next admission; host mute remains an
 independent reason, so neither state can accidentally clear the other.
@@ -432,7 +432,7 @@ CC BY 4.0, as reflected by the crate's aggregate package-license metadata.
 Input is paced in real time as exact 960-sample frames every 20 ms. Each clip
 has one second of leading silence and 6.5 seconds of trailing silence. The long
 tail deliberately keeps continuous recognizers supplied with capture-like PCM
-through VAD settlement and the runtime's five-second live no-result bound; it
+through VAD settlement and the runtime's five-second pending-utterance timeout; it
 is included in the reported workload. A final transcript is validated and
 stored in its per-utterance result before its storage receipt is acknowledged,
 and the next clip does not begin until authoritative speaking and
@@ -462,3 +462,5 @@ Auto is the default input-during-speech preference. It mutes microphone input du
 ### Input activity in stdout streams
 
 `start --stream` (including `--stream live`) emits ephemeral `0\tinput_activity\t{"speaking":true,"recognizing":false}` rows when input speech or recognition state changes. Both booleans are snapshots; show activity while either is true. These rows have cursor zero, are not utterances, and must never advance a speech cursor, trigger an agent turn, or enter transcript history. They are not delivered to Codex tasks. Clear client activity on session restart, stream end, or failure. Older CLIs omit these rows.
+
+On macOS, conventional sessions with `--stream` also emit ephemeral `0\tuser_interim\t{"cursor":12,"text":"you should"}` rows while your words are still being transcribed. Each row replaces the previous one; empty text clears it, as do mute, input reset and session restart. `cursor` is the cursor the next `user` row will carry, so a client can show the words as a caption or let an agent start on them and keep its reply current when the final arrives. The final `user` row stays authoritative. Like `input_activity`, these rows never advance a speech cursor or enter transcript history, and older CLIs omit them.

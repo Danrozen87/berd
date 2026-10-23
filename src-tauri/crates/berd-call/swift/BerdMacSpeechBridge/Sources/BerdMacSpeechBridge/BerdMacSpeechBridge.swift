@@ -7,9 +7,12 @@ import Foundation
 private let finalEvent: Int32 = 1
 private let finishedEvent: Int32 = 2
 private let failedEvent: Int32 = 3
+private let heardEvent: Int32 = 4
 
+// The Double is where a final's or interim result's audio ends, in seconds of
+// pushed input, or NaN.
 public typealias BerdMacSpeechEventCallback = @convention(c) (
-    Int32, UnsafePointer<CChar>?, UnsafeMutableRawPointer?
+    Int32, UnsafePointer<CChar>?, Double, UnsafeMutableRawPointer?
 ) -> Void
 public typealias BerdMacSpeechProgressCallback = @convention(c) (
     Double, UnsafeMutableRawPointer?
@@ -130,7 +133,7 @@ private func speechTranscriber(for locale: Locale) -> SpeechTranscriber {
     SpeechTranscriber(
         locale: locale,
         transcriptionOptions: [],
-        reportingOptions: [],
+        reportingOptions: [.volatileResults],
         attributeOptions: [.audioTimeRange]
     )
 }
@@ -306,9 +309,13 @@ private final class SpeechSession: @unchecked Sendable {
                         guard let self else { return }
                         let text = String(result.text.characters)
                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { continue }
-                        guard result.isFinal else { continue }
-                        self.emit(finalEvent, text: text)
+                        let end = result.range.end.isNumeric ? result.range.end.seconds : .nan
+                        if result.isFinal {
+                            // Empty finals still settle their audio, so the host stops waiting on it.
+                            self.emit(finalEvent, text: text, end: end)
+                        } else if !text.isEmpty {
+                            self.emit(heardEvent, text: text, end: end)
+                        }
                     }
                     self?.taskCompleted()
                 } catch is CancellationError { self?.taskCompleted() }
@@ -417,11 +424,11 @@ private final class SpeechSession: @unchecked Sendable {
         Task.detached { [analyzer] in await analyzer.cancelAndFinishNow() }
     }
 
-    private func emit(_ event: Int32, text: String? = nil) {
+    private func emit(_ event: Int32, text: String? = nil, end: Double = .nan) {
         lock.withLock {
             guard callbacksEnabled, !terminalEmitted else { return }
-            if let text { text.withCString { callback(event, $0, context.pointer) } }
-            else { callback(event, nil, context.pointer) }
+            if let text { text.withCString { callback(event, $0, end, context.pointer) } }
+            else { callback(event, nil, end, context.pointer) }
         }
     }
 
@@ -429,7 +436,7 @@ private final class SpeechSession: @unchecked Sendable {
         let emitted = lock.withLock {
             guard callbacksEnabled, !terminalEmitted else { return false }
             terminalEmitted = true
-            error.localizedDescription.withCString { callback(failedEvent, $0, context.pointer) }
+            error.localizedDescription.withCString { callback(failedEvent, $0, .nan, context.pointer) }
             return true
         }
         if emitted { completion.signal() }
@@ -444,7 +451,7 @@ private final class SpeechSession: @unchecked Sendable {
             completedTasks += 1
             guard completedTasks == 2, callbacksEnabled, !terminalEmitted else { return false }
             terminalEmitted = true
-            callback(finishedEvent, nil, context.pointer)
+            callback(finishedEvent, nil, .nan, context.pointer)
             return true
         }
         if emitted { completion.signal() }

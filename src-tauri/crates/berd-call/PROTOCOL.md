@@ -301,12 +301,40 @@ The child emits:
 {"type":"live_event","token":u64,"text":string,"origin"?:"user"|"spokesperson"|"handoff"}
 ```
 
+On macOS, `recognition_pending.active` reports the agent speech admission hold, not
+the count of unresolved native recognitions. After local speech ends the hold
+expires after five seconds without a final, or, while Apple's latest result is
+interim words that no final has followed, after up to ten more seconds. Noise with no
+interim words keeps the five seconds. Empty finals settle their audio and resolve
+their turns without emitting a `live_event`. Expiry emits
+`recognition_pending.active:false` without cancelling recognition, clearing audio,
+or changing the recognizer generation, so a late final is still forwarded as a
+`live_event`. New speech reasserts the hold. Native finals carry no utterance
+identity, so each final carries the end of its audio and resolves the ended speech
+turns that audio covers, oldest first, which may include expired ones. A final for
+an earlier phrase of a turn still being spoken resolves nothing, and a final with no
+end resolves the oldest turn. Credit accounting is capped at 1024; at the cap attribution stays ambiguous
+until the recognizer resets, and finals still forward but only the timeout
+releases the hold.
+
 For every final live-side event, the child allocates a strictly increasing token,
 stores it in `SessionCore`, acknowledges the runtime storage receipt, and emits
 `live_event`. Conventional sessions omit `origin`, which means `user`.
 Expert-Spokesperson sessions use `origin` to distinguish user transcripts,
 Spokesperson transcripts, and handoffs. User finals interrupt reserved or playing
 assistant output only after storage and emission. Final text is at most 64 KiB.
+
+Conventional sessions on macOS also emit the user's words while they are still
+being transcribed:
+
+```text
+{"type":"user_interim","token":u64,"text":string}
+```
+
+Each `user_interim` replaces the previous one, and empty text clears it.
+`token` is the token the next user final will take, so a reply composed against
+interim words is still current once they finalize. The message is never stored,
+never allocates a token, and never interrupts output.
 
 Expert-Spokesperson sessions also emit two previews for hosts that show the
 conversation as it happens:
@@ -355,7 +383,7 @@ ID and speech ID when it is ready to accept output:
 Before emitting `accepted`, the child installs the admitted speech's leased
 assistant-activity guard. `suppress_input` stops PCM admission so user input
 cannot interrupt the speech; `allow_barge_in` continues PCM admission with the
-assistant-sensitive VAD threshold. `accepted` transfers output authority. The
+same VAD threshold. `accepted` transfers output authority. The
 child then writes Begin and waits for `audio_begin_accepted` before delivering
 PCM. Readiness is bounded to two seconds; expiry emits `speech_failed` with zero output. With `allow_barge_in`, speaking or recognition pending provisionally suspends started output. If both clear without a final, the same speech and player resume. A final, targeted cancellation, host mute/reset while provisionally suspended, pause, or shutdown discards the hold and interrupts exactly once.
 Accepted output owns exactly one assistant-activity guard. The child removes

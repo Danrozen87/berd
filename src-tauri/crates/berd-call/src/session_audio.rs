@@ -321,6 +321,8 @@ impl RemotePcmAudioOutput {
     /// Wakes the playback worker so it can serialize Cancel on the audio pipe.
     /// The caller owns only the cancellation flag; pipe writes remain worker-owned.
     pub fn notify_cancel_requested(&self) {
+        // Waiters check the flag under this lock, so taking it orders the wake after any check.
+        drop(self.state.lock().expect("remote output state"));
         self.changed.notify_all();
     }
 
@@ -1715,6 +1717,25 @@ mod tests {
             .unwrap();
         let mut byte = [0];
         assert!(host.read(&mut byte).is_err());
+    }
+
+    #[test]
+    fn cancel_request_wakes_a_waiter_that_checked_the_flag_before_waiting() {
+        let (output, _host) = fixture();
+        // Like the worker: the flag was checked under the lock, but the wait has not begun.
+        let state = output.state.lock().unwrap();
+        let current = Arc::clone(&output);
+        let canceller = thread::spawn(move || {
+            current.active.store(false, Ordering::SeqCst);
+            current.notify_cancel_requested();
+        });
+        thread::sleep(Duration::from_millis(50));
+        let (_state, wait) = output
+            .changed
+            .wait_timeout(state, Duration::from_secs(1))
+            .unwrap();
+        assert!(!wait.timed_out(), "cancellation wake was lost");
+        canceller.join().unwrap();
     }
 
     #[test]

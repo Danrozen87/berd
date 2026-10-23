@@ -22,7 +22,6 @@ use berd_call::input::{
     VoiceInputConfig, VoiceInputControls, VoiceInputEngineConfig, VoiceInputEvent, VoiceInputFrame,
     VoiceInputRuntime, INPUT_FRAME_SAMPLES,
 };
-use berd_call::openai_realtime_protocol::accepted_handoff_tool_output;
 use berd_call::openai_realtime_protocol::expert_handoff_message;
 use berd_call::openai_realtime_protocol::expert_transcript_message;
 use berd_call::openai_realtime_protocol::RealtimeExpertMessage;
@@ -96,6 +95,8 @@ const PCM_FRAME_BYTES: usize = INPUT_FRAME_SAMPLES * std::mem::size_of::<f32>();
 const MAX_FINAL_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SPEAK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_HANDOFF_IDS: usize = 64;
+/// Speech probability that counts as the user talking, with or without agent playback.
+const VAD_THRESHOLD: f32 = 0.9;
 const MAX_HANDOFF_ID_BYTES: usize = 512;
 const MAX_HANDOFF_REASON_BYTES: usize = 4 * 1024;
 const INPUT_QUEUE_CAPACITY: usize = 32;
@@ -2917,6 +2918,8 @@ fn run_session(config: SessionConfig, pcm_output_fd: RawFd) -> Result<(), String
 enum LivePlaybackInput {
     Samples(Vec<f32>),
     Finish,
+    #[cfg(test)]
+    Checkpoint(SyncSender<()>),
 }
 
 type LivePlaybackResult = Result<(String, u64), (String, u64, String)>;
@@ -4019,7 +4022,7 @@ fn run_expert_spokesperson_session(
                                 }
                                 // The worker has stopped; its result settles this reply.
                                 Err(mpsc::TrySendError::Disconnected(_)) => {}
-                                Err(mpsc::TrySendError::Full(LivePlaybackInput::Finish)) => {
+                                Err(mpsc::TrySendError::Full(_)) => {
                                     unreachable!("streaming sends samples")
                                 }
                             },
@@ -4226,14 +4229,10 @@ fn run_expert_spokesperson_session(
                             LiveSideEvent::Handoff { call_id, .. } => call_id,
                             _ => return Err("live handoff did not produce a handoff ID".into()),
                         };
-                        // A provider that expired right behind the handoff has already
-                        // closed the runtime. Its queued terminal event settles the handoff.
-                        let _ = runtime.as_ref().expect("initialized runtime").send(
-                            SpokespersonCommand::Provider(accepted_handoff_tool_output(
-                                &call_id,
-                                &handoff_id,
-                            )?),
-                        );
+                        runtime
+                            .as_ref()
+                            .expect("initialized runtime")
+                            .acknowledge_handoff(&call_id, &handoff_id)?;
                     }
                     event @ (SpokespersonEvent::Expired(_) | SpokespersonEvent::SessionLost(_)) => {
                         let (message, connection_lost) = match event {
@@ -5554,6 +5553,10 @@ fn spawn_live_playback(
             let mut loudness = berd_call::SpokespersonLoudness::default();
             while let Ok(input) = receiver.recv() {
                 match input {
+                    #[cfg(test)]
+                    LivePlaybackInput::Checkpoint(reached) => {
+                        reached.send(()).unwrap();
+                    }
                     LivePlaybackInput::Samples(mut samples) => {
                         loudness.process(&mut samples);
                         worker_output.write(&samples)?;
@@ -5734,6 +5737,9 @@ fn cancel_live_playback(active: &mut Option<LivePlayback>) {
     if let Some(playback) = active.as_ref() {
         playback.active.store(false, Ordering::SeqCst);
         playback.output.notify_cancel_requested();
+        // The worker may be waiting for provider input instead of an output acknowledgement.
+        // A full queue already wakes it; its next write observes the cancelled authority.
+        let _ = playback.sender.try_send(LivePlaybackInput::Finish);
     }
 }
 
@@ -5918,7 +5924,7 @@ fn flush_active_live_playback(
                 response.pending_frames = 0;
                 return Ok(());
             }
-            Err(mpsc::TrySendError::Full(LivePlaybackInput::Finish)) => {
+            Err(mpsc::TrySendError::Full(_)) => {
                 unreachable!("audio queue contains samples")
             }
         }
@@ -5930,7 +5936,7 @@ fn flush_active_live_playback(
                 mpsc::TrySendError::Full(LivePlaybackInput::Finish)
                 | mpsc::TrySendError::Disconnected(_),
             ) => {}
-            Err(mpsc::TrySendError::Full(LivePlaybackInput::Samples(_))) => {
+            Err(mpsc::TrySendError::Full(_)) => {
                 unreachable!("finish queue contains finish")
             }
         }
@@ -6196,8 +6202,8 @@ fn acknowledge_output_ready(
 ) -> Result<(), String> {
     current.assistant_activity = input_controls.map(|controls| {
         controls
-            .begin_assistant_activity(0.65, current.input_during_tts.policy)
-            .expect("balanced assistant threshold is valid")
+            .begin_assistant_activity(VAD_THRESHOLD, current.input_during_tts.policy)
+            .expect("VAD threshold is valid")
     });
     write_message(
         writer,
@@ -7048,7 +7054,7 @@ fn stt_benchmark_target(config: &SttBackendConfig) -> Result<SttBenchmarkTarget,
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
             locale: None,
-            vad_threshold: 0.5,
+            vad_threshold: VAD_THRESHOLD,
             endpoint_source: None,
             model_source: Some("explicit --stt-model-dir".into()),
             credential_source: None,
@@ -7061,7 +7067,7 @@ fn stt_benchmark_target(config: &SttBackendConfig) -> Result<SttBenchmarkTarget,
                     backend: "macos".into(),
                     model: Some(status.model_status),
                     locale: status.locale,
-                    vad_threshold: 0.5,
+                    vad_threshold: VAD_THRESHOLD,
                     endpoint_source: None,
                     model_source: Some("installed current-locale model".into()),
                     credential_source: None,
@@ -7096,7 +7102,7 @@ fn stt_benchmark_target(config: &SttBackendConfig) -> Result<SttBenchmarkTarget,
                 backend: "openai".into(),
                 model: Some(model),
                 locale: None,
-                vad_threshold: 0.5,
+                vad_threshold: VAD_THRESHOLD,
                 endpoint_source: Some(endpoint_source.into()),
                 model_source: Some(model_source.into()),
                 credential_source: Some(format!(
@@ -7441,7 +7447,7 @@ fn create_input_runtime(
     };
     VoiceInputRuntime::start(VoiceInputConfig {
         engine,
-        speech_vad_threshold: 0.5,
+        speech_vad_threshold: VAD_THRESHOLD,
         controls: VoiceInputControls::default(),
     })
     .map_err(|error| match config {
@@ -7853,6 +7859,13 @@ fn handle_voice_input_event(
             )?;
             update_provisional_suspension(core, active)?;
         }
+        VoiceInputEvent::InterimTranscript(text) => write_message(
+            writer,
+            &SessionMessage::UserInterim {
+                token: *next_token,
+                text,
+            },
+        )?,
         VoiceInputEvent::FinalTranscript {
             text,
             storage_receipt,
@@ -10293,6 +10306,75 @@ mod tests {
         let mut payload = vec![0; length];
         reader.read_exact(&mut payload).unwrap();
         (header[3], payload)
+    }
+
+    #[test]
+    fn live_cancel_wakes_a_worker_waiting_for_more_provider_audio() {
+        for tail_frames in [0, 1, session_audio::MAX_AUDIO_CHUNK_FRAMES - 1] {
+            let (child, mut host) = UnixStream::pair().unwrap();
+            host.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let transport =
+                Arc::new(unsafe { AudioPipeTransport::from_raw_fd(child.into_raw_fd()) }.unwrap());
+            let (control, _controls) = mpsc::channel();
+            let (completed, results) = mpsc::channel();
+            let playback =
+                spawn_live_playback("response".into(), 7, None, transport, control, completed)
+                    .unwrap();
+            assert_eq!(
+                read_audio_record(&mut host).0,
+                session_audio::AUDIO_BEGIN_KIND
+            );
+            playback
+                .output
+                .handle_ack(AudioHostAck::BeginAccepted)
+                .unwrap();
+            playback
+                .sender
+                .send(LivePlaybackInput::Samples(
+                    vec![0.1; session_audio::MAX_AUDIO_CHUNK_FRAMES],
+                ))
+                .unwrap();
+            assert_eq!(
+                read_audio_record(&mut host).0,
+                session_audio::AUDIO_CHUNK_KIND
+            );
+            playback
+                .output
+                .handle_ack(AudioHostAck::ChunkAccepted { sequence: 1 })
+                .unwrap();
+            if tail_frames > 0 {
+                playback
+                    .sender
+                    .send(LivePlaybackInput::Samples(vec![0.2; tail_frames]))
+                    .unwrap();
+            }
+            let (checkpoint, reached) = mpsc::sync_channel(0);
+            playback
+                .sender
+                .send(LivePlaybackInput::Checkpoint(checkpoint))
+                .unwrap();
+            reached.recv_timeout(Duration::from_secs(1)).unwrap();
+            let mut active = Some(playback);
+            cancel_live_playback(&mut active);
+            assert_eq!(
+                read_audio_record(&mut host).0,
+                session_audio::AUDIO_CANCEL_KIND
+            );
+            active
+                .as_ref()
+                .unwrap()
+                .output
+                .handle_ack(AudioHostAck::Cancelled { played_frames: 0 })
+                .unwrap();
+            assert_eq!(
+                results
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err()
+                    .2,
+                session_audio::AUDIO_CANCELLED
+            );
+        }
     }
 
     #[test]
@@ -13020,6 +13102,43 @@ mod tests {
             ["live_event", "speech_interrupted"]
         );
         assert_eq!(core.utterances_after(0)[0].token, 1);
+    }
+
+    #[test]
+    fn interim_words_carry_the_token_their_final_will_take() {
+        let mut core = SessionCore::default();
+        let mut active = None;
+        let mut output = Vec::new();
+        let mut next_token = 7;
+        handle_voice_input_event(
+            VoiceInputEvent::InterimTranscript("you sh".into()),
+            &mut core,
+            &mut active,
+            &mut next_token,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(next_token, 7);
+        store_and_publish_voice_final(
+            "you should".into(),
+            || {},
+            &mut core,
+            &mut active,
+            &mut next_token,
+            &mut output,
+        )
+        .unwrap();
+        let messages: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            messages[0],
+            json!({"type":"user_interim","token":7,"text":"you sh"})
+        );
+        assert_eq!(messages[1]["type"], "live_event");
+        assert_eq!(messages[1]["token"], 7);
     }
 
     #[test]
