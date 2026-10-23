@@ -3832,7 +3832,7 @@ mod tests {
             controls.observe_detection_at(true, epoch, time);
             controls.detection_result_at(false, epoch, time + Duration::from_secs(6));
         }
-        assert_eq!(controls.vad_threshold(0.5), 0.51);
+        assert_eq!(controls.vad_threshold(0.5), 0.5);
         let playback = controls
             .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
             .unwrap();
@@ -3842,9 +3842,9 @@ mod tests {
             controls.detection_result_at(true, epoch, time + Duration::from_secs(6));
         }
         assert_eq!(controls.vad_threshold(0.5), 0.64);
-        assert_eq!(controls.detection().unwrap().settings.listening.value, 0.51);
+        assert_eq!(controls.detection().unwrap().settings.listening.value, 0.5);
         drop(playback);
-        assert_eq!(controls.vad_threshold(0.5), 0.51);
+        assert_eq!(controls.vad_threshold(0.5), 0.5);
     }
 
     #[cfg(target_os = "macos")]

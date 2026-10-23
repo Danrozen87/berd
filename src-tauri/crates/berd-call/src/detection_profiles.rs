@@ -87,6 +87,98 @@ pub fn save_if_unchanged(
     write(path, setup, settings, Some(expected))
 }
 
+/// An in-memory trial. Dropping it leaves the saved profile untouched.
+/// The host must not persist trial acknowledgements through its ordinary saver.
+#[must_use]
+pub struct PreparedTrial {
+    path: PathBuf,
+    setup: AudioSetup,
+    persisted: Option<DetectionSettings>,
+    baseline: DetectionSettings,
+    settings: DetectionSettings,
+}
+
+impl PreparedTrial {
+    pub fn baseline(&self) -> DetectionSettings {
+        self.baseline
+    }
+    pub fn settings(&self) -> DetectionSettings {
+        self.settings
+    }
+}
+
+/// Eligibility is issued only by the shared corpus evaluator. Check the live
+/// route and settings again before applying this trial.
+pub fn prepare_trial(
+    path: &Path,
+    setup: &AudioSetup,
+    current: DetectionSettings,
+    candidate: &berd_call::learning_evaluation::EligibleCandidate,
+) -> Result<PreparedTrial, String> {
+    prepare(
+        path,
+        setup,
+        current,
+        candidate.devices(),
+        candidate.baseline(),
+        candidate.settings(),
+    )
+}
+
+fn prepare(
+    path: &Path,
+    setup: &AudioSetup,
+    current: DetectionSettings,
+    devices: &berd_call::failure_fixtures::AudioDevices,
+    baseline: DetectionSettings,
+    settings: DetectionSettings,
+) -> Result<PreparedTrial, String> {
+    baseline.validate()?;
+    settings.validate()?;
+    if setup.input_uid.is_empty()
+        || setup.output_uid.is_empty()
+        || setup.input_uid != devices.input_uid
+        || setup.output_uid != devices.output_uid
+    {
+        return Err("trial audio devices no longer match".into());
+    }
+    if current != baseline {
+        return Err("trial baseline no longer matches live settings".into());
+    }
+    let persisted = load(path, setup)?;
+    if persisted.is_some_and(|saved| saved != baseline) {
+        return Err("trial baseline no longer matches saved settings".into());
+    }
+    Ok(PreparedTrial {
+        path: path.into(),
+        setup: setup.clone(),
+        persisted,
+        baseline,
+        settings,
+    })
+}
+
+/// Call only after an uninterrupted live trial has passed its health checks.
+/// On failure, use baseline() to restore the live runtime before dropping the
+/// trial. No saved profile changes until this guarded promotion succeeds.
+pub fn finish_trial(
+    trial: PreparedTrial,
+    setup: &AudioSetup,
+    applied: DetectionSettings,
+    passed: bool,
+) -> Result<bool, String> {
+    if !passed {
+        return Ok(false);
+    }
+    if setup.input_uid != trial.setup.input_uid
+        || setup.output_uid != trial.setup.output_uid
+        || applied != trial.settings
+    {
+        return Ok(false);
+    }
+    save_if_unchanged(&trial.path, &trial.setup, trial.persisted, trial.settings)
+}
+
 fn write(
     path: &Path,
     setup: &AudioSetup,
@@ -230,5 +322,110 @@ mod tests {
         assert!(!std::fs::read_to_string(path)
             .unwrap()
             .contains("same display name"));
+    }
+    fn trial_at(path: &Path, setup: &AudioSetup) -> PreparedTrial {
+        let baseline = DetectionSettings::default();
+        let mut settings = baseline;
+        settings.listening.value = 0.45;
+        prepare(
+            path,
+            setup,
+            baseline,
+            &berd_call::failure_fixtures::AudioDevices {
+                input_uid: setup.input_uid.clone(),
+                output_uid: setup.output_uid.clone(),
+            },
+            baseline,
+            settings,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unsuccessful_or_abandoned_trials_do_not_change_saved_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "speaker");
+        let trial = trial_at(&path, &setup);
+        assert_eq!(trial.baseline(), DetectionSettings::default());
+        assert_ne!(trial.settings(), trial.baseline());
+        assert!(!path.exists());
+        assert!(!finish_trial(trial, &setup, DetectionSettings::default(), false).unwrap());
+        assert_eq!(load(&path, &setup).unwrap(), None);
+        let baseline = DetectionSettings::default();
+        save(&path, &setup, baseline).unwrap();
+        drop(trial_at(&path, &setup));
+        assert_eq!(load(&path, &setup).unwrap(), Some(baseline));
+    }
+
+    #[test]
+    fn promotion_requires_applied_candidate_original_devices_and_unchanged_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "speaker");
+        let trial = trial_at(&path, &setup);
+        let candidate = trial.settings();
+        let other = super::tests::setup("mic", "headset");
+        assert!(!finish_trial(trial, &other, candidate, true).unwrap());
+        assert_eq!(load(&path, &setup).unwrap(), None);
+        assert!(!finish_trial(
+            trial_at(&path, &setup),
+            &setup,
+            DetectionSettings::default(),
+            true
+        )
+        .unwrap());
+        let trial = trial_at(&path, &setup);
+        let mut edited = DetectionSettings::default();
+        edited.listening.value = 0.8;
+        save(&path, &setup, edited).unwrap();
+        assert!(!finish_trial(trial, &setup, candidate, true).unwrap());
+        assert_eq!(load(&path, &setup).unwrap(), Some(edited));
+        assert!(prepare(
+            &path,
+            &setup,
+            DetectionSettings::default(),
+            &berd_call::failure_fixtures::AudioDevices {
+                input_uid: "mic".into(),
+                output_uid: "speaker".into()
+            },
+            DetectionSettings::default(),
+            candidate
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn successful_trial_persists_only_its_own_device_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "speaker");
+        let other = super::tests::setup("other", "speaker");
+        save(&path, &other, DetectionSettings::default()).unwrap();
+        let trial = trial_at(&path, &setup);
+        let candidate = trial.settings();
+        assert!(finish_trial(trial, &setup, candidate, true).unwrap());
+        assert_eq!(load(&path, &setup).unwrap(), Some(candidate));
+        assert_eq!(
+            load(&path, &other).unwrap(),
+            Some(DetectionSettings::default())
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_stale_runtime_and_wrong_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "speaker");
+        let baseline = DetectionSettings::default();
+        let mut candidate = baseline;
+        candidate.listening.value = 0.45;
+        let devices = berd_call::failure_fixtures::AudioDevices {
+            input_uid: "mic".into(),
+            output_uid: "speaker".into(),
+        };
+        assert!(prepare(&path, &setup, candidate, &devices, baseline, candidate).is_err());
+        let other = super::tests::setup("different-mic", "speaker");
+        assert!(prepare(&path, &other, baseline, &devices, baseline, candidate).is_err());
     }
 }

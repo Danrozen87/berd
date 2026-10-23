@@ -13,3 +13,7 @@ The host owns device identity and persistence. The shared input runtime owns thr
 ## Speech hold correction, October 22, 2026
 
 Product direction: bound the agent speech hold while transcription is pending, without cancelling recognition when the hold expires. Valid late transcripts remain accepted. New speech reasserts the hold. Keep hold accounting distinct from unresolved recognition and ignore expired or ambiguous outcomes for detector tuning. The configurable idle hold defaults to five seconds, bounded between 250 and 30000 milliseconds. This supersedes using the idle timeout as a no-result/reset signal.
+
+## Recognition health correction, October 23, 2026
+
+An empty recognition result is diagnostic evidence only. It cannot raise either speech threshold because recognizer failures can produce the same result as noise. This supersedes the original no-result increase heuristic. Final transcripts remain positive speech evidence. Automatic candidate trials must retain the saved baseline until independent trial checks pass.

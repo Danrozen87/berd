@@ -222,13 +222,14 @@ impl DetectionTuner {
         self.grace_until = Some(now + RESULT_GRACE);
     }
     pub fn no_result(&mut self, _now: Instant) {
-        if let Some(window) = self
+        if self
             .window
             .take()
-            .filter(|window| window.detected && !window.ambiguous)
+            .is_some_and(|window| window.detected && !window.ambiguous)
         {
             self.snapshot.no_result += 1;
-            self.adjust(window.mode, true);
+            // Empty recognition cannot distinguish noise from recognizer failure.
+            // Keep the observation diagnostic; it cannot justify missing more speech.
         }
     }
     fn adjust(&mut self, mode: DetectionMode, increase: bool) {
@@ -360,7 +361,24 @@ mod tests {
     }
 
     #[test]
-    fn each_no_result_moves_only_the_detecting_mode_one_tick() {
+    fn recognizer_failures_cannot_raise_speech_thresholds() {
+        let mut tuner = tuner();
+        let initial = tuner.snapshot().settings;
+        let now = Instant::now();
+        for mode in [DetectionMode::Listening, DetectionMode::Interruption] {
+            for n in 0..20 {
+                let time = now + Duration::from_secs(n * 10);
+                tuner.observe(mode, true, time);
+                tuner.no_result(time + Duration::from_secs(6));
+            }
+        }
+        assert_eq!(tuner.snapshot().settings, initial);
+        assert_eq!(tuner.snapshot().adjustments, 0);
+        assert_eq!(tuner.snapshot().no_result, 40);
+    }
+
+    #[test]
+    fn no_result_counts_without_changing_thresholds() {
         let mut tuner = tuner();
         let now = Instant::now();
         for n in 0..3 {
@@ -368,12 +386,13 @@ mod tests {
             tuner.observe(DetectionMode::Listening, true, time);
             tuner.no_result(time + Duration::from_secs(6));
         }
-        assert_eq!(tuner.snapshot().settings.listening.value, 0.53);
+        assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
         assert_eq!(tuner.snapshot().settings.interruption.value, 0.65);
-        assert_eq!(tuner.snapshot().adjustments, 3);
+        assert_eq!(tuner.snapshot().adjustments, 0);
+        assert_eq!(tuner.snapshot().no_result, 3);
     }
     #[test]
-    fn idle_mode_changes_do_not_disable_interruption_learning() {
+    fn interruption_no_result_is_diagnostic_after_idle_mode_changes() {
         let mut tuner = tuner();
         let now = Instant::now();
         for n in 0..3 {
@@ -386,7 +405,8 @@ mod tests {
             );
             tuner.no_result(time + Duration::from_secs(7));
         }
-        assert_eq!(tuner.snapshot().settings.interruption.value, 0.68);
+        assert_eq!(tuner.snapshot().settings.interruption.value, 0.65);
+        assert_eq!(tuner.snapshot().no_result, 3);
         assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
     }
 
@@ -415,26 +435,17 @@ mod tests {
         assert_eq!(tuner.snapshot().settings.listening.value, 0.5);
     }
     #[test]
-    fn adjustments_have_no_cooldown_and_stay_inside_dynamic_bounds() {
+    fn recognized_missed_speech_adjustments_stay_inside_dynamic_bounds() {
         let mut tuner = tuner();
-        tuner.snapshot.settings.listening.value = 0.94;
+        tuner.snapshot.settings.listening.value = 0.11;
         let now = Instant::now();
         for n in 0..100 {
-            let time = now + Duration::from_secs(n * 7);
-            tuner.observe(DetectionMode::Listening, true, time);
-            tuner.no_result(time + Duration::from_secs(6));
+            let time = now + Duration::from_secs(n * 20);
+            tuner.observe(DetectionMode::Listening, false, time);
+            tuner.final_transcript(time + Duration::from_secs(6));
         }
-        assert_eq!(tuner.snapshot().settings.listening.value, 0.95);
+        assert_eq!(tuner.snapshot().settings.listening.value, 0.10);
         assert_eq!(tuner.snapshot().adjustments, 1);
-        tuner.snapshot.settings.listening.value = 0.5;
-        tuner.reset_evidence();
-        for n in 0..6 {
-            let time = now + Duration::from_secs(1000 + n);
-            tuner.observe(DetectionMode::Listening, true, time);
-            tuner.no_result(time);
-        }
-        assert_eq!(tuner.snapshot().adjustments, 7);
-        assert_eq!(tuner.snapshot().settings.listening.value, 0.56);
     }
 
     #[test]
