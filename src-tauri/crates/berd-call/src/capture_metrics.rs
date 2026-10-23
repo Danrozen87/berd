@@ -11,6 +11,11 @@ pub struct CaptureMetrics {
     pub request_wait_with_both_us: u64,
     pub request_wait_with_unknown_state_us: u64,
     pub admitted_request_delays_us: Vec<u64>,
+    /// From the end of detected speech to each recognition hold release.
+    pub hold_after_speech_us: Vec<u64>,
+    /// From the end of detected speech to each final transcript, which bounds
+    /// how short the pending-utterance timeout can be.
+    pub final_after_speech_us: Vec<u64>,
     pub unresolved_requests: u64,
     pub requests_censored_by_gap: u64,
     pub capture_gaps: u64,
@@ -24,6 +29,7 @@ pub fn measure(events: &[Value]) -> Result<CaptureMetrics, String> {
     let mut pending = HashMap::<u64, u64>::new();
     let mut speaking = Some(false);
     let mut recognition = Some(false);
+    let mut speech_end = None;
     let mut previous = None;
     for event in events {
         let us = event["us"]
@@ -57,6 +63,7 @@ pub fn measure(events: &[Value]) -> Result<CaptureMetrics, String> {
                 pending.clear();
                 speaking = None;
                 recognition = None;
+                speech_end = None;
             }
             "recognizer" => {
                 result.recognizer_events += 1;
@@ -82,18 +89,25 @@ pub fn measure(events: &[Value]) -> Result<CaptureMetrics, String> {
                         }
                     }
                     ("out", "input_speaking") => {
-                        speaking = Some(
-                            message["active"]
-                                .as_bool()
-                                .ok_or("input_speaking needs active")?,
-                        );
+                        let active = message["active"]
+                            .as_bool()
+                            .ok_or("input_speaking needs active")?;
+                        speaking = Some(active);
+                        speech_end = (!active).then_some(us);
                     }
                     ("out", "recognition_pending") => {
-                        recognition = Some(
-                            message["active"]
-                                .as_bool()
-                                .ok_or("recognition_pending needs active")?,
-                        );
+                        let active = message["active"]
+                            .as_bool()
+                            .ok_or("recognition_pending needs active")?;
+                        recognition = Some(active);
+                        if let (false, Some(end)) = (active, speech_end) {
+                            result.hold_after_speech_us.push(us - end);
+                        }
+                    }
+                    ("out", "live_event") => {
+                        if let Some(end) = speech_end {
+                            result.final_after_speech_us.push(us - end);
+                        }
                     }
                     _ => {}
                 }
@@ -124,6 +138,22 @@ mod tests {
         assert_eq!(result.request_wait_with_both_us, 10);
         assert_eq!(result.request_wait_with_recognition_pending_us, 30);
         assert_eq!(result.admitted_request_delays_us, vec![50]);
+    }
+    #[test]
+    fn measures_finals_and_hold_releases_after_speech_ends() {
+        let events = vec![
+            json!({"us":0,"type":"out","message":{"type":"input_speaking","active":true}}),
+            json!({"us":0,"type":"out","message":{"type":"recognition_pending","active":true}}),
+            json!({"us":5,"type":"out","message":{"type":"live_event","token":1,"text":"mid"}}),
+            json!({"us":10,"type":"out","message":{"type":"input_speaking","active":false}}),
+            json!({"us":30,"type":"out","message":{"type":"live_event","token":2,"text":"end"}}),
+            json!({"us":70,"type":"out","message":{"type":"recognition_pending","active":false}}),
+            json!({"us":80,"type":"gap","reason":"capture_dropped"}),
+            json!({"us":90,"type":"out","message":{"type":"live_event","token":3,"text":"x"}}),
+        ];
+        let result = measure(&events).unwrap();
+        assert_eq!(result.final_after_speech_us, vec![20]);
+        assert_eq!(result.hold_after_speech_us, vec![60]);
     }
     #[test]
     fn gaps_censor_requests_instead_of_scoring_success() {
