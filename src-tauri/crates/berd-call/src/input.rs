@@ -156,6 +156,9 @@ pub enum VoiceInputEvent {
     SpeakingReset,
     /// Agent speech admission hold, which may expire before recognition finishes.
     RecognitionPendingChanged(bool),
+    /// Display only: words Apple is still transcribing, or empty once none are.
+    /// Never stored, delivered or treated as an utterance.
+    InterimTranscript(String),
     FinalTranscript {
         text: String,
         storage_receipt: FinalTranscriptStorageReceipt,
@@ -929,11 +932,16 @@ struct PendingRecognitions {
     /// The latest recognizer sample with interim words.
     #[cfg(target_os = "macos")]
     heard: u64,
+    /// Where the furthest final so far ended, since one can arrive before its turn ends.
+    #[cfg(any(target_os = "macos", test))]
+    final_end: Option<u64>,
     /// Apple's latest result was interim words rather than a final. Apple
     /// re-reports words a final left out, and interim results end where its
     /// audio does rather than at the last word, so order says more than samples.
     #[cfg(any(target_os = "macos", test))]
     unfinalized: bool,
+    /// The interim text last shown, so repeats and clears are sent once.
+    interim: String,
 }
 
 impl PendingRecognitions {
@@ -950,6 +958,11 @@ impl PendingRecognitions {
         events: &tokio_mpsc::Sender<VoiceInputEvent>,
         limit: usize,
     ) -> Result<(), ()> {
+        // Speech after every pending turn resolved is past any earlier final.
+        #[cfg(any(target_os = "macos", test))]
+        if self.ends.is_empty() {
+            self.final_end = None;
+        }
         if self.count == limit {
             self.ambiguous = true;
         } else {
@@ -967,10 +980,18 @@ impl PendingRecognitions {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    fn end_turn(&mut self, speech_end: u64) {
+    fn end_turn(
+        &mut self,
+        events: &tokio_mpsc::Sender<VoiceInputEvent>,
+        speech_end: u64,
+    ) -> Result<(), ()> {
         if let Some(end @ None) = self.ends.back_mut() {
             *end = Some(speech_end);
         }
+        for _ in 0..self.final_end.map_or(0, |end| self.covered(end)) {
+            self.resolve(events)?;
+        }
+        Ok(())
     }
 
     /// Ended turns, oldest first, whose speech a final ending at `end` covers.
@@ -1005,6 +1026,14 @@ impl PendingRecognitions {
         self.agent_starts
             .iter()
             .any(|&at| first_word < at && at + FINAL_COVERAGE_SLACK_SAMPLES <= end)
+    }
+
+    /// Interim text is best effort: a full event queue drops it rather than stall recognition.
+    fn show_interim(&mut self, events: &tokio_mpsc::Sender<VoiceInputEvent>, text: &str) {
+        if self.interim != text {
+            self.interim = text.to_string();
+            let _ = events.try_send(VoiceInputEvent::InterimTranscript(self.interim.clone()));
+        }
     }
 
     fn result_is_current(&self) -> bool {
@@ -1058,6 +1087,7 @@ impl PendingRecognitions {
 
     fn reset(&mut self, events: &tokio_mpsc::Sender<VoiceInputEvent>) -> Result<(), ()> {
         self.release_hold(events)?;
+        self.show_interim(events, "");
         *self = Self::new();
         Ok(())
     }
@@ -1764,6 +1794,7 @@ fn forward_mac_events_with_detection(
                 // can produce several finals, so a final with an end resolves
                 // exactly the turns it covers. Without one it resolves the oldest.
                 pending.unfinalized = false;
+                pending.final_end = pending.final_end.max(end);
                 let resolved = end.map_or(1, |end| pending.covered(end));
                 let late = pending.expired.front().copied().filter(|_| resolved > 0);
                 for _ in 0..resolved {
@@ -1803,12 +1834,16 @@ fn forward_mac_events_with_detection(
                 if pending.blocking == 0 {
                     *settle_deadline = None;
                 }
+                if !pending.words_outstanding() {
+                    pending.show_interim(events, "");
+                }
             }
             crate::mac_speech::MacSpeechRecognitionEvent::FinalStart(start) => {
                 pending.first_word = Some(start);
             }
-            crate::mac_speech::MacSpeechRecognitionEvent::Heard(end) => {
+            crate::mac_speech::MacSpeechRecognitionEvent::Heard(end, text) => {
                 pending.unfinalized = true;
+                pending.show_interim(events, &text);
                 // Apple repeats interim results, so only new audio is traced.
                 if end > pending.heard {
                     pending.heard = end;
@@ -2064,6 +2099,7 @@ fn mac_speech_worker(
             if pending.expire(&events).is_err() {
                 return;
             }
+            pending.show_interim(&events, "");
             settle_deadline = None;
         }
         let frame = match frames.recv_timeout(Duration::from_millis(50)) {
@@ -2171,9 +2207,15 @@ fn mac_speech_worker(
                     } else {
                         // Pushed audio runs slightly ahead of the detector, which
                         // only delays coverage.
-                        pending.end_turn(
-                            recognized.saturating_sub(u64::from(settings.timing.release_ms) * 48),
-                        );
+                        if pending
+                            .end_turn(
+                                &events,
+                                recognized.saturating_sub(u64::from(settings.timing.release_ms) * 48),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
                         end_mac_turn(
                             &pending,
                             &mut settle_deadline,
@@ -3374,6 +3416,7 @@ mod tests {
                     storage_receipt.stored();
                     observed.push("final");
                 }
+                VoiceInputEvent::InterimTranscript(_) => {}
                 VoiceInputEvent::Failed(error) => panic!("unexpected input failure: {error}"),
             }
         }
@@ -4569,7 +4612,7 @@ mod tests {
         // One sentence split by two pauses, then a turn the final does not reach.
         for end in [48_000, 96_000, 200_000] {
             begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
-            pending.end_turn(end);
+            pending.end_turn(&event_tx, end).unwrap();
             end_mac_turn(&pending, &mut deadline, Instant::now(), timeout);
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
@@ -4606,7 +4649,7 @@ mod tests {
         // Apple finalizes the first phrase while the user is still speaking.
         native_tx.send(final_at(50_000)).unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
-        pending.end_turn(200_000);
+        pending.end_turn(&event_tx, 200_000).unwrap();
         end_mac_turn(
             &pending,
             &mut deadline,
@@ -4624,16 +4667,44 @@ mod tests {
         assert!(deadline.is_none());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_final_before_its_turn_ends_releases_the_hold_when_it_does() {
+        let (event_tx, _event_rx) = tokio_mpsc::channel(16);
+        let mut pending = PendingRecognitions::new();
+        let mut deadline = None;
+        let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
+        begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
+        // Apple finalizes the turn before the detector has heard enough silence to end it.
+        native_tx
+            .send(crate::mac_speech::MacSpeechRecognitionEvent::Final(
+                "words".into(),
+                Some(100_000),
+            ))
+            .unwrap();
+        forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
+        assert_eq!(pending.blocking, 1);
+        pending.end_turn(&event_tx, 105_000).unwrap();
+        end_mac_turn(
+            &pending,
+            &mut deadline,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_eq!((pending.count, pending.blocking), (0, 0));
+        assert!(deadline.is_none());
+    }
+
     #[test]
     fn finals_cover_only_ended_turns_in_order() {
         let (event_tx, _event_rx) = tokio_mpsc::channel(4);
         let mut pending = PendingRecognitions::new();
         pending.begin(&event_tx).unwrap();
-        pending.end_turn(10_000);
+        pending.end_turn(&event_tx, 10_000).unwrap();
         pending.begin(&event_tx).unwrap();
         assert_eq!(pending.covered(1_000_000), 1);
-        pending.end_turn(50_000);
-        pending.end_turn(1);
+        pending.end_turn(&event_tx, 50_000).unwrap();
+        pending.end_turn(&event_tx, 1).unwrap();
         assert_eq!(pending.covered(50_000 - FINAL_COVERAGE_SLACK_SAMPLES), 2);
         assert_eq!(pending.covered(49_999 - FINAL_COVERAGE_SLACK_SAMPLES), 1);
         pending.resolve(&event_tx).unwrap();
@@ -4651,17 +4722,17 @@ mod tests {
         // Two sentences: the first final arrives, the second takes longer than the timeout.
         for end in [100_000, 300_000] {
             begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
-            pending.end_turn(end);
+            pending.end_turn(&event_tx, end).unwrap();
             end_mac_turn(&pending, &mut deadline, now, timeout);
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
         // Apple re-reports the second sentence's interim words after the first final.
-        native_tx.send(Heard(310_000)).unwrap();
+        native_tx.send(Heard(310_000, "you should".into())).unwrap();
         native_tx
             .send(Final("first".into(), Some(110_000)))
             .unwrap();
-        native_tx.send(Heard(310_000)).unwrap();
+        native_tx.send(Heard(310_000, "you should".into())).unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 1);
         let words_wait =
@@ -4700,12 +4771,12 @@ mod tests {
         // results end where Apple's audio did, past the final's last word.
         for end in [100_000, 300_000] {
             begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
-            pending.end_turn(end);
+            pending.end_turn(&event_tx, end).unwrap();
             end_mac_turn(&pending, &mut deadline, now, timeout);
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
-        native_tx.send(Heard(130_000)).unwrap();
+        native_tx.send(Heard(130_000, "words".into())).unwrap();
         native_tx
             .send(Final("words".into(), Some(110_000)))
             .unwrap();
@@ -4839,7 +4910,7 @@ mod tests {
         /// A turn whose speech ends at `end`, held until `secs_left` from now.
         fn turn(&mut self, end: u64, secs_left: i64) {
             begin_mac_turn(&mut self.pending, &self.events, &mut self.deadline).unwrap();
-            self.pending.end_turn(end);
+            self.pending.end_turn(&self.events, end).unwrap();
             let now = Instant::now();
             self.deadline = Some(if secs_left < 0 {
                 now - Duration::from_secs(secs_left.unsigned_abs())
@@ -4902,7 +4973,7 @@ mod tests {
         use crate::mac_speech::MacSpeechRecognitionEvent::Heard;
         let mut learning = Learning::all();
         learning.turn(48_000, 5);
-        learning.hear([Heard(50_000)]);
+        learning.hear([Heard(50_000, "words".into())]);
         learning.pending.expire(&learning.events).unwrap();
         learning.deadline = None;
         learning.hear([final_of("late", 50_000)]);
@@ -4913,7 +4984,7 @@ mod tests {
             assert_eq!(learning.settings().interim_words_wait_ms, 10500);
             learning.turn(48_000 * (n + 2), -1);
             learning.hear([
-                Heard(48_000 * (n + 2) + 100),
+                Heard(48_000 * (n + 2) + 100, "words".into()),
                 final_of("prompt", 48_000 * (n + 2)),
             ]);
         }
