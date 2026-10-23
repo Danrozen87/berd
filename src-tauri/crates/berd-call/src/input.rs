@@ -2210,7 +2210,8 @@ fn mac_speech_worker(
                         if pending
                             .end_turn(
                                 &events,
-                                recognized.saturating_sub(u64::from(settings.timing.release_ms) * 48),
+                                recognized
+                                    .saturating_sub(u64::from(settings.timing.release_ms) * 48),
                             )
                             .is_err()
                         {
