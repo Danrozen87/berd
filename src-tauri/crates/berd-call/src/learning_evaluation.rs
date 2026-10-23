@@ -66,6 +66,87 @@ pub struct Evaluation {
     pub candidates_tested: usize,
 }
 
+/// An evaluation bound to one device corpus. Replay acceptance alone does not
+/// establish that the audio setup is eligible for a live trial.
+#[derive(Debug)]
+pub struct CorpusEvaluation {
+    evaluation: Evaluation,
+    devices: crate::failure_fixtures::AudioDevices,
+    baseline: DetectionSettings,
+    trial_ineligible: Vec<String>,
+}
+
+impl CorpusEvaluation {
+    pub fn evaluation(&self) -> &Evaluation {
+        &self.evaluation
+    }
+
+    pub fn trial_ineligible(&self) -> &[String] {
+        &self.trial_ineligible
+    }
+
+    pub fn eligible_candidate(&self) -> Option<EligibleCandidate> {
+        if !self.evaluation.accepted || !self.trial_ineligible.is_empty() {
+            return None;
+        }
+        Some(EligibleCandidate {
+            devices: self.devices.clone(),
+            baseline: self.baseline,
+            settings: self.evaluation.selected.as_ref()?.settings,
+        })
+    }
+}
+
+/// Only constructed from accepted corpus evidence. This authorizes a monitored
+/// trial, not permanent promotion or claims about transcript preservation.
+#[derive(Clone, Debug)]
+pub struct EligibleCandidate {
+    devices: crate::failure_fixtures::AudioDevices,
+    baseline: DetectionSettings,
+    settings: DetectionSettings,
+}
+
+impl EligibleCandidate {
+    pub fn devices(&self) -> &crate::failure_fixtures::AudioDevices {
+        &self.devices
+    }
+
+    pub fn baseline(&self) -> DetectionSettings {
+        self.baseline
+    }
+
+    pub fn settings(&self) -> DetectionSettings {
+        self.settings
+    }
+}
+
+pub fn evaluate_corpus(
+    corpus: &crate::learning_corpus::Corpus,
+    baseline: DetectionSettings,
+    policy: &AcceptancePolicy,
+) -> Result<CorpusEvaluation, String> {
+    let evaluation = evaluate_grouped(
+        &corpus.inputs,
+        &corpus.source_sessions,
+        &corpus.starts,
+        baseline,
+        policy,
+    )?;
+    let mut trial_ineligible = corpus.trial_ineligible.clone();
+    if corpus.devices.input_uid.trim().is_empty() || corpus.devices.output_uid.trim().is_empty() {
+        trial_ineligible.push("audio setup needs nonempty device identities".into());
+    }
+    if baseline.listening.dynamic || baseline.interruption.dynamic {
+        trial_ineligible.push("static replay cannot validate a dynamic baseline".into());
+    }
+    Ok(CorpusEvaluation {
+        evaluation,
+        devices: corpus.devices.clone(),
+        baseline,
+        trial_ineligible,
+    })
+}
+
 /// Search immediate static threshold neighbours only. Timing is unchanged because
 /// gate replay cannot evaluate recognition resets or preservation of pending words.
 pub fn candidates(baseline: DetectionSettings) -> Result<Vec<Candidate>, String> {
@@ -466,6 +547,75 @@ mod tests {
             .as_bool()
             .unwrap());
     }
+    fn device_corpus() -> crate::learning_corpus::Corpus {
+        let inputs = corpus();
+        crate::learning_corpus::Corpus {
+            devices: crate::failure_fixtures::AudioDevices {
+                input_uid: "microphone".into(),
+                output_uid: "speakers".into(),
+            },
+            source_sessions: inputs.iter().map(|i| i.session_id.clone()).collect(),
+            starts: vec![StartConstraint::CaptureStart; inputs.len()],
+            inputs,
+            fixtures: vec![],
+            trial_ineligible: vec![],
+        }
+    }
+
+    #[test]
+    fn eligible_candidate_requires_both_replay_and_device_evidence() {
+        let mut corpus = device_corpus();
+        let result = evaluate_corpus(&corpus, baseline(), &AcceptancePolicy::default()).unwrap();
+        let candidate = result.eligible_candidate().unwrap();
+        assert_eq!(candidate.devices(), &corpus.devices);
+        assert_eq!(candidate.baseline(), baseline());
+        assert_eq!(candidate.settings().listening.value, 0.55);
+
+        corpus
+            .trial_ineligible
+            .push("unverified playback route".into());
+        let result = evaluate_corpus(&corpus, baseline(), &AcceptancePolicy::default()).unwrap();
+        assert!(result.evaluation().accepted);
+        assert!(result.eligible_candidate().is_none());
+        assert_eq!(result.trial_ineligible(), &corpus.trial_ineligible);
+
+        corpus.trial_ineligible.clear();
+        for input in &mut corpus.inputs {
+            for label in &mut input.labels {
+                label.provenance = Provenance::Inferred;
+            }
+        }
+        let result = evaluate_corpus(&corpus, baseline(), &AcceptancePolicy::default()).unwrap();
+        assert!(!result.evaluation().accepted);
+        assert!(result.eligible_candidate().is_none());
+    }
+
+    #[test]
+    fn eligible_candidate_rejects_unknown_devices_and_dynamic_baseline() {
+        let mut corpus = device_corpus();
+        corpus.devices.input_uid = " ".into();
+        let result = evaluate_corpus(&corpus, baseline(), &AcceptancePolicy::default()).unwrap();
+        assert!(result.evaluation().accepted);
+        assert!(result.eligible_candidate().is_none());
+
+        for listening in [true, false] {
+            let mut settings = baseline();
+            if listening {
+                settings.listening.dynamic = true;
+            } else {
+                settings.interruption.dynamic = true;
+            }
+            let result =
+                evaluate_corpus(&device_corpus(), settings, &AcceptancePolicy::default()).unwrap();
+            assert!(result.evaluation().accepted);
+            assert!(result.eligible_candidate().is_none());
+            assert!(result
+                .trial_ineligible()
+                .iter()
+                .any(|r| r.contains("dynamic")));
+        }
+    }
+
     #[test]
     fn held_out_loss_rejects_without_searching_another_candidate() {
         let mut inputs = corpus();

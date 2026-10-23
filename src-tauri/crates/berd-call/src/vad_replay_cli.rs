@@ -32,16 +32,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         )?;
         let policy = berd_call::learning_evaluation::AcceptancePolicy::default();
         let evaluations: Vec<_> = loaded.corpora.iter().map(|corpus| {
-            let evaluation = berd_call::learning_evaluation::evaluate_grouped(
-                &corpus.inputs, &corpus.source_sessions, &corpus.starts, baseline, &policy,
-            );
+            let evaluation = berd_call::learning_evaluation::evaluate_corpus(corpus, baseline, &policy);
             match evaluation {
                 Ok(evaluation) => serde_json::json!({
                     "devices": corpus.devices,
-                    "trial_eligible": evaluation.accepted && corpus.trial_ineligible.is_empty(),
-                    "trial_ineligible": corpus.trial_ineligible,
+                    "trial_eligible": evaluation.eligible_candidate().is_some(),
+                    "trial_ineligible": evaluation.trial_ineligible(),
                     "fixtures": corpus.fixtures,
-                    "evaluation": evaluation,
+                    "evaluation": evaluation.evaluation(),
                 }),
                 Err(error) => serde_json::json!({"devices": corpus.devices, "trial_eligible": false, "error": error}),
             }
