@@ -156,6 +156,9 @@ pub enum VoiceInputEvent {
     SpeakingReset,
     /// Agent speech admission hold, which may expire before recognition finishes.
     RecognitionPendingChanged(bool),
+    /// Display only: words Apple is still transcribing, or empty once none are.
+    /// Never stored, delivered or treated as an utterance.
+    InterimTranscript(String),
     FinalTranscript {
         text: String,
         storage_receipt: FinalTranscriptStorageReceipt,
@@ -934,6 +937,8 @@ struct PendingRecognitions {
     /// audio does rather than at the last word, so order says more than samples.
     #[cfg(any(target_os = "macos", test))]
     unfinalized: bool,
+    /// The interim text last shown, so repeats and clears are sent once.
+    interim: String,
 }
 
 impl PendingRecognitions {
@@ -1007,6 +1012,14 @@ impl PendingRecognitions {
             .any(|&at| first_word < at && at + FINAL_COVERAGE_SLACK_SAMPLES <= end)
     }
 
+    /// Interim text is best effort: a full event queue drops it rather than stall recognition.
+    fn show_interim(&mut self, events: &tokio_mpsc::Sender<VoiceInputEvent>, text: &str) {
+        if self.interim != text {
+            self.interim = text.to_string();
+            let _ = events.try_send(VoiceInputEvent::InterimTranscript(self.interim.clone()));
+        }
+    }
+
     fn result_is_current(&self) -> bool {
         !self.ambiguous && self.count == self.blocking
     }
@@ -1058,6 +1071,7 @@ impl PendingRecognitions {
 
     fn reset(&mut self, events: &tokio_mpsc::Sender<VoiceInputEvent>) -> Result<(), ()> {
         self.release_hold(events)?;
+        self.show_interim(events, "");
         *self = Self::new();
         Ok(())
     }
@@ -1803,12 +1817,16 @@ fn forward_mac_events_with_detection(
                 if pending.blocking == 0 {
                     *settle_deadline = None;
                 }
+                if !pending.words_outstanding() {
+                    pending.show_interim(events, "");
+                }
             }
             crate::mac_speech::MacSpeechRecognitionEvent::FinalStart(start) => {
                 pending.first_word = Some(start);
             }
-            crate::mac_speech::MacSpeechRecognitionEvent::Heard(end) => {
+            crate::mac_speech::MacSpeechRecognitionEvent::Heard(end, text) => {
                 pending.unfinalized = true;
+                pending.show_interim(events, &text);
                 // Apple repeats interim results, so only new audio is traced.
                 if end > pending.heard {
                     pending.heard = end;
@@ -2064,6 +2082,7 @@ fn mac_speech_worker(
             if pending.expire(&events).is_err() {
                 return;
             }
+            pending.show_interim(&events, "");
             settle_deadline = None;
         }
         let frame = match frames.recv_timeout(Duration::from_millis(50)) {
@@ -3374,6 +3393,7 @@ mod tests {
                     storage_receipt.stored();
                     observed.push("final");
                 }
+                VoiceInputEvent::InterimTranscript(_) => {}
                 VoiceInputEvent::Failed(error) => panic!("unexpected input failure: {error}"),
             }
         }
@@ -4657,11 +4677,11 @@ mod tests {
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
         // Apple re-reports the second sentence's interim words after the first final.
-        native_tx.send(Heard(310_000)).unwrap();
+        native_tx.send(Heard(310_000, "you should".into())).unwrap();
         native_tx
             .send(Final("first".into(), Some(110_000)))
             .unwrap();
-        native_tx.send(Heard(310_000)).unwrap();
+        native_tx.send(Heard(310_000, "you should".into())).unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 1);
         let words_wait =
@@ -4705,7 +4725,7 @@ mod tests {
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
-        native_tx.send(Heard(130_000)).unwrap();
+        native_tx.send(Heard(130_000, "words".into())).unwrap();
         native_tx
             .send(Final("words".into(), Some(110_000)))
             .unwrap();
@@ -4902,7 +4922,7 @@ mod tests {
         use crate::mac_speech::MacSpeechRecognitionEvent::Heard;
         let mut learning = Learning::all();
         learning.turn(48_000, 5);
-        learning.hear([Heard(50_000)]);
+        learning.hear([Heard(50_000, "words".into())]);
         learning.pending.expire(&learning.events).unwrap();
         learning.deadline = None;
         learning.hear([final_of("late", 50_000)]);
@@ -4913,7 +4933,7 @@ mod tests {
             assert_eq!(learning.settings().interim_words_wait_ms, 10500);
             learning.turn(48_000 * (n + 2), -1);
             learning.hear([
-                Heard(48_000 * (n + 2) + 100),
+                Heard(48_000 * (n + 2) + 100, "words".into()),
                 final_of("prompt", 48_000 * (n + 2)),
             ]);
         }
