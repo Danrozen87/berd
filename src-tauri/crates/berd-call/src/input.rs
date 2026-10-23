@@ -201,6 +201,8 @@ struct ControlState {
     mute_epoch: AtomicU64,
     cue_suppressions: AtomicU64,
     assistant_speaking: AtomicBool,
+    /// Agent speech starts so far, so the worker can place each on its timeline.
+    assistant_starts: AtomicU64,
     assistant_vad_threshold: AtomicU32,
     trace: OnceLock<Arc<dyn DetectionTrace>>,
 }
@@ -333,6 +335,7 @@ impl Default for VoiceInputControls {
                 mute_epoch: AtomicU64::new(0),
                 cue_suppressions: AtomicU64::new(0),
                 assistant_speaking: AtomicBool::new(false),
+                assistant_starts: AtomicU64::new(0),
                 assistant_vad_threshold: AtomicU32::new(0.5_f32.to_bits()),
                 trace: OnceLock::new(),
             }),
@@ -395,6 +398,19 @@ impl VoiceInputControls {
             .map(|tuner| tuner.snapshot())
     }
 
+    /// Runs `learn` on the tuner unless a reset has made `epoch` stale.
+    #[cfg(target_os = "macos")]
+    fn tune(&self, epoch: u64, learn: impl FnOnce(&mut crate::detection::DetectionTuner)) {
+        if let Ok(mut detection) = self.shared.detection.lock() {
+            if self.mute_epoch() != epoch {
+                return;
+            }
+            if let Some(tuner) = detection.as_mut() {
+                learn(tuner);
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn observe_detection(&self, detected: bool, epoch: u64) {
         self.observe_detection_at(detected, epoch, Instant::now());
@@ -407,14 +423,7 @@ impl VoiceInputControls {
         } else {
             crate::detection::DetectionMode::Listening
         };
-        if let Ok(mut detection) = self.shared.detection.lock() {
-            if self.mute_epoch() != epoch {
-                return;
-            }
-            if let Some(tuner) = detection.as_mut() {
-                tuner.observe(mode, detected, now);
-            }
-        }
+        self.tune(epoch, |tuner| tuner.observe(mode, detected, now));
     }
 
     #[cfg(target_os = "macos")]
@@ -424,18 +433,13 @@ impl VoiceInputControls {
 
     #[cfg(target_os = "macos")]
     fn detection_result_at(&self, recognized: bool, epoch: u64, now: Instant) {
-        if let Ok(mut detection) = self.shared.detection.lock() {
-            if self.mute_epoch() != epoch {
-                return;
+        self.tune(epoch, |tuner| {
+            if recognized {
+                tuner.final_transcript(now);
+            } else {
+                tuner.no_result(now);
             }
-            if let Some(tuner) = detection.as_mut() {
-                if recognized {
-                    tuner.final_transcript(now);
-                } else {
-                    tuner.no_result(now);
-                }
-            }
-        }
+        });
     }
 
     pub fn is_muted(&self) -> bool {
@@ -507,6 +511,7 @@ impl VoiceInputControls {
             transition.auto_monitor_running = true;
         }
         self.publish_assistant_activity(&transition.assistant_activity);
+        self.shared.assistant_starts.fetch_add(1, Ordering::AcqRel);
         self.publish_effective_mute(&transition);
         drop(transition);
         if start_monitor {
@@ -581,6 +586,8 @@ impl VoiceInputControls {
                 },
                 timing: Default::default(),
                 pending_utterance_timeout_ms: 5000,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
             },
             |snapshot| snapshot.settings,
         );
@@ -899,10 +906,9 @@ const MAX_PENDING_RECOGNITIONS: usize = 1024;
 #[cfg(any(target_os = "macos", test))]
 const FINAL_COVERAGE_SLACK_SAMPLES: u64 = 12_000;
 
-// How much longer than the pending-utterance timeout agents wait while Apple
-// still has interim words to finalize. Finals can take seven seconds or more.
-#[cfg(target_os = "macos")]
-const HEARD_WORDS_GRACE: Duration = Duration::from_secs(10);
+// Agent starts a final's words could straddle, which is only the latest few.
+#[cfg(any(target_os = "macos", test))]
+const MAX_AGENT_STARTS: usize = 8;
 
 #[derive(Default)]
 struct PendingRecognitions {
@@ -911,6 +917,15 @@ struct PendingRecognitions {
     ambiguous: bool,
     /// Where each unresolved turn's speech ended, oldest first; None while it continues.
     ends: VecDeque<Option<u64>>,
+    /// The wait each unresolved turn's hold had expired in, oldest first. A turn the
+    /// hold has not given up on has none, and the marked turns are always the oldest.
+    expired: VecDeque<crate::detection::Wait>,
+    /// Where the next final's first word starts, as Apple reported just before it.
+    #[cfg(any(target_os = "macos", test))]
+    first_word: Option<u64>,
+    /// Recognizer samples at which agent speech began, oldest first.
+    #[cfg(any(target_os = "macos", test))]
+    agent_starts: VecDeque<u64>,
     /// The latest recognizer sample with interim words.
     #[cfg(target_os = "macos")]
     heard: u64,
@@ -974,10 +989,22 @@ impl PendingRecognitions {
         self.unfinalized
     }
 
-    /// Stops waiting on interim words whose final never came, so later holds keep their timeout.
-    #[cfg(target_os = "macos")]
-    fn abandon_heard_words(&mut self) {
-        self.unfinalized = false;
+    #[cfg(any(target_os = "macos", test))]
+    fn agent_began(&mut self, at: u64) {
+        if self.agent_starts.len() == MAX_AGENT_STARTS {
+            self.agent_starts.pop_front();
+        }
+        self.agent_starts.push_back(at);
+    }
+
+    /// An agent started speaking in the middle of a final's words, after the first and
+    /// with some left to say. Apple ends a final about as long after its last word as
+    /// the coverage slack.
+    #[cfg(any(target_os = "macos", test))]
+    fn agent_jumped_in(&self, first_word: u64, end: u64) -> bool {
+        self.agent_starts
+            .iter()
+            .any(|&at| first_word < at && at + FINAL_COVERAGE_SLACK_SAMPLES <= end)
     }
 
     fn result_is_current(&self) -> bool {
@@ -991,6 +1018,7 @@ impl PendingRecognitions {
         let current = self.result_is_current();
         self.count -= 1;
         self.ends.pop_front();
+        self.expired.pop_front();
         if current {
             self.blocking -= 1;
             if self.blocking == 0 {
@@ -999,6 +1027,22 @@ impl PendingRecognitions {
                     .map_err(|_| ())?;
             }
         }
+        Ok(())
+    }
+
+    /// Gives up the hold while its turns' finals are still to come, and stops waiting on
+    /// interim words whose final never came, so later holds keep their timeout.
+    #[cfg(target_os = "macos")]
+    fn expire(&mut self, events: &tokio_mpsc::Sender<VoiceInputEvent>) -> Result<(), ()> {
+        use crate::detection::Wait;
+        let wait = if self.unfinalized {
+            Wait::Words
+        } else {
+            Wait::Timeout
+        };
+        self.release_hold(events)?;
+        self.unfinalized = false;
+        self.expired.resize(self.count, wait);
         Ok(())
     }
 
@@ -1697,7 +1741,13 @@ fn forward_mac_events_with_detection(
     while let Ok(event) = recognition_events.try_recv() {
         match event {
             crate::mac_speech::MacSpeechRecognitionEvent::Final(text, end) => {
+                use crate::detection::Wait;
                 let text = text.trim().to_string();
+                // What a final says about the waits and release, read before it resolves turns.
+                let (now, has_words, words) =
+                    (Instant::now(), !text.is_empty(), pending.unfinalized);
+                let waiting = settle_deadline.filter(|_| pending.result_is_current());
+                let first_word = pending.first_word.take();
                 if !text.is_empty() {
                     if let Some((controls, epoch)) =
                         controls.filter(|_| pending.result_is_current())
@@ -1715,8 +1765,36 @@ fn forward_mac_events_with_detection(
                 // exactly the turns it covers. Without one it resolves the oldest.
                 pending.unfinalized = false;
                 let resolved = end.map_or(1, |end| pending.covered(end));
+                let late = pending.expired.front().copied().filter(|_| resolved > 0);
                 for _ in 0..resolved {
                     pending.resolve(events)?;
+                }
+                if let (true, Some((controls, epoch))) = (has_words, controls) {
+                    let on_time = waiting
+                        .filter(|_| pending.blocking == 0)
+                        .and_then(|deadline| match (now < deadline, words) {
+                            (true, _) => Some(Wait::Timeout),
+                            (false, true) => Some(Wait::Words),
+                            (false, false) => None,
+                        });
+                    // A split sentence is one the agent could have jumped into.
+                    let jumped = first_word
+                        .zip(end)
+                        .filter(|_| resolved > 1)
+                        .map(|(first, end)| pending.agent_jumped_in(first, end));
+                    controls.tune(epoch, |tuner| {
+                        if let Some(wait) = late {
+                            tuner.hold_final(wait, true);
+                        } else if let Some(wait) = on_time {
+                            tuner.hold_final(wait, false);
+                        }
+                        if let Some(jumped) = jumped {
+                            tuner.split_final(jumped);
+                        }
+                    });
+                }
+                if let Some(end) = end {
+                    pending.agent_starts.retain(|&at| at > end);
                 }
                 if let Some(trace) = controls.and_then(|(controls, _)| controls.shared.trace.get())
                 {
@@ -1725,6 +1803,9 @@ fn forward_mac_events_with_detection(
                 if pending.blocking == 0 {
                     *settle_deadline = None;
                 }
+            }
+            crate::mac_speech::MacSpeechRecognitionEvent::FinalStart(start) => {
+                pending.first_word = Some(start);
             }
             crate::mac_speech::MacSpeechRecognitionEvent::Heard(end) => {
                 pending.unfinalized = true;
@@ -1896,10 +1977,11 @@ fn mac_settle_expired(
     pending: &PendingRecognitions,
     settle_deadline: Option<Instant>,
     now: Instant,
+    words_wait: Duration,
 ) -> bool {
     pending.blocking > 0
         && settle_deadline.is_some_and(|deadline| {
-            now >= deadline && (!pending.words_outstanding() || now >= deadline + HEARD_WORDS_GRACE)
+            now >= deadline && (!pending.words_outstanding() || now >= deadline + words_wait)
         })
 }
 
@@ -1946,6 +2028,7 @@ fn mac_speech_worker(
     let mut received_audio = false;
     // Samples pushed to the current recognizer, the timeline its finals report.
     let mut recognized = 0_u64;
+    let mut agent_starts = controls.shared.assistant_starts.load(Ordering::Acquire);
     let mut tracer = FrameTracer::new(controls.shared.trace.get().cloned());
     let (mut consumed, mut produced) = (0_u64, 0_u64);
     if events.blocking_send(VoiceInputEvent::Ready).is_err() {
@@ -1966,13 +2049,21 @@ fn mac_speech_worker(
         {
             return;
         }
-        if mac_settle_expired(&pending, settle_deadline, Instant::now()) {
+        let words_wait = controls
+            .effective_detection(speech_vad_threshold)
+            .0
+            .interim_words_wait_ms;
+        if mac_settle_expired(
+            &pending,
+            settle_deadline,
+            Instant::now(),
+            Duration::from_millis(words_wait.into()),
+        ) {
             // Release admission only. Keep native recognition and all its queued
             // events/audio alive so late finals still reach the conversation.
-            if pending.release_hold(&events).is_err() {
+            if pending.expire(&events).is_err() {
                 return;
             }
-            pending.abandon_heard_words();
             settle_deadline = None;
         }
         let frame = match frames.recv_timeout(Duration::from_millis(50)) {
@@ -1997,6 +2088,7 @@ fn mac_speech_worker(
             }
             let _ = pending.reset(&events);
             settle_deadline = None;
+            agent_starts = controls.shared.assistant_starts.load(Ordering::Acquire);
             recognizer.cancel();
             if shutting_down {
                 tracer.ended("cancel");
@@ -2033,6 +2125,11 @@ fn mac_speech_worker(
         }
         received_audio = true;
         recognized += frame.frame.samples().len() as u64;
+        // Speech the agent began since the last frame started about here on the recognizer's timeline.
+        let starts = controls.shared.assistant_starts.load(Ordering::Acquire);
+        if std::mem::replace(&mut agent_starts, starts) != starts {
+            pending.agent_began(recognized);
+        }
 
         input_48k.extend_from_slice(frame.frame.samples());
         let input_end = (frame.mic_frame + 1) * INPUT_FRAME_SAMPLES as u64;
@@ -3968,6 +4065,8 @@ mod tests {
         let settings = crate::detection::DetectionSettings {
             timing: Default::default(),
             pending_utterance_timeout_ms: 5000,
+            interim_words_wait_ms: 10000,
+            dynamic: Default::default(),
             listening: crate::detection::Threshold {
                 value: 0.81,
                 dynamic: true,
@@ -4565,14 +4664,21 @@ mod tests {
         native_tx.send(Heard(310_000)).unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 1);
-        assert!(!mac_settle_expired(&pending, deadline, now + timeout));
+        let words_wait =
+            Duration::from_millis(crate::detection::default_interim_words_wait_ms().into());
+        assert!(!mac_settle_expired(
+            &pending,
+            deadline,
+            now + timeout,
+            words_wait
+        ));
         assert!(mac_settle_expired(
             &pending,
             deadline,
-            now + timeout + HEARD_WORDS_GRACE
+            now + timeout + words_wait,
+            words_wait
         ));
-        pending.release_hold(&event_tx).unwrap();
-        pending.abandon_heard_words();
+        pending.expire(&event_tx).unwrap();
         assert!(!pending.words_outstanding());
         // The late final still resolves its turn.
         native_tx
@@ -4605,7 +4711,12 @@ mod tests {
             .unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 1);
-        assert!(mac_settle_expired(&pending, deadline, now + timeout));
+        assert!(mac_settle_expired(
+            &pending,
+            deadline,
+            now + timeout,
+            Duration::from_secs(10)
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -4620,14 +4731,16 @@ mod tests {
         assert!(!mac_settle_expired(
             &pending,
             deadline,
-            now + Duration::from_millis(749)
+            now + Duration::from_millis(749),
+            Duration::from_secs(10)
         ));
         assert!(mac_settle_expired(
             &pending,
             deadline,
-            now + Duration::from_millis(750)
+            now + Duration::from_millis(750),
+            Duration::from_secs(10)
         ));
-        pending.release_hold(&event_tx).unwrap();
+        pending.expire(&event_tx).unwrap();
         assert_eq!(pending.count, 1);
         assert_eq!(pending.blocking, 0);
         begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
@@ -4685,6 +4798,251 @@ mod tests {
             .unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 0);
+    }
+
+    /// Apple's events replayed through the ledger into a learning tuner.
+    #[cfg(target_os = "macos")]
+    struct Learning {
+        controls: VoiceInputControls,
+        events: tokio_mpsc::Sender<VoiceInputEvent>,
+        _held: tokio_mpsc::Receiver<VoiceInputEvent>,
+        pending: PendingRecognitions,
+        deadline: Option<Instant>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Learning {
+        fn new(dynamic: crate::detection::Dynamic) -> Self {
+            let controls = VoiceInputControls::default();
+            controls
+                .set_detection(crate::detection::DetectionSettings {
+                    dynamic,
+                    ..Default::default()
+                })
+                .unwrap();
+            let (events, _held) = tokio_mpsc::channel(4096);
+            Self {
+                controls,
+                events,
+                _held,
+                pending: PendingRecognitions::new(),
+                deadline: None,
+            }
+        }
+        fn all() -> Self {
+            Self::new(crate::detection::Dynamic {
+                pending_utterance_timeout: true,
+                interim_words_wait: true,
+                release: true,
+            })
+        }
+        /// A turn whose speech ends at `end`, held until `secs_left` from now.
+        fn turn(&mut self, end: u64, secs_left: i64) {
+            begin_mac_turn(&mut self.pending, &self.events, &mut self.deadline).unwrap();
+            self.pending.end_turn(end);
+            let now = Instant::now();
+            self.deadline = Some(if secs_left < 0 {
+                now - Duration::from_secs(secs_left.unsigned_abs())
+            } else {
+                now + Duration::from_secs(secs_left as u64)
+            });
+        }
+        fn hear(
+            &mut self,
+            events: impl IntoIterator<Item = crate::mac_speech::MacSpeechRecognitionEvent>,
+        ) {
+            let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
+            for event in events {
+                native_tx.send(event).unwrap();
+            }
+            forward_mac_events_with_detection(
+                &mut native_rx,
+                &self.events,
+                &mut self.pending,
+                &mut self.deadline,
+                None,
+                Some((&self.controls, self.controls.mute_epoch())),
+            )
+            .unwrap();
+        }
+        fn settings(&self) -> crate::detection::DetectionSettings {
+            self.controls.detection().unwrap().settings
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn final_of(text: &str, end: u64) -> crate::mac_speech::MacSpeechRecognitionEvent {
+        crate::mac_speech::MacSpeechRecognitionEvent::Final(text.into(), Some(end))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_late_final_after_the_idle_timeout_lengthens_it_and_prompt_ones_shorten_it() {
+        let mut learning = Learning::all();
+        learning.turn(48_000, 5);
+        learning.pending.expire(&learning.events).unwrap();
+        learning.deadline = None;
+        learning.hear([final_of("late", 48_000)]);
+        assert_eq!(learning.settings().pending_utterance_timeout_ms, 5250);
+        assert_eq!(learning.settings().interim_words_wait_ms, 10000);
+        for n in 0..19 {
+            assert_eq!(learning.settings().pending_utterance_timeout_ms, 5250);
+            learning.turn(48_000 * (n + 2), 5);
+            learning.hear([final_of("prompt", 48_000 * (n + 2))]);
+        }
+        let snapshot = learning.controls.detection().unwrap();
+        assert_eq!(snapshot.settings.pending_utterance_timeout_ms, 5000);
+        assert_eq!(snapshot.pending_utterance_timeout_adjustments, 2);
+        assert_eq!(snapshot.interim_words_wait_adjustments, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_final_that_ends_the_interim_words_wait_is_judged_by_that_wait() {
+        use crate::mac_speech::MacSpeechRecognitionEvent::Heard;
+        let mut learning = Learning::all();
+        learning.turn(48_000, 5);
+        learning.hear([Heard(50_000)]);
+        learning.pending.expire(&learning.events).unwrap();
+        learning.deadline = None;
+        learning.hear([final_of("late", 50_000)]);
+        assert_eq!(learning.settings().interim_words_wait_ms, 10500);
+        assert_eq!(learning.settings().pending_utterance_timeout_ms, 5000);
+        // Finals that arrive once the timeout has passed, with words still showing.
+        for n in 0..19 {
+            assert_eq!(learning.settings().interim_words_wait_ms, 10500);
+            learning.turn(48_000 * (n + 2), -1);
+            learning.hear([
+                Heard(48_000 * (n + 2) + 100),
+                final_of("prompt", 48_000 * (n + 2)),
+            ]);
+        }
+        assert_eq!(learning.settings().interim_words_wait_ms, 10000);
+        assert_eq!(learning.settings().pending_utterance_timeout_ms, 5000);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_finals_without_words_or_for_unfinished_holds_teach_nothing() {
+        let mut learning = Learning::all();
+        let before = learning.controls.detection().unwrap();
+        // Two turns, and a final that reaches only the first leaves the hold waiting.
+        learning.turn(48_000, 5);
+        learning.turn(200_000, 5);
+        learning.hear([final_of("first", 48_000)]);
+        // Empty finals settle audio without saying a hold was long enough or short.
+        learning.pending.expire(&learning.events).unwrap();
+        learning.hear([final_of("", 200_000)]);
+        learning.turn(300_000, 5);
+        learning.hear([final_of("", 300_000)]);
+        // Past the timeout with no interim words is the worker's expiry to judge.
+        learning.turn(400_000, -1);
+        learning.hear([final_of("slow", 400_000)]);
+        assert_eq!(learning.controls.detection().unwrap(), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_agent_jumping_into_a_split_sentence_lengthens_the_release() {
+        use crate::mac_speech::MacSpeechRecognitionEvent::FinalStart;
+        let mut learning = Learning::all();
+        // The sentence's pause ended a turn at 48 000, the agent began at 70 000, and
+        // the user went on to 96 000. One final carries words from both sides.
+        learning.turn(48_000, 5);
+        learning.turn(96_000, 5);
+        learning.pending.agent_began(70_000);
+        learning.hear([FinalStart(10_000), final_of("whole sentence", 120_000)]);
+        assert_eq!(learning.settings().timing.release_ms, 332);
+        assert_eq!(
+            learning.controls.detection().unwrap().release_adjustments,
+            1
+        );
+        assert!(learning.pending.agent_starts.is_empty());
+        // Splits the agent did not jump into step it back after nineteen.
+        for n in 0..19 {
+            assert_eq!(learning.settings().timing.release_ms, 332);
+            learning.turn(200_000 * (n + 1), 5);
+            learning.turn(200_000 * (n + 1) + 48_000, 5);
+            learning.hear([
+                FinalStart(200_000 * (n + 1) - 90_000),
+                final_of("split", 200_000 * (n + 1) + 60_000),
+            ]);
+        }
+        assert_eq!(learning.settings().timing.release_ms, 300);
+        assert_eq!(learning.settings().timing.onset_ms, 16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_release_counts_agents_outside_the_words_as_calm_and_unplaceable_finals_as_nothing() {
+        use crate::mac_speech::MacSpeechRecognitionEvent::FinalStart;
+        let mut learning = Learning::all();
+        learning.turn(48_000, 5);
+        learning.turn(96_000, 5);
+        learning.pending.agent_began(70_000);
+        learning.hear([FinalStart(10_000), final_of("whole sentence", 120_000)]);
+        assert_eq!(learning.settings().timing.release_ms, 332);
+        // An agent that began before the first word, after the last, or too near the end
+        // of the final to have cut in on words is no straddle.
+        for at in [5_000, 120_000, 110_000].repeat(6) {
+            learning.turn(48_000, 5);
+            learning.turn(96_000, 5);
+            learning.pending.agent_began(at);
+            learning.hear([FinalStart(10_000), final_of("whole sentence", 120_000)]);
+        }
+        // A final of one turn, or with no first word, says nothing of a split.
+        learning.turn(48_000, 5);
+        learning.pending.agent_began(30_000);
+        learning.hear([FinalStart(10_000), final_of("one turn", 120_000)]);
+        learning.turn(48_000, 5);
+        learning.turn(96_000, 5);
+        learning.pending.agent_began(60_000);
+        learning.hear([final_of("unplaced", 120_000)]);
+        assert_eq!(learning.settings().timing.release_ms, 332);
+        learning.turn(48_000, 5);
+        learning.turn(96_000, 5);
+        learning.hear([FinalStart(10_000), final_of("whole sentence", 120_000)]);
+        assert_eq!(learning.settings().timing.release_ms, 300);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_learning_is_off_until_each_setting_opts_in() {
+        use crate::mac_speech::MacSpeechRecognitionEvent::FinalStart;
+        let mut learning = Learning::new(Default::default());
+        let before = learning.controls.detection().unwrap();
+        for _ in 0..30 {
+            learning.turn(48_000, 5);
+            learning.pending.expire(&learning.events).unwrap();
+            learning.pending.agent_began(30_000);
+            learning.turn(96_000, 5);
+            learning.hear([FinalStart(10_000), final_of("late", 120_000)]);
+            learning.hear([final_of("again", 120_000)]);
+        }
+        assert_eq!(
+            learning.controls.detection().unwrap().settings,
+            before.settings
+        );
+    }
+
+    #[test]
+    fn agent_starts_are_counted_and_only_the_latest_few_are_kept() {
+        let controls = VoiceInputControls::default();
+        let starts = || controls.shared.assistant_starts.load(Ordering::Acquire);
+        let first = controls
+            .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
+            .unwrap();
+        let second = controls
+            .begin_assistant_activity(0.65, InputDuringTtsPolicy::AllowBargeIn)
+            .unwrap();
+        drop((first, second));
+        assert_eq!(starts(), 2);
+        let mut pending = PendingRecognitions::new();
+        for at in 0..20 {
+            pending.agent_began(at * 100_000);
+        }
+        assert_eq!(pending.agent_starts.len(), MAX_AGENT_STARTS);
+        assert_eq!(pending.agent_starts.front(), Some(&1_200_000));
     }
 
     #[test]

@@ -670,6 +670,8 @@ mod tests {
         };
         DetectionSettings {
             pending_utterance_timeout_ms: 5000,
+            interim_words_wait_ms: 10000,
+            dynamic: Default::default(),
             listening: threshold,
             interruption: threshold,
             timing: VadTiming {

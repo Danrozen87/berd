@@ -153,10 +153,7 @@ pub fn replay(input: &ReplayInput, candidate: Option<&Candidate>) -> Result<Repo
     input.validate()?;
     if let Some(candidate) = candidate {
         candidate.settings.validate()?;
-        if candidate.name.trim().is_empty()
-            || candidate.settings.listening.dynamic
-            || candidate.settings.interruption.dynamic
-        {
+        if candidate.name.trim().is_empty() || candidate.settings.is_dynamic() {
             return Err("candidate needs a name and static thresholds".into());
         }
     }

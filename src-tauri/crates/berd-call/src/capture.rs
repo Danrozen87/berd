@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(
             vad,
             [
-                json!({"type": "settings", "revision": 0, "settings": {"listening": {"value": 0.5, "dynamic": false}, "interruption": {"value": 0.65, "dynamic": false}, "timing": {"onset_ms": 16, "release_ms": 300}, "pending_utterance_timeout_ms": 5000}}),
+                json!({"type": "settings", "revision": 0, "settings": {"listening": {"value": 0.5, "dynamic": false}, "interruption": {"value": 0.65, "dynamic": false}, "timing": {"onset_ms": 16, "release_ms": 300}, "pending_utterance_timeout_ms": 5000, "interim_words_wait_ms": 10000, "dynamic": {"pending_utterance_timeout": false, "interim_words_wait": false, "release": false}}}),
                 json!({"mic_sample": 768, "vad_frame": 0, "epoch": 0, "generation": 1, "mode": "listening", "probability": 0.75, "threshold": 0.5, "detected": true, "active": true, "settings_revision": 0}),
             ]
         );

@@ -145,10 +145,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     input.validate()?;
     for candidate in &candidates {
         candidate.settings.validate()?;
-        if candidate.name.trim().is_empty()
-            || candidate.settings.listening.dynamic
-            || candidate.settings.interruption.dynamic
-        {
+        if candidate.name.trim().is_empty() || candidate.settings.is_dynamic() {
             return Err("candidates need unique names and static thresholds".into());
         }
     }

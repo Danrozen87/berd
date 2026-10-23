@@ -150,8 +150,10 @@ Usage:
 
 Each form also accepts:
     [--rate FLOAT] [--listening-threshold 0..1] [--interruption-threshold 0..1]
-    [--pending-utterance-timeout-ms 250..30000]
+    [--pending-utterance-timeout-ms 250..30000] [--interim-words-wait-ms 250..60000]
     [--dynamic-listening true|false] [--dynamic-interruption true|false]
+    [--dynamic-pending-utterance-timeout true|false] [--dynamic-interim-words-wait true|false]
+    [--dynamic-release true|false]
     [--stt-backend macos|parakeet|openai] [--stt-model-dir PATH] [--stt-hint PHRASE]...
     [--mode conventional|expert-spokesperson] [--allow-direct-agent-speech]
     [--spokesperson-voice NAME] [--spokesperson-rate 0.25..1.5]
@@ -163,9 +165,17 @@ Each form also accepts:
 --interruption-threshold sets local speech detection during agent playback (default 0.65).
 --pending-utterance-timeout-ms bounds the idle agent speech hold (default 5000 ms).
 Expiry keeps macOS recognition running and accepts late transcripts.
+--interim-words-wait-ms extends that hold while Apple still has interim words to finalize (default 10000 ms).
 Higher values require stronger evidence of speech before pausing playback.
 Dynamic adjustment is experimental, off by default, and requires macOS STT.
-Each enabled threshold learns independently, moving by 0.01 within 0.10..0.95.
+Each enabled threshold learns independently, moving by 0.01 within 0.10..0.95:
+a transcript missed by detection lowers it, and every 99 detected transcripts raise it back.
+--dynamic-pending-utterance-timeout and --dynamic-interim-words-wait lengthen their wait (by 250 and
+500 ms, within 2000..8000 and 2000..20000 ms) when a transcript arrives after the hold expired,
+and shorten it after 19 transcripts that arrived in time. --dynamic-release lengthens VAD release
+(300 ms by default) by 32 ms, within 160..1500 ms, when an agent began speaking in the middle of a
+transcript that spanned several pauses, and shortens it after 19 split transcripts it did not.
+Learned values are saved to the default audio setup profile.
 Use detection-profile [--settings JSON] to read or save the default audio setup profile.
 
 The host owns microphone capture, audio playback, transcript delivery, and

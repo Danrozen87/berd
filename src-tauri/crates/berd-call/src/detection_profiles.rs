@@ -23,6 +23,9 @@ pub fn settings_for_start(
             "--pending-utterance-timeout-ms" => {
                 settings.pending_utterance_timeout_ms = configured.pending_utterance_timeout_ms
             }
+            "--interim-words-wait-ms" => {
+                settings.interim_words_wait_ms = configured.interim_words_wait_ms
+            }
             "--listening-threshold" => settings.listening.value = configured.listening.value,
             "--interruption-threshold" => {
                 settings.interruption.value = configured.interruption.value
@@ -31,6 +34,14 @@ pub fn settings_for_start(
             "--dynamic-interruption" => {
                 settings.interruption.dynamic = configured.interruption.dynamic
             }
+            "--dynamic-pending-utterance-timeout" => {
+                settings.dynamic.pending_utterance_timeout =
+                    configured.dynamic.pending_utterance_timeout
+            }
+            "--dynamic-interim-words-wait" => {
+                settings.dynamic.interim_words_wait = configured.dynamic.interim_words_wait
+            }
+            "--dynamic-release" => settings.dynamic.release = configured.dynamic.release,
             _ => {}
         }
     }
@@ -275,6 +286,76 @@ mod tests {
             settings_for_start(Some(profile), configured, &inherited).unwrap(),
             profile
         );
+    }
+
+    #[test]
+    fn learned_waits_and_release_persist_and_their_flags_override_only_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "output");
+        let mut learned = DetectionSettings {
+            pending_utterance_timeout_ms: 5250,
+            interim_words_wait_ms: 10500,
+            ..Default::default()
+        };
+        learned.timing.release_ms = 332;
+        learned.dynamic = berd_call::detection::Dynamic {
+            pending_utterance_timeout: true,
+            interim_words_wait: true,
+            release: true,
+        };
+        save(&path, &setup, learned).unwrap();
+        assert_eq!(load(&path, &setup).unwrap(), Some(learned));
+        let configured = DetectionSettings {
+            interim_words_wait_ms: 12000,
+            ..Default::default()
+        };
+        let explicit = [
+            "--interim-words-wait-ms",
+            "12000",
+            "--dynamic-release",
+            "false",
+        ]
+        .map(str::to_string);
+        let restored = settings_for_start(Some(learned), configured, &explicit).unwrap();
+        assert_eq!(restored.interim_words_wait_ms, 12000);
+        assert!(!restored.dynamic.release);
+        assert!(restored.dynamic.pending_utterance_timeout && restored.dynamic.interim_words_wait);
+        assert_eq!(restored.pending_utterance_timeout_ms, 5250);
+        assert_eq!(restored.timing.release_ms, 332);
+        let all_off = [
+            "--dynamic-pending-utterance-timeout",
+            "false",
+            "--dynamic-interim-words-wait",
+            "false",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            settings_for_start(Some(learned), configured, &all_off)
+                .unwrap()
+                .dynamic,
+            berd_call::detection::Dynamic {
+                release: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn profiles_saved_before_waits_and_release_learned_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let setup = setup("mic", "output");
+        let legacy = format!(
+            r#"{{"profiles":{{{}:{{"listening":{{"value":0.7,"dynamic":true}},"interruption":{{"value":0.8}},"timing":{{"onset_ms":16,"release_ms":300}},"pending_utterance_timeout_ms":4000}}}}}}"#,
+            serde_json::to_string(&key(&setup)).unwrap()
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = load(&path, &setup).unwrap().unwrap();
+        assert_eq!(loaded.pending_utterance_timeout_ms, 4000);
+        assert_eq!(loaded.interim_words_wait_ms, 10000);
+        assert_eq!(loaded.dynamic, berd_call::detection::Dynamic::default());
+        assert!(loaded.listening.dynamic);
     }
 
     #[test]

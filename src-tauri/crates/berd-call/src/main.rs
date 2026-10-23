@@ -214,8 +214,10 @@ struct SessionConfig {
     interruption_threshold: f32,
     listening_threshold: f32,
     pending_utterance_timeout_ms: u32,
+    interim_words_wait_ms: u32,
     dynamic_listening: bool,
     dynamic_interruption: bool,
+    dynamic: berd_call::detection::Dynamic,
     /// The Spokesperson's session options beyond its voice and speed.
     spokesperson_options:
         Option<berd_call::openai_realtime_protocol::RealtimeSpokespersonSessionOptions>,
@@ -2618,6 +2620,8 @@ fn run_session(
                     berd_call::detection::DetectionSettings {
                         timing: Default::default(),
                         pending_utterance_timeout_ms: config.pending_utterance_timeout_ms,
+                        interim_words_wait_ms: config.interim_words_wait_ms,
+                        dynamic: config.dynamic,
                         listening: berd_call::detection::Threshold {
                             value: config.listening_threshold,
                             dynamic: config.dynamic_listening,
@@ -2775,19 +2779,18 @@ fn run_session(
                 }
             }
             Input::Request(SessionRequest::SetDetectionSettings { id, settings }) => {
-                let result = if (settings.listening.dynamic || settings.interruption.dynamic)
-                    && !matches!(config.stt, SttBackendConfig::Macos)
-                {
-                    Err(
-                        "dynamic speech detection currently requires macOS speech recognition"
-                            .to_string(),
-                    )
-                } else {
-                    input_controls
-                        .as_ref()
-                        .ok_or_else(|| "speech input is not ready".to_string())
-                        .and_then(|controls| controls.set_detection(settings))
-                };
+                let result =
+                    if settings.is_dynamic() && !matches!(config.stt, SttBackendConfig::Macos) {
+                        Err(
+                            "dynamic speech detection currently requires macOS speech recognition"
+                                .to_string(),
+                        )
+                    } else {
+                        input_controls
+                            .as_ref()
+                            .ok_or_else(|| "speech input is not ready".to_string())
+                            .and_then(|controls| controls.set_detection(settings))
+                    };
                 let snapshot = result
                     .as_ref()
                     .ok()
@@ -6561,8 +6564,10 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
     let mut interruption_threshold = 0.65;
     let mut listening_threshold = 0.5;
     let mut pending_utterance_timeout_ms = 5000;
+    let mut interim_words_wait_ms = berd_call::detection::default_interim_words_wait_ms();
     let mut dynamic_listening = false;
     let mut dynamic_interruption = false;
+    let mut dynamic = berd_call::detection::Dynamic::default();
     let mut spokesperson_options = None;
     let mut capture = None;
     let mut index = 2;
@@ -6586,6 +6591,12 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     return Err(format!("{flag} must be 250 to 30000 ms").into());
                 }
             }
+            "--interim-words-wait-ms" => {
+                interim_words_wait_ms = value.parse::<u32>().map_err(|_| format!("{flag} must be an integer"))?;
+                if !(250..=60000).contains(&interim_words_wait_ms) {
+                    return Err(format!("{flag} must be 250 to 60000 ms").into());
+                }
+            }
             "--interruption-threshold" | "--listening-threshold" => {
                 let threshold = value
                     .parse::<f32>()
@@ -6607,6 +6618,20 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
                     dynamic_listening = enabled;
                 } else {
                     dynamic_interruption = enabled;
+                }
+            }
+            "--dynamic-pending-utterance-timeout"
+            | "--dynamic-interim-words-wait"
+            | "--dynamic-release" => {
+                let enabled = value
+                    .parse::<bool>()
+                    .map_err(|_| format!("{flag} must be true or false"))?;
+                match flag {
+                    "--dynamic-pending-utterance-timeout" => {
+                        dynamic.pending_utterance_timeout = enabled
+                    }
+                    "--dynamic-interim-words-wait" => dynamic.interim_words_wait = enabled,
+                    _ => dynamic.release = enabled,
                 }
             }
             "--tts-backend" => backend = value,
@@ -6713,8 +6738,10 @@ fn parse_args(args: &[String]) -> Result<SessionConfig, ParseFailure> {
         interruption_threshold,
         listening_threshold,
         pending_utterance_timeout_ms,
+        interim_words_wait_ms,
         dynamic_listening,
         dynamic_interruption,
+        dynamic,
         spokesperson_options,
         capture,
     })
@@ -7741,9 +7768,7 @@ fn create_input_runtime(
             }
         }
     };
-    if (detection.listening.dynamic || detection.interruption.dynamic)
-        && !matches!(config, SttBackendConfig::Macos)
-    {
+    if detection.is_dynamic() && !matches!(config, SttBackendConfig::Macos) {
         return Err("dynamic speech detection currently requires macOS speech recognition".into());
     }
     let controls = VoiceInputControls::default();
@@ -9117,6 +9142,53 @@ mod tests {
         assert!(parse_args(&args).unwrap().dynamic_interruption);
         args.extend(["--dynamic-listening".into(), "maybe".into()]);
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn learned_wait_and_release_switches_are_explicit_bounded_and_independent() {
+        let base: Vec<String> = ["berd-call", "session", "--tts-backend", "openai"]
+            .map(str::to_string)
+            .to_vec();
+        let config = parse_args(&base).unwrap();
+        assert_eq!(config.interim_words_wait_ms, 10000);
+        assert_eq!(config.dynamic, berd_call::detection::Dynamic::default());
+        for (flag, check) in [
+            (
+                "--dynamic-pending-utterance-timeout",
+                (|d: berd_call::detection::Dynamic| d.pending_utterance_timeout) as fn(_) -> bool,
+            ),
+            ("--dynamic-interim-words-wait", |d| d.interim_words_wait),
+            ("--dynamic-release", |d| d.release),
+        ] {
+            let mut args = base.clone();
+            args.extend([flag.into(), "true".into()]);
+            let dynamic = parse_args(&args).unwrap().dynamic;
+            assert!(check(dynamic));
+            assert_eq!(
+                [
+                    dynamic.pending_utterance_timeout,
+                    dynamic.interim_words_wait,
+                    dynamic.release
+                ]
+                .into_iter()
+                .filter(|on| *on)
+                .count(),
+                1
+            );
+            args.extend([flag.into(), "maybe".into()]);
+            assert!(parse_args(&args).is_err());
+        }
+        for (value, valid) in [
+            ("249", false),
+            ("250", true),
+            ("60000", true),
+            ("60001", false),
+            ("x", false),
+        ] {
+            let mut args = base.clone();
+            args.extend(["--interim-words-wait-ms".into(), value.into()]);
+            assert_eq!(parse_args(&args).is_ok(), valid, "{value}");
+        }
     }
 
     #[test]
@@ -11691,6 +11763,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }
@@ -11712,6 +11786,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }
@@ -11799,6 +11875,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }
@@ -11865,6 +11943,8 @@ mod tests {
             pending_utterance_timeout_ms: 5000,
             dynamic_listening: false,
             dynamic_interruption: false,
+            interim_words_wait_ms: 10000,
+            dynamic: Default::default(),
             spokesperson_options: None,
             capture: None,
         };
@@ -12157,6 +12237,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }
@@ -12229,6 +12311,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }
@@ -12684,6 +12768,8 @@ mod tests {
                 pending_utterance_timeout_ms: 5000,
                 dynamic_listening: false,
                 dynamic_interruption: false,
+                interim_words_wait_ms: 10000,
+                dynamic: Default::default(),
                 spokesperson_options: None,
                 capture: None,
             }

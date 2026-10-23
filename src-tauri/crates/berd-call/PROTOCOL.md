@@ -405,7 +405,7 @@ output.
 
 ## Local speech detection (protocol 7)
 
-Conventional session readiness includes an optional `session.detection` snapshot with `settings.listening` and `settings.interruption` (`value`, `dynamic`), plus `adjustments`, `no_result` and `missed_detection` counters. These local controls are separate from Realtime Spokesperson turn detection.
+Conventional session readiness includes an optional `session.detection` snapshot with `settings.listening` and `settings.interruption` (`value`, `dynamic`), `settings.pending_utterance_timeout_ms`, `settings.interim_words_wait_ms`, `settings.timing.release_ms` and the opt-ins `settings.dynamic.pending_utterance_timeout`, `settings.dynamic.interim_words_wait` and `settings.dynamic.release`, plus `adjustments` (threshold steps), `no_result`, `missed_detection`, `pending_utterance_timeout_adjustments`, `interim_words_wait_adjustments` and `release_adjustments` counters. These local controls are separate from Realtime Spokesperson turn detection.
 
 A host sends `{"type":"set_detection_settings","id":42,"settings":{"listening":{"value":0.7,"dynamic":true},"interruption":{"value":0.8,"dynamic":false}}}` to replace both settings atomically and discard stale input/learning evidence. The session returns `detection_settings_result` with that ID and an applied `snapshot`, or `snapshot:null` and a `message` explaining rejection. Invalid settings leave the current values unchanged. Dynamic choices require macOS STT.
 

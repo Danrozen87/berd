@@ -136,7 +136,7 @@ pub fn evaluate_corpus(
     if corpus.devices.input_uid.trim().is_empty() || corpus.devices.output_uid.trim().is_empty() {
         trial_ineligible.push("audio setup needs nonempty device identities".into());
     }
-    if baseline.listening.dynamic || baseline.interruption.dynamic {
+    if baseline.is_dynamic() {
         trial_ineligible.push("static replay cannot validate a dynamic baseline".into());
     }
     Ok(CorpusEvaluation {
@@ -154,9 +154,7 @@ pub fn candidates(baseline: DetectionSettings) -> Result<Vec<Candidate>, String>
     let mut result = Vec::new();
     for listening in [true, false] {
         for delta in [-0.05, 0.05] {
-            let mut settings = baseline;
-            settings.listening.dynamic = false;
-            settings.interruption.dynamic = false;
+            let mut settings = baseline.fixed();
             let value = if listening {
                 &mut settings.listening.value
             } else {
@@ -333,9 +331,7 @@ pub fn evaluate_grouped(
         candidates_tested: 0,
     };
     let mut sessions = BTreeSet::new();
-    let mut static_baseline = baseline;
-    static_baseline.listening.dynamic = false;
-    static_baseline.interruption.dynamic = false;
+    let static_baseline = baseline.fixed();
     output.baseline = static_baseline;
     let reference = Candidate {
         name: "baseline".into(),
