@@ -273,6 +273,14 @@ impl DetectionTrace for Capture {
             detail: json!({"end_sample": end_sample, "resolved": resolved}),
         });
     }
+
+    fn recognition(&self, kind: &'static str, sample: u64) {
+        self.send(Record::Event {
+            us: self.us(),
+            kind,
+            detail: json!({"sample": sample}),
+        });
+    }
 }
 
 /// Mirrors complete lines written through it into the capture.
