@@ -189,6 +189,16 @@ impl Capture {
         });
     }
 
+    /// The default devices, recorded whenever they change because a host following them
+    /// can switch mid-call. None when CoreAudio has no default.
+    pub fn route(&self, setup: Option<&impl Serialize>) {
+        self.send(Record::Event {
+            us: self.us(),
+            kind: "route",
+            detail: json!({ "devices": setup }),
+        });
+    }
+
     /// Writes everything queued and closes the files.
     pub fn finish(&self) {
         let (done, finished) = mpsc::sync_channel(1);
@@ -768,6 +778,24 @@ mod tests {
             ),
             (&json!("recognizer"), &json!(1), &json!(1), &json!("start"))
         );
+    }
+
+    #[test]
+    fn records_each_default_route_on_the_timeline() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = Capture::start(root.path(), Value::Null).unwrap();
+        let airpods = json!({"input_uid": "pods", "output_uid": "pods"});
+        capture.route(Some(&airpods));
+        capture.mic(&frame(0.0));
+        capture.route(None::<&Value>);
+        capture.finish();
+
+        let routes = events(capture.dir())
+            .into_iter()
+            .filter(|event| event["type"] == "route")
+            .map(|event| (event["frame"].clone(), event["devices"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(routes, [(json!(0), airpods), (json!(1), Value::Null)]);
     }
 
     #[test]

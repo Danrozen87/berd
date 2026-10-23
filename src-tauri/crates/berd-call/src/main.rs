@@ -2282,6 +2282,40 @@ fn capture_session(config: &SessionConfig, args: &[String]) -> serde_json::Value
     })
 }
 
+/// Records the default devices into a capture until dropped. Buzz and other hosts
+/// that follow the system default can change device mid-call without telling the session.
+#[cfg(target_os = "macos")]
+struct RouteRecorder(Arc<AtomicBool>);
+
+#[cfg(target_os = "macos")]
+impl RouteRecorder {
+    const POLL: Duration = Duration::from_millis(250);
+
+    fn start(capture: capture::Capture) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut last = None;
+            while !stopped.load(Ordering::SeqCst) {
+                let setup = berd_call::macos_audio_route::default_audio_setup();
+                if last.as_ref() != Some(&setup) {
+                    capture.route(setup.as_ref());
+                    last = Some(setup);
+                }
+                thread::sleep(Self::POLL);
+            }
+        });
+        Self(stop)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RouteRecorder {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn run_session(
     config: SessionConfig,
     pcm_output_fd: RawFd,
@@ -2304,6 +2338,8 @@ fn run_session(
             &mut io::stderr(),
         )
     });
+    #[cfg(target_os = "macos")]
+    let _routes = capture.clone().map(RouteRecorder::start);
     let audio_transport = Arc::new(
         unsafe { AudioPipeTransport::from_raw_fd(pcm_output_fd)? }.with_capture(capture.clone()),
     );
