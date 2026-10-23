@@ -911,9 +911,12 @@ struct PendingRecognitions {
     ambiguous: bool,
     /// Where each unresolved turn's speech ended, oldest first; None while it continues.
     ends: VecDeque<Option<u64>>,
-    /// The latest recognizer sample with interim words, and the latest a final reached.
+    /// The latest recognizer sample with interim words.
     heard: u64,
-    finalized: u64,
+    /// Apple's latest result was interim words rather than a final. Apple
+    /// re-reports words a final left out, and interim results end where its
+    /// audio does rather than at the last word, so order says more than samples.
+    unfinalized: bool,
 }
 
 impl PendingRecognitions {
@@ -966,13 +969,13 @@ impl PendingRecognitions {
     /// Apple has interim words no final has reached yet, so a transcript is still coming.
     #[cfg(any(target_os = "macos", test))]
     fn words_outstanding(&self) -> bool {
-        self.heard > self.finalized.saturating_add(FINAL_COVERAGE_SLACK_SAMPLES)
+        self.unfinalized
     }
 
     /// Stops waiting on interim words whose final never came, so later holds keep their timeout.
     #[cfg(target_os = "macos")]
     fn abandon_heard_words(&mut self) {
-        self.finalized = self.finalized.max(self.heard);
+        self.unfinalized = false;
     }
 
     fn result_is_current(&self) -> bool {
@@ -1708,9 +1711,7 @@ fn forward_mac_events_with_detection(
                 // One final can span several turns split by pauses, and one turn
                 // can produce several finals, so a final with an end resolves
                 // exactly the turns it covers. Without one it resolves the oldest.
-                if let Some(end) = end {
-                    pending.finalized = pending.finalized.max(end);
-                }
+                pending.unfinalized = false;
                 let resolved = end.map_or(1, |end| pending.covered(end));
                 for _ in 0..resolved {
                     pending.resolve(events)?;
@@ -1724,6 +1725,7 @@ fn forward_mac_events_with_detection(
                 }
             }
             crate::mac_speech::MacSpeechRecognitionEvent::Heard(end) => {
+                pending.unfinalized = true;
                 // Apple repeats interim results, so only new audio is traced.
                 if end > pending.heard {
                     pending.heard = end;
@@ -4553,10 +4555,12 @@ mod tests {
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
+        // Apple re-reports the second sentence's interim words after the first final.
         native_tx.send(Heard(310_000)).unwrap();
         native_tx
             .send(Final("first".into(), Some(110_000)))
             .unwrap();
+        native_tx.send(Heard(310_000)).unwrap();
         forward_mac_events(&mut native_rx, &event_tx, &mut pending, &mut deadline, None).unwrap();
         assert_eq!(pending.blocking, 1);
         assert!(!mac_settle_expired(&pending, deadline, now + timeout));
@@ -4584,7 +4588,8 @@ mod tests {
         let mut deadline = None;
         let now = Instant::now();
         let timeout = Duration::from_secs(5);
-        // Words, then noise after them that Apple never transcribes.
+        // Words, then noise after them that Apple never transcribes. Interim
+        // results end where Apple's audio did, past the final's last word.
         for end in [100_000, 300_000] {
             begin_mac_turn(&mut pending, &event_tx, &mut deadline).unwrap();
             pending.end_turn(end);
@@ -4592,7 +4597,7 @@ mod tests {
         }
         let (native_tx, mut native_rx) = tokio_mpsc::unbounded_channel();
         use crate::mac_speech::MacSpeechRecognitionEvent::{Final, Heard};
-        native_tx.send(Heard(105_000)).unwrap();
+        native_tx.send(Heard(130_000)).unwrap();
         native_tx
             .send(Final("words".into(), Some(110_000)))
             .unwrap();
