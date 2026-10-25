@@ -317,6 +317,7 @@ Use Radix-backed shared primitives for dialogs, sheets, drawers, dropdowns, popo
 - **Shape:** `rounded-overlay` for popovers and dropdowns, `rounded-modal` for dialogs.
 - **Color:** `bg-popover text-popover-foreground`.
 - **Motion:** Use existing open/close animations and durations (`--duration-fast`, `--duration-normal`, `--duration-slow`).
+- **Tooltips:** The shared default leaves an 8px gap so the arrow and entry animation stay clear of the trigger. Pointer recovery after activation has one timer owner; do not start a second hover timer for the same event. Preserve explicit hoverable and pointer-pass-through options.
 - **Modal Use:** Dialogs are for blocking decisions, destructive confirmation, or workflows that cannot remain inline.
 
 ## 7. Do's and Don'ts

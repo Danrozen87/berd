@@ -13,14 +13,19 @@ import { TOOLTIP_DELAY } from "@/shared/ui/tooltip-delay";
 
 function pointerEvent(
   type: "pointerdown" | "pointermove",
-  { x, y }: { x: number; y: number },
+  {
+    x,
+    y,
+    pointerType = "mouse",
+  }: { x: number; y: number; pointerType?: string },
 ) {
   const event = new MouseEvent(type, {
     bubbles: true,
+    cancelable: true,
     clientX: x,
     clientY: y,
   });
-  Object.defineProperty(event, "pointerType", { value: "mouse" });
+  Object.defineProperty(event, "pointerType", { value: pointerType });
   return event;
 }
 
@@ -84,11 +89,17 @@ describe("Tooltip", () => {
     await act(() => vi.advanceTimersByTimeAsync(TOOLTIP_DELAY.standard * 2));
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
 
-    fireEvent(trigger, pointerEvent("pointermove", { x: 20, y: 10 }));
+    const reopenMove = pointerEvent("pointermove", { x: 20, y: 10 });
+    fireEvent(trigger, reopenMove);
+    expect(reopenMove.defaultPrevented).toBe(true);
     await act(() => vi.advanceTimersByTimeAsync(TOOLTIP_DELAY.standard - 1));
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Attach files");
+    const continuedMove = pointerEvent("pointermove", { x: 21, y: 10 });
+    fireEvent(trigger, continuedMove);
+    await act(() => vi.advanceTimersByTimeAsync(TOOLTIP_DELAY.standard * 2));
     expect(screen.getByRole("tooltip")).toHaveTextContent("Attach files");
   });
 
@@ -265,5 +276,38 @@ describe("Tooltip", () => {
       "text-popover-inverse-foreground",
       "rounded-md",
     );
+  });
+  it.each([
+    "prevented",
+    "touch",
+  ])("does not start a custom reopen for a %s move", async (kind) => {
+    vi.useFakeTimers();
+    render(
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger
+            asChild
+            onPointerMove={(event) => {
+              if (kind === "prevented") event.preventDefault();
+            }}
+          >
+            <Button>Help</Button>
+          </TooltipTrigger>
+          <TooltipContent>Help text</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>,
+    );
+    const trigger = screen.getByRole("button", { name: "Help" });
+    fireEvent(trigger, pointerEvent("pointerdown", { x: 10, y: 10 }));
+    fireEvent(
+      trigger,
+      pointerEvent("pointermove", {
+        x: 20,
+        y: 10,
+        pointerType: kind === "touch" ? "touch" : "mouse",
+      }),
+    );
+    await act(() => vi.advanceTimersByTimeAsync(TOOLTIP_DELAY.standard * 2));
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 });

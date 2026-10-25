@@ -186,10 +186,13 @@ function TooltipTrigger({
       }}
       onPointerMove={(event) => {
         onPointerMove?.(event);
-        interaction?.onPointerMove(event.currentTarget, {
+        if (event.defaultPrevented || event.pointerType === "touch") return;
+        const handled = interaction?.onPointerMove(event.currentTarget, {
           x: event.clientX,
           y: event.clientY,
         });
+        // A custom reopen timer owns this move; Radix must not start another.
+        if (handled) event.preventDefault();
       }}
       onPointerLeave={(event) => {
         interaction?.onPointerLeave();
@@ -216,7 +219,8 @@ type TooltipContentProps = React.ComponentProps<
 function TooltipContent({
   className,
   side = "top",
-  sideOffset = 0,
+  // Keep the arrow and entry motion outside the trigger hit area.
+  sideOffset = 8,
   children,
   pointerEvents = "auto",
   layer = "default",

@@ -48,7 +48,8 @@
     "quality:check": "node ./personal/check-quality.mjs",
     "test:quality": "node --test personal/check-quality.test.mjs",
     "test:theme-contrast": "playwright test --config tests/theme-contrast/playwright.config.ts",
-    "test:provider-setup": "playwright test --config tests/provider-setup/playwright.config.ts"
+    "test:provider-setup": "playwright test --config tests/provider-setup/playwright.config.ts",
+    "test:tooltips": "playwright test --config tests/tooltips/playwright.config.ts"
   },
   "dependencies": {
     "@aaif/goose-sdk": "workspace:*",
