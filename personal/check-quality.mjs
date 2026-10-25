@@ -26,7 +26,16 @@ function baseRevision(root, staged) {
   if (staged) return "HEAD";
   const base = git(root, ["merge-base", "upstream/main", "HEAD"], true)?.trim();
   if (!base)
-    throw new Error("upstream/main is required for the personal quality gate.");
+    throw new Error(
+      [
+        "upstream/main is required for the personal quality gate.",
+        "If the upstream remote is missing, add it:",
+        "  git remote add upstream https://github.com/block/berd.git",
+        "Then fetch the baseline:",
+        "  git fetch upstream main",
+        "See personal/CONTRIBUTING.md for clone setup.",
+      ].join("\n"),
+    );
   return base;
 }
 

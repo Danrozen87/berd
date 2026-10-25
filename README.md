@@ -11,6 +11,9 @@ distribution seams without adding private material to the public source tree.
 
 ## Getting started
 
+For the personal fork, follow [clone setup](personal/CONTRIBUTING.md#clone-setup)
+first so local checks can resolve their upstream baseline.
+
 ```bash
 just setup
 just dev

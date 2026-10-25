@@ -35,6 +35,7 @@ function fixture(t, initial = short) {
   git("commit", "-qm", "fixture");
   git("update-ref", "refs/remotes/upstream/main", "HEAD");
   return {
+    git,
     write: (source) => writeFileSync(join(root, "work.ts"), source),
     stage: () => git("add", "work.ts"),
     run: (...args) =>
@@ -50,6 +51,24 @@ function expectStatus(result, status) {
   assert.equal(result.status, status, `${result.stdout}\n${result.stderr}`);
   if (status === 1) assert.match(result.stderr, /Function limits grew/);
 }
+
+test("missing upstream explains setup and preserves staged checks", (t) => {
+  const f = fixture(t);
+  f.git("update-ref", "-d", "refs/remotes/upstream/main");
+  const result = f.run();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /upstream\/main is required/);
+  assert.ok(
+    result.stderr.includes(
+      "git remote add upstream https://github.com/block/berd.git",
+    ),
+  );
+  assert.ok(result.stderr.includes("git fetch upstream main"));
+  assert.ok(result.stderr.includes("personal/CONTRIBUTING.md"));
+  expectStatus(f.run("--staged"), 0);
+  f.git("update-ref", "refs/remotes/upstream/main", "HEAD");
+  expectStatus(f.run(), 0);
+});
 
 test("new oversized production functions fail, including untracked files", (t) => {
   const f = fixture(t);

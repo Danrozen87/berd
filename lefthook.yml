@@ -23,8 +23,6 @@ pre-commit:
 pre-push:
   parallel: true
   commands:
-    personal-quality:
-      run: node personal/check-quality.mjs
     fmt-check:
       run: just fmt-check
     clippy:

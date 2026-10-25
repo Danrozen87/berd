@@ -4,6 +4,19 @@
 Keep fixes small enough to review and remove when upstream provides the same
 behavior. Do not mix an upstream sync with product changes.
 
+## Clone setup
+
+After cloning `Danrozen87/berd`, fetch the upstream baseline used by local checks:
+
+```bash
+git remote add upstream https://github.com/block/berd.git
+git fetch upstream main
+just setup
+just dev
+```
+
+If the `upstream` remote already exists, skip the `git remote add` command.
+
 ## Daily checks
 
 `npm run dev`, `pnpm dev`, and `just dev` run the personal function gate before
