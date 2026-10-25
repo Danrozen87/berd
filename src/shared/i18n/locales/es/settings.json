@@ -724,10 +724,11 @@
       "deviceCode": "Código de dispositivo"
     },
     "setupRequired": {
-      "body": "Esta versión no incluye un proveedor de modelos preconfigurado. Configura uno antes de iniciar un chat de Goose.",
+      "body": "Elige un proveedor de modelos o inicia sesión en un agente de programación para empezar a chatear. Puedes hacerlo más tarde en Ajustes.",
       "openProviders": "Abrir proveedores de IA",
-      "title": "Elige un proveedor de IA para empezar a chatear",
-      "toast": "Elige un proveedor de IA antes de iniciar un chat."
+      "title": "Conecta un proveedor de IA",
+      "toast": "Elige un proveedor de IA antes de iniciar un chat.",
+      "notNow": "Ahora no"
     },
     "showFewer": "Mostrar menos",
     "showMore": "Mostrar {{count}} proveedores más",

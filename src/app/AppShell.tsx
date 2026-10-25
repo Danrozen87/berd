@@ -183,14 +183,13 @@ import type { SkillInfo } from "@/features/skills/api/skills";
 import { toChatSkillDraft } from "@/features/skills/lib/skillChatPrompt";
 import { useMigrationGate } from "@/features/migration/hooks/useMigrationGate";
 import { useNewSessionTarget } from "@/features/providers/hooks/useNewSessionTarget";
-import { useAgentProviderStatus } from "@/features/providers/hooks/useAgentProviderStatus";
+import { useProviderSetupRequired } from "@/features/providers/hooks/useProviderSetupRequired";
 import { useDefaultProviderReadinessStore } from "@/features/providers/stores/defaultProviderReadinessStore";
 import {
   getProviderCatalog,
   resolveAgentProviderCatalogIdStrict,
 } from "@/features/providers/providerCatalog";
 import { useProviderModelCacheStore } from "@/features/providers/stores/providerModelCacheStore";
-import { getBuildFeatureState } from "@/shared/profile/buildProfile";
 import { gooseServeSelectionFromExecutionTarget } from "@/features/chat/lib/gooseServeExecutionTarget";
 import {
   isModelExecutionTarget,
@@ -1123,14 +1122,12 @@ export function AppShell({
     },
     [ensureNewSessionTarget],
   );
-  const { readyAgentIds } = useAgentProviderStatus();
   const defaultProviderReadinessStatus = useDefaultProviderReadinessStore(
     (state) => state.readiness?.status,
   );
-  const providerSetupRequiredForHome =
-    getBuildFeatureState().byoKeyProviders &&
-    defaultProviderReadinessStatus === "needs_setup" &&
-    ![...readyAgentIds].some((providerId) => providerId !== "goose");
+  const providerSetupRequiredForHome = useProviderSetupRequired(
+    defaultProviderReadinessStatus,
+  );
   const selectedProviderRef = useRef(selectedProvider);
   selectedProviderRef.current = selectedProvider;
   const projects = useProjectStore(selectProjects);

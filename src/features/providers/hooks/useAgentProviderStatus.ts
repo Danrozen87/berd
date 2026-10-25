@@ -1,6 +1,9 @@
 import { useCallback, useMemo } from "react";
 import type { DoctorCheck, DoctorReport } from "@/shared/api/doctor";
-import { useDoctorReport } from "@/shared/api/useDoctorReport";
+import {
+  useDoctorReport,
+  isDoctorTimeoutReport,
+} from "@/shared/api/useDoctorReport";
 import { crateCheckIdToProviderId } from "@/features/providers/lib/agentIdMap";
 import { CURATED_PROVIDER_CATALOG_BY_ID } from "@/features/providers/curatedProviders";
 import { useDefaultProviderReadinessStore } from "@/features/providers/stores/defaultProviderReadinessStore";
@@ -15,6 +18,7 @@ interface UseAgentProviderStatusReturn {
   // source / version / update-available without re-probing.
   agentChecks: Map<string, DoctorCheck>;
   loading: boolean;
+  hasConfirmedReport: boolean;
   refresh: () => Promise<Map<string, AgentProviderReadiness>>;
 }
 
@@ -172,6 +176,7 @@ export function useAgentProviderStatus(): UseAgentProviderStatusReturn {
     agentReadiness,
     agentChecks,
     loading: query.isPending,
+    hasConfirmedReport: query.isSuccess && !isDoctorTimeoutReport(query.data),
     refresh,
   };
 }

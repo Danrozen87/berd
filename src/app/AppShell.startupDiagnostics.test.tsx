@@ -93,6 +93,7 @@ vi.mock("@/features/providers/hooks/useAgentProviderStatus", () => ({
     agentReadiness: new Map([["goose", "ready"]]),
     agentChecks: new Map(),
     loading: false,
+    hasConfirmedReport: true,
     refresh: vi.fn().mockResolvedValue(undefined),
   }),
 }));

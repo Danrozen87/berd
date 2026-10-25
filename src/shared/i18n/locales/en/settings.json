@@ -721,10 +721,11 @@
       "deviceCode": "Device code"
     },
     "setupRequired": {
-      "body": "This build does not include a preconfigured model provider. Configure one before starting a Goose chat.",
+      "body": "Choose a model provider or sign in to a coding agent to start chatting. You can do this later in Settings.",
       "openProviders": "Open AI providers",
-      "title": "Choose an AI provider to start chatting",
-      "toast": "Choose an AI provider before starting a chat."
+      "title": "Connect an AI provider",
+      "toast": "Choose an AI provider before starting a chat.",
+      "notNow": "Not now"
     },
     "showFewer": "Show fewer",
     "showMore": "Show {{count}} more providers",

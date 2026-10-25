@@ -15,6 +15,7 @@ function SolidXIcon({ className }: { className?: string }) {
 }
 
 import { cn } from "@/shared/lib/cn";
+import { Button } from "@/shared/ui/button";
 
 /**
  * Dialog — the app's one modal surface.
@@ -132,12 +133,17 @@ function DialogContent({
         >
           {children}
           {showCloseButton && (
-            <DialogPrimitive.Close
-              data-slot="dialog-close"
-              className="focus-visible:ring-ring/50 data-[state=open]:bg-muted data-[state=open]:text-muted-foreground absolute top-4 right-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
-            >
-              <SolidXIcon />
-              <span className="sr-only">{closeLabel}</span>
+            <DialogPrimitive.Close asChild>
+              <Button
+                type="button"
+                data-slot="dialog-close"
+                variant="ghost"
+                size="icon-sm"
+                className="absolute top-2 right-2"
+                aria-label={closeLabel}
+              >
+                <SolidXIcon />
+              </Button>
             </DialogPrimitive.Close>
           )}
         </DialogPrimitive.Content>

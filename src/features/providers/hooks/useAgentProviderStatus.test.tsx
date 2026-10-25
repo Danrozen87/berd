@@ -1,3 +1,5 @@
+import { useProviderSetupRequired } from "./useProviderSetupRequired";
+import { DOCTOR_TIMEOUT_CHECK_ID } from "@/shared/api/useDoctorReport";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -71,6 +73,39 @@ describe("useAgentProviderStatus", () => {
     useDefaultProviderReadinessStore.setState({
       readiness: null,
     });
+  });
+
+  it.each([
+    "error",
+    "timeout",
+    "confirmed",
+  ])("only requests setup after a confirmed report: %s", async (outcome) => {
+    mockBuildFeatures.byoKeyProviders = true;
+    useDefaultProviderReadinessStore.setState({
+      readiness: { status: "needs_setup", reason: "missing_defaults" },
+    });
+    if (outcome === "error")
+      runDoctor.mockRejectedValueOnce(new Error("doctor unavailable"));
+    else
+      runDoctor.mockResolvedValueOnce(
+        report(
+          outcome === "timeout"
+            ? [check({ id: DOCTOR_TIMEOUT_CHECK_ID, status: "warn" })]
+            : [],
+        ),
+      );
+    const { result } = renderHook(
+      () => ({
+        status: useAgentProviderStatus(),
+        setupRequired: useProviderSetupRequired("needs_setup"),
+      }),
+      { wrapper: createWrapper() },
+    );
+    await waitFor(() => expect(result.current.status.loading).toBe(false));
+    expect(result.current.status.hasConfirmedReport).toBe(
+      outcome === "confirmed",
+    );
+    expect(result.current.setupRequired).toBe(outcome === "confirmed");
   });
 
   it("marks agents installed and authenticated in the doctor report as ready", async () => {

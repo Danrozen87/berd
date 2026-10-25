@@ -2,7 +2,7 @@ import { useEffect, type ReactNode } from "react";
 import { HomeScreen } from "@/features/home/ui/HomeScreen";
 import { HomeView } from "@/features/home/ui/HomeView";
 import { ChatView } from "@/features/chat/ui/ChatView";
-import { ProviderSetupRequired } from "@/features/providers/ui/ProviderSetupRequired";
+import { ProviderSetupDialog } from "@/features/providers/ui/ProviderSetupDialog";
 import { AutomationsWorkbench } from "@/features/automations/ui/AutomationsView";
 import type { AutomationBuilderLeaveAction } from "@/features/automations/ui/AutomationBuilderView";
 import { BuilderbotView } from "@/features/builderbot/ui/BuilderbotView";
@@ -196,45 +196,26 @@ export function AppShellContent({
     targetLocation,
   });
 
-  const openHomeAutomation = automationsEnabled
-    ? (automationId: string) =>
-        onNavigateAutomations({
-          surface: "detail",
-          automationId,
-          tab: "details",
-          selectedRunKey: null,
-        })
-    : undefined;
-  const openHomeAutomations = automationsEnabled
-    ? () => onNavigateAutomations({ surface: "overview" })
-    : undefined;
-  const setupRequiredContent = homeProviderSetupRequired ? (
-    <div className="flex h-full w-full items-center justify-center p-6">
-      <ProviderSetupRequired onOpenProviders={onOpenProvidersSettings} />
-    </div>
-  ) : null;
-  const homeContent = setupRequiredContent ?? (
-    <HomeView
-      onOpenProject={onStartChatFromProjectId}
-      onOpenAgent={onOpenAgent}
-      onOpenSkill={onOpenSkill}
-      onTagAgentInComposer={onTagHomeComposerAgent}
-      onTagProjectInComposer={onTagHomeComposerProject}
-      onTagSkillInComposer={onTagHomeComposerSkill}
-      onRunPrompt={onRunPinnedPrompt}
-      onSelectSession={onSelectSession}
-      onStartProjectChat={onStartProjectChat}
-      onCreatePersona={onCreatePersona}
-      onCreateProject={onCreateProject}
-      onWorkspaceNameRequest={onWorkspaceNameRequest}
-      onOpenAutomation={openHomeAutomation}
-      onOpenSkills={() => onNavigateSkills(null)}
-      onOpenAutomations={openHomeAutomations}
-      onHydratePinnedChatSessions={onHydratePinnedChatSessions}
-      onResolveBerdyAgent={onResolveBerdyAgent}
-      viewportLeftOcclusionPx={homeViewportLeftOcclusionPx}
-    />
-  );
+  const homeContent = renderHomeContent({
+    automationsEnabled,
+    onNavigateAutomations,
+    onStartChatFromProjectId,
+    onOpenAgent,
+    onOpenSkill,
+    onTagHomeComposerAgent,
+    onTagHomeComposerProject,
+    onTagHomeComposerSkill,
+    onRunPinnedPrompt,
+    onSelectSession,
+    onStartProjectChat,
+    onCreatePersona,
+    onCreateProject,
+    onWorkspaceNameRequest,
+    onNavigateSkills,
+    onHydratePinnedChatSessions,
+    onResolveBerdyAgent,
+    homeViewportLeftOcclusionPx,
+  });
 
   const routeContent = renderRouteContent({
     authStatus,
@@ -286,7 +267,6 @@ export function AppShellContent({
     onStartProviderTroubleshootingChat,
     onStartConnectionSetupChat,
     renderedSession,
-    setupRequiredContent,
   });
 
   return (
@@ -294,12 +274,122 @@ export function AppShellContent({
       <AppRouteLayer inert={isPreparingContent} hidden={isPreparingContent}>
         {routeContent}
       </AppRouteLayer>
+      <ProviderSetupRouteDialog
+        homeProviderSetupRequired={homeProviderSetupRequired}
+        isPreparingContent={isPreparingContent}
+        renderedLocation={renderedLocation}
+        renderedSession={renderedSession}
+        onOpenProvidersSettings={onOpenProvidersSettings}
+      />
       {isPreparingContent ? (
         <div className="absolute inset-0 z-10 min-h-0">
           <AppContentPlaceholder location={targetLocation} />
         </div>
       ) : null}
     </AppStagedContentFrame>
+  );
+}
+
+function renderHomeContent({
+  automationsEnabled,
+  onNavigateAutomations,
+  onStartChatFromProjectId,
+  onOpenAgent,
+  onOpenSkill,
+  onTagHomeComposerAgent,
+  onTagHomeComposerProject,
+  onTagHomeComposerSkill,
+  onRunPinnedPrompt,
+  onSelectSession,
+  onStartProjectChat,
+  onCreatePersona,
+  onCreateProject,
+  onWorkspaceNameRequest,
+  onNavigateSkills,
+  onHydratePinnedChatSessions,
+  onResolveBerdyAgent,
+  homeViewportLeftOcclusionPx,
+}: Pick<
+  AppShellContentProps,
+  | "automationsEnabled"
+  | "onNavigateAutomations"
+  | "onStartChatFromProjectId"
+  | "onOpenAgent"
+  | "onOpenSkill"
+  | "onTagHomeComposerAgent"
+  | "onTagHomeComposerProject"
+  | "onTagHomeComposerSkill"
+  | "onRunPinnedPrompt"
+  | "onSelectSession"
+  | "onStartProjectChat"
+  | "onCreatePersona"
+  | "onCreateProject"
+  | "onWorkspaceNameRequest"
+  | "onNavigateSkills"
+  | "onHydratePinnedChatSessions"
+  | "onResolveBerdyAgent"
+  | "homeViewportLeftOcclusionPx"
+>) {
+  const openHomeAutomation = automationsEnabled
+    ? (automationId: string) =>
+        onNavigateAutomations({
+          surface: "detail",
+          automationId,
+          tab: "details",
+          selectedRunKey: null,
+        })
+    : undefined;
+  const openHomeAutomations = automationsEnabled
+    ? () => onNavigateAutomations({ surface: "overview" })
+    : undefined;
+  return (
+    <HomeView
+      onOpenProject={onStartChatFromProjectId}
+      onOpenAgent={onOpenAgent}
+      onOpenSkill={onOpenSkill}
+      onTagAgentInComposer={onTagHomeComposerAgent}
+      onTagProjectInComposer={onTagHomeComposerProject}
+      onTagSkillInComposer={onTagHomeComposerSkill}
+      onRunPrompt={onRunPinnedPrompt}
+      onSelectSession={onSelectSession}
+      onStartProjectChat={onStartProjectChat}
+      onCreatePersona={onCreatePersona}
+      onCreateProject={onCreateProject}
+      onWorkspaceNameRequest={onWorkspaceNameRequest}
+      onOpenAutomation={openHomeAutomation}
+      onOpenSkills={() => onNavigateSkills(null)}
+      onOpenAutomations={openHomeAutomations}
+      onHydratePinnedChatSessions={onHydratePinnedChatSessions}
+      onResolveBerdyAgent={onResolveBerdyAgent}
+      viewportLeftOcclusionPx={homeViewportLeftOcclusionPx}
+    />
+  );
+}
+
+function ProviderSetupRouteDialog({
+  homeProviderSetupRequired,
+  isPreparingContent,
+  renderedLocation,
+  renderedSession,
+  onOpenProvidersSettings,
+}: Pick<
+  AppShellContentProps,
+  | "homeProviderSetupRequired"
+  | "isPreparingContent"
+  | "renderedLocation"
+  | "renderedSession"
+  | "onOpenProvidersSettings"
+>) {
+  const emptyChat = renderedLocation.view === "chat" && !renderedSession;
+  return (
+    <ProviderSetupDialog
+      required={Boolean(
+        homeProviderSetupRequired &&
+          !isPreparingContent &&
+          (renderedLocation.view === "home" || emptyChat),
+      )}
+      onOpenProviders={onOpenProvidersSettings}
+    />
   );
 }
 
@@ -376,7 +466,6 @@ interface RenderRouteContentOptions {
   onStartConnectionSetupChat: (request: SetupChatRequest) => void;
   onReturnToAgentDraft?: () => void;
   renderedSession?: ChatSession;
-  setupRequiredContent: ReactNode | null;
 }
 
 function renderRouteContent({
@@ -428,7 +517,6 @@ function renderRouteContent({
   onStartChatWithSkill,
   onStartProviderTroubleshootingChat,
   onStartConnectionSetupChat,
-  setupRequiredContent,
   renderedSession,
 }: RenderRouteContentOptions) {
   switch (location.view) {
@@ -538,15 +626,13 @@ function renderRouteContent({
           onAgentBuilderCompleted={onAgentBuilderCompleted}
         />
       ) : (
-        (setupRequiredContent ?? (
-          <HomeScreen
-            sessionId={homeSessionId}
-            onActivateSession={onActivateHomeSession}
-            onCreatePersona={onCreatePersona}
-            onCreateProject={onCreateProject}
-            onWorkspaceNameRequest={onWorkspaceNameRequest}
-          />
-        ))
+        <HomeScreen
+          sessionId={homeSessionId}
+          onActivateSession={onActivateHomeSession}
+          onCreatePersona={onCreatePersona}
+          onCreateProject={onCreateProject}
+          onWorkspaceNameRequest={onWorkspaceNameRequest}
+        />
       );
     case "home":
       return homeContent;

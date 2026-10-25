@@ -142,6 +142,7 @@ const mockIsExternalAgentReady = vi.hoisted(() => vi.fn());
 const originalStopVoiceConversation = useVoiceConversationStore.getState().stop;
 const mockAgentStatus = vi.hoisted(() => ({
   readyAgentIds: new Set<string>(["goose"]),
+  loading: false,
 }));
 const mockCreatePersonaSource = vi.hoisted(() => vi.fn());
 const mockListPersonaSources = vi.hoisted(() => vi.fn());
@@ -626,7 +627,8 @@ vi.mock("@/features/providers/hooks/useAgentProviderStatus", () => ({
       ]),
     ),
     agentChecks: new Map(),
-    loading: false,
+    loading: mockAgentStatus.loading,
+    hasConfirmedReport: !mockAgentStatus.loading,
     refresh: vi.fn().mockResolvedValue(undefined),
   }),
 }));
@@ -643,6 +645,7 @@ vi.mock("./lib/scheduleAfterNextPaint", () => ({
 
 vi.mock("./ui/AppShellContent", () => ({
   AppShellContent: (({
+    homeProviderSetupRequired,
     targetLocation,
     renderedLocation,
     isPreparingContent,
@@ -691,6 +694,9 @@ vi.mock("./ui/AppShellContent", () => ({
 
     return (
       <section>
+        <div data-testid="provider-setup-required">
+          {String(homeProviderSetupRequired)}
+        </div>
         <div data-testid="active-view">{activeView}</div>
         <div data-testid="rendered-view">{renderedLocation.view}</div>
         <div data-testid="preparing-content">{String(isPreparingContent)}</div>
@@ -1109,6 +1115,7 @@ describe("AppShell global navigation", () => {
     mockIsExternalAgentReady.mockReset();
     mockIsExternalAgentReady.mockResolvedValue(false);
     mockAgentStatus.readyAgentIds = new Set(["goose"]);
+    mockAgentStatus.loading = false;
     mockCreatePersonaSource.mockReset();
     mockCreatePersonaSource.mockResolvedValue({
       type: "agent",
@@ -1593,6 +1600,31 @@ describe("AppShell global navigation", () => {
       },
       executionTargetSource: "ui",
     });
+  });
+
+  it("waits for saved agent connections before requesting provider setup", () => {
+    requireByoDefaultProviderSetup();
+    mockAgentStatus.loading = true;
+    const { rerender } = renderAppShell();
+    expect(screen.getByTestId("provider-setup-required")).toHaveTextContent(
+      "false",
+    );
+    mockAgentStatus.loading = false;
+    mockAgentStatus.readyAgentIds = new Set(["codex-acp"]);
+    rerender(appShellWithTheme());
+    expect(screen.getByTestId("provider-setup-required")).toHaveTextContent(
+      "false",
+    );
+  });
+
+  it("requests setup when the connection check finishes with no ready agent", () => {
+    requireByoDefaultProviderSetup();
+    mockAgentStatus.loading = false;
+    mockAgentStatus.readyAgentIds = new Set();
+    renderAppShell();
+    expect(screen.getByTestId("provider-setup-required")).toHaveTextContent(
+      "true",
+    );
   });
 
   it("does not create a chat when BYO default provider setup is required", async () => {
