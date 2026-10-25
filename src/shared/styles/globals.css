@@ -1723,6 +1723,31 @@ html[data-window-kind="voice-buddy"] #root {
   --ring: var(--popover-inverse-foreground);
 }
 
+/* Menu surfaces and items paint their own focus highlight (focus:bg-*),
+   so the global focus ring is suppressed for them. */
+*:not(body):is(
+    [data-slot="dropdown-menu-content"],
+    [data-slot="popover-content"],
+    [data-slot="context-menu-content"],
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-checkbox-item"],
+    [data-slot="dropdown-menu-radio-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-checkbox-item"],
+    [data-slot="context-menu-radio-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="menubar-item"],
+    [data-slot="menubar-checkbox-item"],
+    [data-slot="menubar-radio-item"],
+    [data-slot="menubar-sub-trigger"]
+  ) {
+  &:focus-visible {
+    outline: none;
+    @apply ring-0 ring-offset-0;
+  }
+}
+
 @layer base {
   *,
   ::after,
@@ -1972,31 +1997,6 @@ html[data-window-kind="voice-buddy"] #root {
     &:focus-visible {
       @apply ring-ring ring-offset-background ring-2 ring-offset-2 outline-hidden;
     }
-  }
-}
-
-/* Menu surfaces and items paint their own focus highlight (focus:bg-*),
-   so the global focus ring is suppressed for them. */
-*:not(body):is(
-    [data-slot="dropdown-menu-content"],
-    [data-slot="popover-content"],
-    [data-slot="context-menu-content"],
-    [data-slot="dropdown-menu-item"],
-    [data-slot="dropdown-menu-checkbox-item"],
-    [data-slot="dropdown-menu-radio-item"],
-    [data-slot="dropdown-menu-sub-trigger"],
-    [data-slot="context-menu-item"],
-    [data-slot="context-menu-checkbox-item"],
-    [data-slot="context-menu-radio-item"],
-    [data-slot="context-menu-sub-trigger"],
-    [data-slot="menubar-item"],
-    [data-slot="menubar-checkbox-item"],
-    [data-slot="menubar-radio-item"],
-    [data-slot="menubar-sub-trigger"]
-  ) {
-  &:focus-visible {
-    outline: none;
-    @apply ring-0 ring-offset-0;
   }
 }
 
