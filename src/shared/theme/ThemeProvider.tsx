@@ -1,4 +1,6 @@
 import * as React from "react";
+import { normalizeHexColor } from "./colorContrast";
+import { usePrimaryColor } from "./primaryColor";
 
 type ThemeMode = "system" | "light" | "dark";
 
@@ -32,12 +34,6 @@ const ThemeProviderContext = React.createContext<
   ThemeProviderState | undefined
 >(undefined);
 
-type RGB = {
-  r: number;
-  g: number;
-  b: number;
-};
-
 function isThemeMode(value: string | null): value is ThemeMode {
   return THEME_MODES.includes(value as ThemeMode);
 }
@@ -57,57 +53,6 @@ function getResolvedMode(
   return systemPrefersDark ? "dark" : "light";
 }
 
-function normalizeHexColor(color: string | null): string | null {
-  const value = color?.trim();
-  if (!value) return null;
-
-  const hex = value.startsWith("#") ? value.slice(1) : value;
-  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
-    return `#${hex
-      .split("")
-      .map((char) => char + char)
-      .join("")
-      .toLowerCase()}`;
-  }
-  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
-    return `#${hex.toLowerCase()}`;
-  }
-
-  return null;
-}
-
-function hexToRgb(hex: string): RGB {
-  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  if (!match) {
-    return { r: 0, g: 0, b: 0 };
-  }
-
-  return {
-    r: Number.parseInt(match[1], 16),
-    g: Number.parseInt(match[2], 16),
-    b: Number.parseInt(match[3], 16),
-  };
-}
-
-function luminance(hex: string): number {
-  const { r, g, b } = hexToRgb(hex);
-  const [rs, gs, bs] = [r, g, b].map((channel) => {
-    const scaled = channel / 255;
-    return scaled <= 0.03928
-      ? scaled / 12.92
-      : ((scaled + 0.055) / 1.055) ** 2.4;
-  });
-
-  return 0.2126 * rs + 0.7152 * gs + 0.0722 * bs;
-}
-
-function getReadableForeground(hexColor: string): "#000000" | "#ffffff" {
-  const colorLuminance = luminance(hexColor);
-  const contrastWithBlack = (colorLuminance + 0.05) / 0.05;
-  const contrastWithWhite = 1.05 / (colorLuminance + 0.05);
-  return contrastWithBlack > contrastWithWhite ? "#000000" : "#ffffff";
-}
-
 function applyResolvedMode(isDark: boolean) {
   const root = document.documentElement;
   root.classList.remove("light", "dark");
@@ -123,25 +68,6 @@ function readInitialThemeMode(): ThemeMode {
   }
 
   return "system";
-}
-
-function applyPrimaryOverride(color: string | null) {
-  const root = document.documentElement;
-  const normalizedColor = normalizeHexColor(color);
-
-  if (!normalizedColor) {
-    root.style.removeProperty("--primary");
-    root.style.removeProperty("--primary-foreground");
-    root.style.removeProperty("--sidebar-primary");
-    root.style.removeProperty("--sidebar-primary-foreground");
-    return;
-  }
-
-  const foreground = getReadableForeground(normalizedColor);
-  root.style.setProperty("--primary", normalizedColor);
-  root.style.setProperty("--primary-foreground", foreground);
-  root.style.setProperty("--sidebar-primary", normalizedColor);
-  root.style.setProperty("--sidebar-primary-foreground", foreground);
 }
 
 export function ThemeProvider({ children }: ThemeProviderProps) {
@@ -171,9 +97,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     applyResolvedMode(isDark);
   }, [isDark]);
 
-  React.useLayoutEffect(() => {
-    applyPrimaryOverride(customPrimaryColor);
-  }, [customPrimaryColor]);
+  usePrimaryColor(customPrimaryColor, resolvedTheme);
 
   React.useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

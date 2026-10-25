@@ -313,8 +313,13 @@
   --backdrop-panel: blur(18px) saturate(180%) brightness(1.02);
   --popover: var(--color-white);
   --popover-foreground: var(--foreground);
+  accent-color: var(--primary);
   --primary: var(--color-gray-900);
   --primary-foreground: var(--color-white);
+  --primary-hover: color-mix(in srgb, var(--primary) 90%, var(--color-black));
+  --primary-active: color-mix(in srgb, var(--primary) 80%, var(--color-black));
+  --switch-unchecked: var(--muted-foreground);
+  --switch-unchecked-foreground: var(--card);
   --secondary: var(--color-gray-400);
   --secondary-foreground: var(--foreground);
   --muted: var(--color-gray-100);
@@ -326,7 +331,7 @@
   --destructive-foreground: var(--color-white);
   --border: var(--color-gray-200);
   --input: var(--color-gray-300);
-  --ring: var(--color-gray-400);
+  --ring: var(--primary);
   --text-selection-bg: color-mix(in oklab, var(--primary) 18%, transparent);
   --text-selection-fg: var(--foreground);
   --scrollbar-size: 12px;
@@ -739,13 +744,17 @@
   --popover-foreground: var(--foreground);
   --primary: var(--color-white);
   --primary-foreground: var(--color-black);
+  --primary-hover: color-mix(in srgb, var(--primary) 90%, var(--color-white));
+  --primary-active: color-mix(in srgb, var(--primary) 80%, var(--color-white));
+  --switch-unchecked: var(--muted-foreground);
+  --switch-unchecked-foreground: var(--card);
   --secondary: var(--color-gray-700);
   --secondary-foreground: var(--foreground);
   /* Keep quiet and interactive fills one step lighter than card/popover so
      selected tabs, hover rows, and active picker items do not disappear in dark
      surfaces. */
   --muted: var(--color-gray-700);
-  --muted-foreground: var(--color-gray-500);
+  --muted-foreground: var(--color-gray-400);
   --accent: var(--color-gray-700);
   --accent-hover: var(--color-gray-600);
   --accent-foreground: var(--foreground);
@@ -753,7 +762,7 @@
   --destructive-foreground: var(--color-black);
   --border: var(--color-gray-700);
   --input: var(--color-gray-700);
-  --ring: var(--color-gray-400);
+  --ring: var(--primary);
   --text-selection-bg: color-mix(in oklab, var(--primary) 30%, transparent);
   --text-selection-fg: var(--foreground);
   --scrollbar-thumb-alpha: 16%;
@@ -1072,6 +1081,10 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-active: var(--primary-active);
+  --color-switch-unchecked: var(--switch-unchecked);
+  --color-switch-unchecked-foreground: var(--switch-unchecked-foreground);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -1696,6 +1709,20 @@ html[data-window-kind="voice-buddy"] #root {
   background-image: none;
 }
 
+/* One opaque keyboard-focus indicator. Keep outside utility layers so a
+   primitive's outline-none or translucent ring cannot erase this baseline.
+   Existing composite inputs can retain an explicit managed-focus treatment. */
+:focus-visible:not(.focus-override) {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+
+/* Inverse surfaces own their local focus color, including nested actions. */
+[data-slot="popover-content"][data-variant="tooltip"],
+[data-slot="tooltip-content"] {
+  --ring: var(--popover-inverse-foreground);
+}
+
 @layer base {
   *,
   ::after,
@@ -1937,40 +1964,6 @@ html[data-window-kind="voice-buddy"] #root {
     appearance: none;
   }
 
-  *:not(body):not(.focus-override) {
-    outline: none !important;
-  }
-
-  *:not(body):not(.focus-override) {
-    &:focus-visible {
-      @apply ring-ring ring-offset-background ring-2 ring-offset-1 outline-hidden;
-    }
-  }
-
-  /* Menu surfaces and items paint their own focus highlight (focus:bg-*),
-     so the global focus ring is suppressed for them. */
-  *:not(body):is(
-      [data-slot="dropdown-menu-content"],
-      [data-slot="popover-content"],
-      [data-slot="context-menu-content"],
-      [data-slot="dropdown-menu-item"],
-      [data-slot="dropdown-menu-checkbox-item"],
-      [data-slot="dropdown-menu-radio-item"],
-      [data-slot="dropdown-menu-sub-trigger"],
-      [data-slot="context-menu-item"],
-      [data-slot="context-menu-checkbox-item"],
-      [data-slot="context-menu-radio-item"],
-      [data-slot="context-menu-sub-trigger"],
-      [data-slot="menubar-item"],
-      [data-slot="menubar-checkbox-item"],
-      [data-slot="menubar-radio-item"],
-      [data-slot="menubar-sub-trigger"]
-    ) {
-    &:focus-visible {
-      @apply ring-0 ring-offset-0;
-    }
-  }
-
   .link {
     @apply hover:text-foreground/80 inline-flex items-center gap-1 rounded-xs font-medium underline underline-offset-4;
   }
@@ -1979,6 +1972,31 @@ html[data-window-kind="voice-buddy"] #root {
     &:focus-visible {
       @apply ring-ring ring-offset-background ring-2 ring-offset-2 outline-hidden;
     }
+  }
+}
+
+/* Menu surfaces and items paint their own focus highlight (focus:bg-*),
+   so the global focus ring is suppressed for them. */
+*:not(body):is(
+    [data-slot="dropdown-menu-content"],
+    [data-slot="popover-content"],
+    [data-slot="context-menu-content"],
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-checkbox-item"],
+    [data-slot="dropdown-menu-radio-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-checkbox-item"],
+    [data-slot="context-menu-radio-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="menubar-item"],
+    [data-slot="menubar-checkbox-item"],
+    [data-slot="menubar-radio-item"],
+    [data-slot="menubar-sub-trigger"]
+  ) {
+  &:focus-visible {
+    outline: none;
+    @apply ring-0 ring-offset-0;
   }
 }
 

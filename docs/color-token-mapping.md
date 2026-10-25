@@ -97,7 +97,7 @@ This follows the shadcn theming model: core tokens describe component anatomy an
 
 | Button intent | Default | Hover | Disabled |
 | --- | --- | --- | --- |
-| `default` | `bg-primary text-primary-foreground` | `bg-primary/90` | shadcn disabled behavior. |
+| `default` | `bg-primary text-primary-foreground` | `bg-primary-hover` | shadcn disabled behavior. |
 | `secondary` | `bg-secondary text-secondary-foreground` | `bg-secondary/80` | shadcn disabled behavior. |
 | `outline` | `border-input bg-background text-foreground` | `bg-accent text-accent-foreground` | shadcn disabled behavior. |
 | `ghost` | `bg-transparent text-foreground` | `bg-accent text-accent-foreground` | shadcn disabled behavior. |
@@ -221,3 +221,31 @@ exact machine-checked contract.
 | Is this a form/control border? | `input` |
 | Is this a Berd-only product surface or identity chip? | Use the smallest Berd extension token that names that product job. |
 | Is this a pseudo-element, highlight, filter, or opacity that no utility class can target? | Define a `:root`/dark token and consume it with `var(...)`. See [Tokens Consumed In Raw CSS](#tokens-consumed-in-raw-css). |
+
+## Accessible primary colors
+
+The color picker stores the chosen sRGB seed. `ThemeProvider` derives a usable
+shade with the shared WCAG math in `src/shared/theme/colorContrast.ts`. The CSS
+surface ladder remains in `globals.css`; `primaryColor.ts` reads those tokens
+only when the accent or resolved theme changes. Light themes use white on the
+primary fill; dark themes use black. The derived shade meets 4.5:1 for that pair
+and for primary text on the supported solid surfaces and their 10% primary tint.
+The seed is retained when switching themes; resetting the accent removes the custom seed.
+
+`primary-hover` and `primary-active` are opaque shades that increase contrast
+with the same foreground. Use these for primary control states. Fading a primary
+fill with opacity can lose contrast against its backdrop. The shared switch has
+its own `switch-unchecked` / `switch-unchecked-foreground` pair so its neutral
+state does not inherit a foreground chosen for the checked accent.
+
+Keyboard focus uses an opaque two-pixel `ring` outline with a three-pixel gap.
+It is a shared baseline, including on controls that also have a utility ring.
+Inverse popovers scope the focus color to their own foreground. Menu surfaces
+retain their managed highlight instead of an outer outline. Composite controls
+with explicit managed-focus styles remain responsible for
+showing focus on their containing surface.
+
+These contracts cover the named semantic pairs, not every arbitrary foreground,
+opacity, photograph, overlay, or feature override. Keep normal text at 4.5:1 and
+meaningful non-text state indicators at 3:1 against their actual adjacent colors.
+Use the browser contrast suite for rendered states as well as color-math tests.

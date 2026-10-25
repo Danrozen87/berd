@@ -2,6 +2,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider, useTheme } from "./ThemeProvider";
+import { contrastRatio } from "./colorContrast";
 
 function createMediaQueryList(initialMatches: boolean) {
   let matches = initialMatches;
@@ -218,12 +219,15 @@ describe("ThemeProvider", () => {
         "#22c55e",
       );
     });
-    expect(document.documentElement.style.getPropertyValue("--primary")).toBe(
-      "#22c55e",
-    );
+    expect(
+      contrastRatio(
+        document.documentElement.style.getPropertyValue("--primary"),
+        "#ffffff",
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
     expect(
       document.documentElement.style.getPropertyValue("--primary-foreground"),
-    ).toBe("#000000");
+    ).toBe("#ffffff");
 
     await user.click(screen.getByRole("button", { name: "Reset Primary" }));
 
@@ -236,6 +240,29 @@ describe("ThemeProvider", () => {
         "",
       );
     });
+  });
+
+  it("recomputes the accent pair on a system theme change and retains the chosen seed", () => {
+    const media = createMediaQueryList(false);
+    localStorage.setItem("goose-primary-color", "#3b7ce4");
+    render(
+      <ThemeProvider>
+        <ThemeConsumer />
+      </ThemeProvider>,
+    );
+    const root = document.documentElement;
+    const light = root.style.getPropertyValue("--primary");
+    expect(root.style.getPropertyValue("--primary-foreground")).toBe("#ffffff");
+    expect(contrastRatio(light, "#ffffff")).toBeGreaterThanOrEqual(4.5);
+    act(() => media.setMatches(true));
+    const dark = root.style.getPropertyValue("--primary");
+    expect(root.style.getPropertyValue("--primary-foreground")).toBe("#000000");
+    expect(contrastRatio(dark, "#000000")).toBeGreaterThanOrEqual(4.5);
+    expect(dark).not.toBe(light);
+    expect(localStorage.getItem("goose-primary-color")).toBe("#3b7ce4");
+    expect(screen.getByTestId("custom-primary-color")).toHaveTextContent(
+      "#3b7ce4",
+    );
   });
 
   it("clears deprecated density preferences", async () => {

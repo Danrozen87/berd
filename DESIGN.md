@@ -166,7 +166,7 @@ The source palette is a semantic token system backed by a gray scale and small s
 - **`--foreground`, `--card-foreground`, `--popover-foreground`, `--primary-foreground`, `--secondary-foreground`, `--muted-foreground`, `--text-placeholder`**: Lower-level semantic text values.
 - **`--sidebar-accent`, `--sidebar-accent-foreground`**: Left navigation row states. Hover and selected change only the fill; text and icons keep the same foreground.
 - **`--foreground`, `--muted-foreground`, `--card-foreground`, `--popover-foreground`, `--primary-foreground`, `--secondary-foreground`**: Source text inputs that semantic text tokens consume.
-- **`--ring`**: Focus border/ring color. Keep it a quiet neutral gray so focus is visible without becoming a black outline.
+- **`--ring`**: Opaque keyboard-focus color. It follows the accessible primary shade on regular surfaces; inverse popovers scope it to their own foreground. Keep focus visible against the actual adjacent surface.
 
 ### Named Rules
 
@@ -260,6 +260,7 @@ Use [Button](src/shared/ui/button.tsx) and its variants before adding feature-le
 
 - **Shape:** `rounded-full` for all buttons — text and icon-only alike. The base `Button` applies this automatically; feature code should not override the radius. Buttons are exempt from the geometric nesting rule — their effective radius is half their height, not a scale step.
 - **Primary:** `bg-primary text-primary-foreground`, mapping through semantic primary surface and readable-on-primary text tokens.
+- **Custom primary colors:** Store the chosen seed and derive theme-appropriate shades centrally. Pair `primary` with `primary-foreground`; use opaque `primary-hover` and `primary-active` for interaction states. See `docs/color-token-mapping.md` for the contrast contract.
 - **Sizing:** Use the `Button` `size` prop. Current variants map to `h-7`, `h-8`, `h-9`, and `h-10`.
 - **Ghost icon buttons:** No hover fill for `variant="ghost"` plus icon sizes; they shift from muted text to foreground text.
 - **Rule:** Add variants to `Button` when a reusable button treatment is missing.

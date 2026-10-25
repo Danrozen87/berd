@@ -45,7 +45,7 @@
     },
     "primary": {
       "custom": "Custom",
-      "description": "Use the theme primary by default, or choose one primary color to keep across themes.",
+      "description": "Choose a color. Its shades adapt to keep text and controls readable in each theme.",
       "label": "Primary color",
       "reset": "Use theme",
       "theme": "Theme"

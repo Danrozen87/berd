@@ -10,7 +10,7 @@ const toastActionButtonClassName = buttonVariants({
   className: cn(
     toastActionButtonLayoutClassName,
     "relative select-none cursor-pointer",
-    "!bg-primary !text-primary-foreground hover:!bg-primary/90 focus-visible:!ring-2 focus-visible:!ring-ring",
+    "!bg-primary !text-primary-foreground hover:!bg-primary-hover active:!bg-primary-active focus-visible:!ring-2 focus-visible:!ring-ring",
   ),
 });
 

@@ -799,7 +799,7 @@ const buttonVariantColorRows: Record<ButtonVariant, TokenColorRow[]> = {
     {
       anatomy: "Button",
       state: "Hover",
-      background: "--primary / 90%",
+      background: "--primary-hover",
       textIcon: "--primary-foreground",
     },
   ],
@@ -1042,13 +1042,13 @@ function getSwitchTokenDetails({
     {
       anatomy: "Track",
       state,
-      background: `${checked ? "--primary" : "--secondary"}${opacitySuffix}`,
+      background: `${checked ? "--primary" : "--switch-unchecked"}${opacitySuffix}`,
       border: "transparent",
     },
     {
       anatomy: "Thumb",
       state,
-      background: `--primary-foreground${opacitySuffix}`,
+      background: `${checked ? "--primary-foreground" : "--switch-unchecked-foreground"}${opacitySuffix}`,
     },
   ];
 
@@ -1336,7 +1336,7 @@ const badgeVariantColorRows: Record<BadgeVariant, TokenColorRow[]> = {
     {
       anatomy: "Badge",
       state: "Clickable hover",
-      background: "--primary / 90%",
+      background: "--primary-hover",
       textIcon: "--primary-foreground",
       border: "transparent",
     },
@@ -5844,6 +5844,10 @@ function isColorTokenName(token: string) {
       "--popover-foreground",
       "--primary",
       "--primary-foreground",
+      "--primary-hover",
+      "--primary-active",
+      "--switch-unchecked",
+      "--switch-unchecked-foreground",
       "--secondary",
       "--secondary-foreground",
       "--muted",

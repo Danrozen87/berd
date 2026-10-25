@@ -5,6 +5,10 @@ import { CheckIcon, PlusIcon } from "lucide-react";
 import { Input } from "@/shared/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { cn } from "@/shared/lib/cn";
+import {
+  normalizeHexColor as normalizeHex,
+  readableForeground,
+} from "@/shared/theme/colorContrast";
 
 export interface ColorSwatch {
   /** Identifier stored/returned via onChange, e.g. a tone name or hex string. */
@@ -39,22 +43,6 @@ const DEFAULT_HUE = 84;
 
 export function isHexColor(value: string | null | undefined): value is string {
   return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
-}
-
-function normalizeHex(value: string): string | null {
-  const trimmed = value.trim();
-  const hex = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
-  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
-    return `#${hex
-      .split("")
-      .map((c) => c + c)
-      .join("")
-      .toLowerCase()}`;
-  }
-  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
-    return `#${hex.toLowerCase()}`;
-  }
-  return null;
 }
 
 function hexToHue(hex: string): number {
@@ -114,13 +102,9 @@ function hexFromHue(mode: "pastel" | "none", hue: number): string {
 }
 
 function swatchIconColor(hex: string): string {
-  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  if (!match) return "var(--muted-foreground)";
-  const r = Number.parseInt(match[1], 16);
-  const g = Number.parseInt(match[2], 16);
-  const b = Number.parseInt(match[3], 16);
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-  return luminance > 0.62 ? "var(--color-gray-800)" : "var(--color-white)";
+  return normalizeHex(hex)
+    ? readableForeground(hex)
+    : "var(--muted-foreground)";
 }
 
 function normalizeCustomColor(

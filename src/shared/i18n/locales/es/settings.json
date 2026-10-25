@@ -45,7 +45,7 @@
     },
     "primary": {
       "custom": "Personalizado",
-      "description": "Usa el color primario del tema de forma predeterminada o elige un color primario para conservarlo entre temas.",
+      "description": "Elige un color. Sus tonos se adaptan para mantener legibles el texto y los controles en cada tema.",
       "label": "Color primario",
       "reset": "Usar tema",
       "theme": "Tema"
