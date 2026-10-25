@@ -62,6 +62,47 @@ import {
   type HomeWidgetState,
 } from "./homeWidgetRuntime";
 
+type WidgetMutation = (
+  instances: HomeWidgetState["instances"],
+) => HomeWidgetState["instances"] | null;
+
+function createWidgetRemovalActions(
+  get: () => HomeWidgetStore,
+  runtime: ReturnType<typeof createHomeWidgetRuntime>,
+  canAcceptMutation: (state: HomeWidgetStore) => boolean,
+  applyMutation: (mutate: WidgetMutation) => void,
+): Pick<HomeWidgetStore, "removeWidget" | "removeChatPins"> {
+  return {
+    removeWidget: (id) => {
+      clearStarterHomeLayoutEligibility();
+      applyMutation((instances) => removeWidgetMutation(instances, id));
+    },
+    removeChatPins: async (sessionId) => {
+      await runtime.initialize();
+      if (!canAcceptMutation(get()))
+        throw new Error("Home layout is unavailable");
+      const isPin = (instance: WidgetInstance) =>
+        instance.type === "chatPin" && instance.state?.sessionId === sessionId;
+      if (get().instances.some(isPin)) {
+        clearStarterHomeLayoutEligibility();
+        applyMutation((instances) =>
+          instances.filter((instance) => !isPin(instance)),
+        );
+      }
+      await runtime.waitForPendingSaves();
+      const latest = get();
+      const confirmed = latest.lastConfirmedLayout;
+      if (
+        !confirmed ||
+        latest.instances.some(isPin) ||
+        layoutItemsToHomeWidgets(confirmed.items).some(isPin)
+      ) {
+        throw new Error("Chat pin removal was not saved");
+      }
+    },
+  };
+}
+
 function canMutateWidgets(state: HomeWidgetStore): boolean {
   return state.loadStatus === "ready" && state.itemRevision !== null;
 }
@@ -236,6 +277,7 @@ interface HomeWidgetStore extends HomeWidgetState {
   ) => Promise<boolean>;
   reloadOnboardingTourForDev: () => void;
   removeWidget: (id: string) => void;
+  removeChatPins: (sessionId: string) => Promise<void>;
   updateWidgetState: (
     id: string,
     state: Record<string, unknown>,
@@ -311,11 +353,7 @@ function createHomeWidgetStore() {
       return !onboardingResetInFlight && canMutateWidgets(state);
     }
 
-    function applyMutation(
-      mutate: (
-        instances: HomeWidgetState["instances"],
-      ) => HomeWidgetState["instances"] | null,
-    ): void {
+    function applyMutation(mutate: WidgetMutation): void {
       const state = get();
       if (!canAcceptMutation(state)) {
         return;
@@ -850,10 +888,12 @@ function createHomeWidgetStore() {
         if (!import.meta.env.DEV) return;
         void get().resetOnboardingTour();
       },
-      removeWidget: (id) => {
-        clearStarterHomeLayoutEligibility();
-        applyMutation((instances) => removeWidgetMutation(instances, id));
-      },
+      ...createWidgetRemovalActions(
+        get,
+        runtime,
+        canAcceptMutation,
+        applyMutation,
+      ),
       updateWidgetState: (id, state, bounds) => {
         applyMutation((instances) =>
           updateWidgetStateMutation(

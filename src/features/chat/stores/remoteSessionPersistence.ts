@@ -70,7 +70,9 @@ function normalizeRemoteSessionRecord(
   return record;
 }
 
-function readAllRemoteSessionRecords(): RemoteSessionRecordsBySessionId {
+function readAllRemoteSessionRecords(
+  strict = false,
+): RemoteSessionRecordsBySessionId {
   if (typeof window === "undefined") return {};
 
   try {
@@ -90,13 +92,15 @@ function readAllRemoteSessionRecords(): RemoteSessionRecordsBySessionId {
       }
     }
     return bySessionId;
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
 
 function writeAllRemoteSessionRecords(
   bySessionId: RemoteSessionRecordsBySessionId,
+  strict = false,
 ): void {
   if (typeof window === "undefined") return;
 
@@ -110,7 +114,8 @@ function writeAllRemoteSessionRecords(
       REMOTE_SESSIONS_STORAGE_KEY,
       JSON.stringify(bySessionId),
     );
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // localStorage may be unavailable
   }
 }
@@ -124,12 +129,19 @@ export function persistRemoteSessionRecord(record: RemoteSessionRecord): void {
   writeAllRemoteSessionRecords(bySessionId);
 }
 
-export function removeRemoteSessionRecord(sessionId: string): void {
-  const bySessionId = readAllRemoteSessionRecords();
+export function removeRemoteSessionRecord(
+  sessionId: string,
+  strict = false,
+): void {
+  const bySessionId = readAllRemoteSessionRecords(strict);
   if (!(sessionId in bySessionId)) return;
 
   delete bySessionId[sessionId];
-  writeAllRemoteSessionRecords(bySessionId);
+  writeAllRemoteSessionRecords(bySessionId, strict);
+}
+
+export function forgetPersistedRemoteSession(sessionId: string): void {
+  removeRemoteSessionRecord(sessionId, true);
 }
 
 export function readRemoteSessionRecords(): RemoteSessionRecord[] {

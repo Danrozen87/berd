@@ -1,6 +1,6 @@
 const STORAGE_KEY = "goose:chat-auto-modes";
 
-function readModes(): Record<string, string | null> {
+function readModes(strict = false): Record<string, string | null> {
   try {
     const value: unknown = JSON.parse(
       localStorage.getItem(STORAGE_KEY) ?? "{}",
@@ -12,7 +12,8 @@ function readModes(): Record<string, string | null> {
           mode === null || (typeof mode === "string" && mode.length > 0),
       ),
     );
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
@@ -25,15 +26,21 @@ export function loadAutoMode(sessionId: string): string | null | undefined {
 export function persistAutoMode(
   sessionId: string,
   modeId: string | null | undefined,
+  strict = false,
 ): void {
   try {
-    const modes = readModes();
+    const modes = readModes(strict);
     if (modeId === undefined) delete modes[sessionId];
     else modes[sessionId] = modeId;
     if (Object.keys(modes).length)
       localStorage.setItem(STORAGE_KEY, JSON.stringify(modes));
     else localStorage.removeItem(STORAGE_KEY);
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // Storage can be unavailable.
   }
+}
+
+export function forgetPersistedAutoMode(sessionId: string): void {
+  persistAutoMode(sessionId, undefined, true);
 }

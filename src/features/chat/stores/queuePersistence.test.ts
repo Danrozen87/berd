@@ -6,6 +6,7 @@ const { mockInvoke } = vi.hoisted(() => ({ mockInvoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
 
 import {
+  forgetPersistedMessageQueue,
   loadPersistedMessageQueues,
   persistMessageQueues,
 } from "./queuePersistence";
@@ -400,5 +401,97 @@ describe("queuePersistence", () => {
         }),
       }),
     );
+  });
+  it("acknowledges deletion only after prior native writes and its own save finish", async () => {
+    let releasePrior = () => {};
+    let acknowledgeDelete = () => {};
+    const priorWrite = new Promise<void>((resolve) => {
+      releasePrior = resolve;
+    });
+    const deletionWrite = new Promise<void>((resolve) => {
+      acknowledgeDelete = resolve;
+    });
+    mockInvoke
+      .mockReturnValueOnce(priorWrite)
+      .mockReturnValueOnce(deletionWrite);
+    const record = {
+      kind: "transport-ready" as const,
+      recordId: "record",
+      payload: admitSystemInheritedQueuedMessage({
+        text: "private queued text",
+      }),
+    };
+    persistMessageQueues({ deleted: [record], retained: [record] }, [
+      "deleted",
+      "retained",
+    ]);
+    let settled = false;
+    const deletion = forgetPersistedMessageQueue("deleted").then(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(1));
+    expect(settled).toBe(false);
+    releasePrior();
+    await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(2));
+    expect(mockInvoke).toHaveBeenLastCalledWith(
+      "persist_message_queue_updates",
+      {
+        serializedUpdates: JSON.stringify({ deleted: null }),
+      },
+    );
+    expect(settled).toBe(false);
+    acknowledgeDelete();
+    await deletion;
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("goose:chat-message-queues:v1") ?? "{}",
+      ),
+    ).toMatchObject({ retained: [{ recordId: "record" }] });
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("goose:chat-message-queues:v1") ?? "{}",
+      ),
+    ).not.toHaveProperty("deleted");
+  });
+
+  it("reports native deletion failures and permits later acknowledged writes", async () => {
+    const error = new Error("native save failed");
+    mockInvoke.mockRejectedValueOnce(error).mockResolvedValue(undefined);
+    await expect(forgetPersistedMessageQueue("deleted")).rejects.toThrow(error);
+    await expect(
+      forgetPersistedMessageQueue("retained"),
+    ).resolves.toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports cache failure after still attempting and acknowledging native deletion", async () => {
+    const error = new Error("cache write failed");
+    const remove = vi
+      .spyOn(Storage.prototype, "removeItem")
+      .mockImplementation(() => {
+        throw error;
+      });
+    let acknowledgeDelete = () => {};
+    mockInvoke.mockReturnValue(
+      new Promise<void>((resolve) => {
+        acknowledgeDelete = resolve;
+      }),
+    );
+    let settled = false;
+    const outcome = forgetPersistedMessageQueue("deleted").then(
+      () => {
+        settled = true;
+        return null;
+      },
+      (failure: unknown) => {
+        settled = true;
+        return failure;
+      },
+    );
+    await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(1));
+    expect(settled).toBe(false);
+    acknowledgeDelete();
+    expect(await outcome).toBe(error);
+    remove.mockRestore();
   });
 });

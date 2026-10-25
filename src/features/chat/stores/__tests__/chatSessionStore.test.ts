@@ -18,13 +18,16 @@ import {
 import {
   type ChatSession,
   SessionNotFoundError,
+  SessionDeletionUnavailableError,
   useChatSessionStore,
 } from "../chatSessionStore";
 
 const mocks = vi.hoisted(() => ({
   acpCreateSession: vi.fn(),
+  acpGetSessionInfo: vi.fn(),
   acpListSessionsPage: vi.fn(),
   archiveSession: vi.fn(),
+  deleteSession: vi.fn(),
   checkAllProviderStatus: vi.fn(),
   releaseSession: vi.fn(),
   unarchiveSession: vi.fn(),
@@ -32,6 +35,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/shared/api/acp", () => ({
   acpCreateSession: (...args: unknown[]) => mocks.acpCreateSession(...args),
+  acpGetSessionInfo: (...args: unknown[]) => mocks.acpGetSessionInfo(...args),
   acpListSessionsPage: (...args: unknown[]) =>
     mocks.acpListSessionsPage(...args),
 }));
@@ -58,6 +62,7 @@ vi.mock("@/shared/profile/buildProfile", () => ({
 
 vi.mock("@/shared/api/acpApi", () => ({
   archiveSession: (...args: unknown[]) => mocks.archiveSession(...args),
+  deleteSession: (...args: unknown[]) => mocks.deleteSession(...args),
   unarchiveSession: (...args: unknown[]) => mocks.unarchiveSession(...args),
   renameSession: vi.fn().mockResolvedValue(undefined),
   updateSessionProject: vi.fn().mockResolvedValue(undefined),
@@ -164,6 +169,7 @@ describe("chatSessionStore", () => {
     useSessionWindowStore.getState().setSnapshot([]);
     vi.clearAllMocks();
     mocks.archiveSession.mockResolvedValue(undefined);
+    mocks.deleteSession.mockResolvedValue(undefined);
     mocks.checkAllProviderStatus.mockResolvedValue([]);
     mocks.releaseSession.mockResolvedValue(undefined);
     mocks.unarchiveSession.mockResolvedValue(undefined);
@@ -2499,5 +2505,148 @@ describe("chatSessionStore", () => {
       expect(useChatSessionStore.getState().isRightRailOpen).toBe(false);
       expect(window.localStorage.getItem("goose:right-rail-open")).toBe("0");
     });
+  });
+});
+
+describe("archived session deletion", () => {
+  beforeEach(() => {
+    resetStore();
+    useSessionWindowStore.getState().setSnapshot([]);
+    vi.clearAllMocks();
+    mocks.deleteSession.mockResolvedValue(undefined);
+    mocks.releaseSession.mockResolvedValue(undefined);
+    mocks.unarchiveSession.mockResolvedValue(undefined);
+  });
+
+  it.each([
+    "active",
+    "window",
+    "unknownWindows",
+    "restoring",
+    "unarchived",
+  ])("blocks deletion of %s chats", async (reason) => {
+    const id = `blocked-delete-${reason}`;
+    seedSession({
+      id,
+      archivedAt: reason === "unarchived" ? undefined : "2026-10-01",
+    });
+    if (reason === "active")
+      useChatSessionStore.setState({ activeSessionId: id });
+    if (reason === "window")
+      useSessionWindowStore
+        .getState()
+        .setSnapshot([{ sessionId: id, windowLabel: "other" }]);
+    if (reason === "unknownWindows")
+      useSessionWindowStore.setState({ hasLoadedSnapshot: false });
+    if (reason === "restoring") {
+      const restore = createDeferredPromise<void>();
+      mocks.unarchiveSession.mockReturnValueOnce(restore.promise);
+      const pending = useChatSessionStore.getState().unarchiveSession(id);
+      await expect(
+        useChatSessionStore.getState().deleteArchivedSession(id),
+      ).rejects.toBeInstanceOf(SessionDeletionUnavailableError);
+      restore.resolve();
+      await pending;
+    } else {
+      await expect(
+        useChatSessionStore.getState().deleteArchivedSession(id),
+      ).rejects.toBeInstanceOf(SessionDeletionUnavailableError);
+    }
+    expect(mocks.deleteSession).not.toHaveBeenCalled();
+    expect(useChatSessionStore.getState().getSession(id)).toBeDefined();
+  });
+
+  it("keeps metadata on backend failure and permits retry", async () => {
+    const id = "delete-backend-failure";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    mocks.deleteSession.mockRejectedValueOnce(new Error("offline"));
+    await expect(
+      useChatSessionStore.getState().deleteArchivedSession(id),
+    ).rejects.toThrow("offline");
+    expect(useChatSessionStore.getState().getSession(id)?.archivedAt).toBe(
+      "2026-10-01",
+    );
+    await expect(
+      useChatSessionStore.getState().deleteArchivedSession(id),
+    ).resolves.toEqual({ cleanupFailed: false });
+    expect(useChatSessionStore.getState().getSession(id)).toBeUndefined();
+  });
+
+  it("finishes local deletion when canonical absence confirms a lost response", async () => {
+    const id = "delete-lost-response";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    mocks.deleteSession
+      .mockRejectedValueOnce(new Error("Agent unload failed"))
+      .mockRejectedValueOnce({ data: "Session not found" });
+    mocks.acpGetSessionInfo.mockRejectedValueOnce({
+      code: -32002,
+      data: `Session not found: ${id}`,
+    });
+    await expect(
+      useChatSessionStore.getState().deleteArchivedSession(id),
+    ).resolves.toEqual({ cleanupFailed: false });
+    expect(useChatSessionStore.getState().getSession(id)).toBeUndefined();
+  });
+
+  it("preserves data when the failed delete cannot be reconciled", async () => {
+    const id = "delete-unknown-outcome";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    mocks.deleteSession.mockRejectedValueOnce(new Error("offline"));
+    mocks.acpGetSessionInfo.mockRejectedValueOnce(new Error("offline"));
+    await expect(
+      useChatSessionStore.getState().deleteArchivedSession(id),
+    ).rejects.toThrow("offline");
+    expect(useChatSessionStore.getState().getSession(id)).toBeDefined();
+  });
+
+  it("does not mistake a lookup read failure for confirmed deletion", async () => {
+    const id = "delete-lookup-read-failure";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    mocks.deleteSession
+      .mockRejectedValueOnce(new Error("database locked"))
+      .mockRejectedValueOnce(new Error("database locked"));
+    mocks.acpGetSessionInfo.mockRejectedValueOnce({
+      data: `Session not found: ${id}`,
+    });
+    await expect(
+      useChatSessionStore.getState().deleteArchivedSession(id),
+    ).rejects.toThrow("database locked");
+    expect(useChatSessionStore.getState().getSession(id)).toBeDefined();
+  });
+
+  it("deduplicates deletion, blocks restore/send, and filters late list responses", async () => {
+    const id = "delete-deduplicated";
+    const session = seedSession({ id, archivedAt: "2026-10-01" });
+    const deletion = createDeferredPromise<void>();
+    const page = createDeferredPromise<ReturnType<typeof mockPage>>();
+    mocks.deleteSession.mockReturnValueOnce(deletion.promise);
+    mocks.acpListSessionsPage.mockReturnValueOnce(page.promise);
+    const loading = useChatSessionStore.getState().loadSessions();
+    const first = useChatSessionStore.getState().deleteArchivedSession(id);
+    expect(useChatSessionStore.getState().deleteArchivedSession(id)).toBe(
+      first,
+    );
+    await expect(
+      useChatSessionStore.getState().unarchiveSession(id),
+    ).rejects.toBeInstanceOf(SessionDeletionUnavailableError);
+    await expect(
+      useChatSessionStore.getState().ensureSessionActive(id),
+    ).rejects.toBeInstanceOf(SessionDeletionUnavailableError);
+    expect(() =>
+      useChatSessionStore.getState().assertSessionActive(id),
+    ).toThrow(SessionDeletionUnavailableError);
+    deletion.resolve();
+    await first;
+    page.resolve(
+      mockPage([makeAcpSession({ sessionId: id, archivedAt: "2026-10-01" })]),
+    );
+    await loading;
+    useChatSessionStore.getState().addSession(session);
+    useChatSessionStore.getState().ensurePinnedSessionPlaceholder(id);
+    expect(useChatSessionStore.getState().getSession(id)).toBeUndefined();
+    expect(mocks.deleteSession).toHaveBeenCalledTimes(1);
+    await expect(
+      useChatSessionStore.getState().ensureSessionActive(id),
+    ).rejects.toBeInstanceOf(SessionDeletionUnavailableError);
   });
 });

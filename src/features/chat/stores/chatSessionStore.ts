@@ -1,7 +1,11 @@
 import type { AutoRoutingDecision } from "@/shared/api/autoRouting";
 import { loadAutoMode, persistAutoMode } from "./autoModePersistence";
-import { create } from "zustand";
-import { acpCreateSession, acpListSessionsPage } from "@/shared/api/acp";
+import { create, type StoreApi } from "zustand";
+import {
+  acpCreateSession,
+  acpListSessionsPage,
+  acpGetSessionInfo,
+} from "@/shared/api/acp";
 import type {
   WorkspaceAttachment,
   WorkspaceAttachmentLifecycle,
@@ -19,6 +23,7 @@ import {
 } from "@/features/chat/lib/workspaceAttachments";
 import {
   archiveSession as acpArchiveSession,
+  deleteSession as acpDeleteSession,
   unarchiveSession as acpUnarchiveSession,
 } from "@/shared/api/acpApi";
 import { mergeAcpSessionPage } from "@/features/chat/lib/acpSessionMapping";
@@ -40,7 +45,10 @@ import {
   removeRemoteSessionRecord,
 } from "./remoteSessionPersistence";
 import { backendIdForSession } from "@/shared/api/acpBackendId";
-import { isAcpSessionNotFoundError } from "@/shared/api/acpErrors";
+import {
+  isAcpSessionNotFoundError,
+  formatAcpErrorMessage,
+} from "@/shared/api/acpErrors";
 import {
   registerSessionBackend,
   transferSessionBackend,
@@ -60,6 +68,60 @@ let sessionLoadEpoch = 0;
 let archiveMutationOperationId = 0;
 const inFlightArchiveMutationIdsBySessionId = new Map<string, Set<number>>();
 const inFlightUnarchiveBySessionId = new Map<string, Promise<void>>();
+const inFlightDeleteBySessionId = new Map<
+  string,
+  Promise<{ cleanupFailed: boolean }>
+>();
+const deletedSessionIds = new Set<string>();
+
+export function isSessionDeletionBlocked(id: string): boolean {
+  return deletedSessionIds.has(id) || inFlightDeleteBySessionId.has(id);
+}
+
+async function confirmSessionDeletion(id: string): Promise<boolean> {
+  try {
+    await acpGetSessionInfo(id);
+    return false;
+  } catch (error) {
+    if (!isAcpSessionNotFoundError(error)) return false;
+  }
+  // Goose's info endpoint also maps read errors to "not found". A bounded
+  // retry must confirm absence through delete's actual existence query.
+  try {
+    await acpDeleteSession(id);
+    return true;
+  } catch (error) {
+    return formatAcpErrorMessage(error, "") === "Session not found";
+  }
+}
+
+async function deleteCanonicalSession(id: string): Promise<void> {
+  try {
+    await acpDeleteSession(id);
+  } catch (error) {
+    // A lost response or failed agent unload can follow a committed transaction.
+    if (await confirmSessionDeletion(id)) return;
+    throw error;
+  }
+}
+
+export class SessionDeletionUnavailableError extends Error {
+  constructor() {
+    super("Archive and close this chat before permanently deleting it.");
+    this.name = "SessionDeletionUnavailableError";
+  }
+}
+
+function withoutDeletedSessions(
+  page: Awaited<ReturnType<typeof acpListSessionsPage>>,
+) {
+  return {
+    ...page,
+    sessions: page.sessions.filter(
+      (session) => !deletedSessionIds.has(session.sessionId),
+    ),
+  };
+}
 
 /** Thrown by archiveSession when the id matches no session in the store. */
 export class SessionNotFoundError extends Error {
@@ -251,6 +313,7 @@ interface ChatSessionStoreActions {
   updateSessionSubtitleFromText: (sessionId: string, text: string) => void;
   addSession: (session: ChatSession) => void;
   removeSession: (id: string) => void;
+  deleteArchivedSession: (id: string) => Promise<{ cleanupFailed: boolean }>;
   /**
    * Archive a session optimistically (sets `archivedAt`), then awaits the
    * backend call. On backend failure `archivedAt` rolls back and the error is
@@ -541,6 +604,96 @@ function persistWorkspaceMetadataForSession(session: ChatSession): void {
   });
 }
 
+function deleteArchivedSession(id: string, get: () => ChatSessionStore) {
+  const existing = inFlightDeleteBySessionId.get(id);
+  if (existing) return existing;
+  if (deletedSessionIds.has(id))
+    return Promise.resolve({ cleanupFailed: false });
+  const session = get().getSession(id);
+  if (
+    !session?.archivedAt ||
+    get().activeSessionId === id ||
+    get().archiveMutationBySessionId[id]?.status === "pending" ||
+    !useSessionWindowStore.getState().hasLoadedSnapshot ||
+    useSessionWindowStore.getState().isOpenInWindow(id)
+  ) {
+    return Promise.reject(new SessionDeletionUnavailableError());
+  }
+  const deletion = (async () => {
+    await deleteCanonicalSession(id);
+    deletedSessionIds.add(id);
+    try {
+      get().removeSession(id);
+      return { cleanupFailed: false };
+    } catch {
+      // Canonical deletion succeeded; a local persistence failure cannot undo it.
+      return { cleanupFailed: true };
+    }
+  })();
+  inFlightDeleteBySessionId.set(id, deletion);
+  void deletion
+    .finally(() => inFlightDeleteBySessionId.delete(id))
+    .catch(() => {});
+  return deletion;
+}
+
+function assertSessionNotDeleted(id: string): void {
+  if (isSessionDeletionBlocked(id)) {
+    throw new SessionDeletionUnavailableError();
+  }
+}
+
+function assertSessionActive(id: string, state: ChatSessionStore): void {
+  assertSessionNotDeleted(id);
+  if (state.getSession(id)?.archivedAt) {
+    throw new Error(`Session ${id} was archived before the send started.`);
+  }
+}
+
+async function ensureSessionActive(
+  id: string,
+  get: () => ChatSessionStore,
+): Promise<void> {
+  assertSessionNotDeleted(id);
+  const existing = inFlightUnarchiveBySessionId.get(id);
+  if (existing) await existing;
+  else if (get().getSession(id)?.archivedAt) await get().unarchiveSession(id);
+  assertSessionActive(id, get());
+}
+
+function ensurePinnedSessionPlaceholder(
+  id: string,
+  set: StoreApi<ChatSessionStore>["setState"],
+): void {
+  if (deletedSessionIds.has(id)) return;
+  set((state) => {
+    const existing = state.sessions.find((session) => session.id === id);
+    if (existing) {
+      if (existing.creationState || existing.pinnedLoadState === "loading") {
+        return state;
+      }
+      return {
+        sessions: state.sessions.map((session) =>
+          session.id === id
+            ? { ...session, pinnedLoadState: "loading" as const }
+            : session,
+        ),
+      };
+    }
+
+    const now = new Date().toISOString();
+    const placeholder: ChatSession = {
+      id,
+      title: DEFAULT_CHAT_TITLE,
+      createdAt: now,
+      updatedAt: now,
+      messageCount: 0,
+      pinnedLoadState: "loading",
+    };
+    return { sessions: [placeholder, ...state.sessions] };
+  });
+}
+
 export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
   sessions: [],
   activeSessionId: null,
@@ -828,34 +981,8 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
     }));
   },
 
-  ensurePinnedSessionPlaceholder: (id) => {
-    set((state) => {
-      const existing = state.sessions.find((session) => session.id === id);
-      if (existing) {
-        if (existing.creationState || existing.pinnedLoadState === "loading") {
-          return state;
-        }
-        return {
-          sessions: state.sessions.map((session) =>
-            session.id === id
-              ? { ...session, pinnedLoadState: "loading" as const }
-              : session,
-          ),
-        };
-      }
-
-      const now = new Date().toISOString();
-      const placeholder: ChatSession = {
-        id,
-        title: DEFAULT_CHAT_TITLE,
-        createdAt: now,
-        updatedAt: now,
-        messageCount: 0,
-        pinnedLoadState: "loading",
-      };
-      return { sessions: [placeholder, ...state.sessions] };
-    });
-  },
+  ensurePinnedSessionPlaceholder: (id) =>
+    ensurePinnedSessionPlaceholder(id, set),
 
   loadSessions: async () => {
     const loadEpoch = ++sessionLoadEpoch;
@@ -863,7 +990,9 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
     try {
       const page = await acpListSessionsPage();
       if (sessionLoadEpoch !== loadEpoch) return;
-      set((state) => mergeAcpSessionPage(state, page, null));
+      set((state) =>
+        mergeAcpSessionPage(state, withoutDeletedSessions(page), null),
+      );
     } catch (error) {
       if (sessionLoadEpoch === loadEpoch) {
         console.error("Failed to load sessions from ACP:", error);
@@ -886,7 +1015,13 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
     try {
       const page = await acpListSessionsPage({ cursor: sessionPageCursor });
       if (sessionLoadEpoch !== loadEpoch) return;
-      set((state) => mergeAcpSessionPage(state, page, sessionPageCursor));
+      set((state) =>
+        mergeAcpSessionPage(
+          state,
+          withoutDeletedSessions(page),
+          sessionPageCursor,
+        ),
+      );
     } catch (error) {
       if (sessionLoadEpoch === loadEpoch) {
         console.error("Failed to load more sessions from ACP:", error);
@@ -1021,6 +1156,7 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
   },
 
   addSession: (session) => {
+    if (deletedSessionIds.has(session.id)) return;
     let sessionForRemotePersistence: ChatSession | null = null;
     set((state) => {
       const existing = state.sessions.findIndex(
@@ -1091,6 +1227,8 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
     releaseWindowedSession(id);
   },
 
+  deleteArchivedSession: (id) => deleteArchivedSession(id, get),
+
   archiveSession: async (id, fallbackSession, options) => {
     const storedSession = get().sessions.find(
       (candidate) => candidate.id === id,
@@ -1157,6 +1295,9 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
   },
 
   unarchiveSession: (id) => {
+    if (inFlightDeleteBySessionId.has(id) || deletedSessionIds.has(id)) {
+      return Promise.reject(new SessionDeletionUnavailableError());
+    }
     const existing = inFlightUnarchiveBySessionId.get(id);
     if (existing) {
       return existing;
@@ -1219,27 +1360,15 @@ export const useChatSessionStore = create<ChatSessionStore>((set, get) => ({
     return restore;
   },
 
-  ensureSessionActive: async (id) => {
-    const existing = inFlightUnarchiveBySessionId.get(id);
-    if (existing) {
-      await existing;
-    } else if (get().getSession(id)?.archivedAt) {
-      await get().unarchiveSession(id);
-    }
-
-    if (get().getSession(id)?.archivedAt) {
-      throw new Error(`Session ${id} was archived before the send started.`);
-    }
-  },
-
-  assertSessionActive: (id) => {
-    if (get().getSession(id)?.archivedAt) {
-      throw new Error(`Session ${id} was archived before the send started.`);
-    }
-  },
+  ensureSessionActive: (id) => ensureSessionActive(id, get),
+  assertSessionActive: (id) => assertSessionActive(id, get()),
 
   setActiveSession: (sessionId) => {
-    if (get().activeSessionId === sessionId) return;
+    if (
+      get().activeSessionId === sessionId ||
+      (sessionId && isSessionDeletionBlocked(sessionId))
+    )
+      return;
     set({ activeSessionId: sessionId });
   },
 

@@ -303,7 +303,7 @@ function fetchCorpus(
     queryKey: [CORPUS_QUERY_KEY_PREFIX, target.id, target.stamp],
     queryFn: () => exportCorpus(target.id),
     // The key embeds the session version, so an entry is never stale by
-    // definition — and nothing invalidates this key, so a corpus is pinned to
+    // definition — deletion explicitly removes its keys; otherwise a corpus is pinned to
     // its stamp until the stamp changes or it is evicted. That is safe because
     // the stamp cannot run ahead of the export: goose derives both
     // `messageCount` (`COUNT(m.id)`) and `lastMessageAt` (`MAX(...)` over
@@ -518,4 +518,14 @@ function buildSnippet(text: string, query: string): string {
   const prefix = start > 0 ? "..." : "";
   const suffix = end < text.length ? "..." : "";
   return `${prefix}${text.substring(start, end).trim()}${suffix}`;
+}
+
+/** Remove every cached transcript version, including an in-flight export. */
+export async function forgetSessionSearch(
+  queryClient: QueryClient,
+  sessionId: string,
+): Promise<void> {
+  const queryKey = [CORPUS_QUERY_KEY_PREFIX, sessionId];
+  await queryClient.cancelQueries({ queryKey });
+  queryClient.removeQueries({ queryKey });
 }

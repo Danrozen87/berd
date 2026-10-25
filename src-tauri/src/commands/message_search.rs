@@ -149,7 +149,60 @@ pub async fn search_session_messages(
     .map_err(|_| "message_search_timeout: Search did not finish before its deadline".to_string())?
 }
 
+/// Clear Berd's derived copy after canonical history has been deleted by Goose.
+#[tauri::command]
+pub async fn forget_session_search_cache(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MessageSearchState>,
+    session_id: String,
+) -> Result<(), String> {
+    let destination = app
+        .path()
+        .app_data_dir()
+        .map_err(error_string)?
+        .join("message-search.sqlite");
+    tokio::time::timeout(SEARCH_DEADLINE, async {
+        let mut guard = state.index.lock().await;
+        if guard.is_none() && destination.is_file() {
+            let source = crate::services::acp::GooseServeProcess::message_search_source()
+                .ok_or_else(|| "Local session store is unavailable".to_string())?;
+            *guard = Some(SearchIndex::open(&source, &destination).await?);
+        }
+        if let Some(index) = guard.as_mut() {
+            index.forget_session(&session_id).await?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        "message_search_timeout: Cache cleanup did not finish before its deadline".to_string()
+    })?
+}
+
 impl SearchIndex {
+    async fn forget_session(&mut self, session_id: &str) -> Result<(), String> {
+        let mut tx = self.derived.begin().await.map_err(error_string)?;
+        sqlx::query("DELETE FROM search_messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(error_string)?;
+        sqlx::query("DELETE FROM search_sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(error_string)?;
+        tx.commit().await.map_err(error_string)?;
+        sqlx::query("DROP TABLE IF EXISTS temp.message_search_snapshot")
+            .execute(&mut self.derived)
+            .await
+            .map_err(error_string)?;
+        self.source_version = None;
+        self.candidate_query = None;
+        self.generation += 1;
+        Ok(())
+    }
+
     async fn open(source: &Path, destination: &Path) -> Result<Self, String> {
         let identity = SourceIdentity::read(source)?;
         if let Some(parent) = destination.parent() {
@@ -1228,6 +1281,72 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn forget_session_purges_cached_content_without_mutating_canonical_history() {
+        let (_temp, mut source, mut index) = fixture().await;
+        message(&mut source, 1, "active", "deleted sentinel").await;
+        message(&mut source, 2, "older", "retained sentinel").await;
+        index.search(request("sentinel")).await.unwrap();
+        let generation = index.generation;
+        index.forget_session("active").await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM search_messages WHERE session_id='active'"
+            )
+            .fetch_one(&mut index.derived)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM search_sessions WHERE id='active'")
+                .fetch_one(&mut index.derived)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM search_messages WHERE session_id='older'"
+            )
+            .fetch_one(&mut index.derived)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sqlite_temp_master WHERE name='message_search_snapshot'"
+            )
+            .fetch_one(&mut index.derived)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE session_id='active'")
+                .fetch_one(&mut source)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(index.source_version.is_none());
+        assert!(index.candidate_query.is_none());
+        assert!(index.generation > generation);
+        // The command owns only a derived cache. Canonical deletion remains Goose's job.
+        sqlx::query("DELETE FROM messages WHERE session_id='active'")
+            .execute(&mut source)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sessions WHERE id='active'")
+            .execute(&mut source)
+            .await
+            .unwrap();
+        let page = index.search(request("sentinel")).await.unwrap();
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].session_id, "older");
     }
 
     #[test]

@@ -470,6 +470,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::message_search::search_session_messages,
+            commands::message_search::forget_session_search_cache,
             commands::pr_tracker::open_pr_tracker_url,
             commands::pr_tracker::resolve_pr_tracker_projects,
             commands::pr_tracker::list_pr_tracker_pull_requests,

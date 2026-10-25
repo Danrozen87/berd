@@ -9,6 +9,7 @@ import {
   type ChatSessionPatch,
   type ChatSession,
   useChatSessionStore,
+  isSessionDeletionBlocked,
 } from "@/features/chat/stores/chatSessionStore";
 import { checkDirectory } from "@/features/projects/lib/missingProjectDirs";
 import type { ProjectInfo } from "@/features/projects/api/projects";
@@ -278,6 +279,7 @@ export async function loadSessionMessages(
   sessionId: string,
   options: LoadSessionMessagesOptions = {},
 ): Promise<boolean> {
+  if (isSessionDeletionBlocked(sessionId)) return false;
   const existingLoad = sessionLoadPromises.get(sessionId);
   if (existingLoad) {
     return existingLoad;
@@ -538,6 +540,7 @@ async function performSessionMessagesLoad(
 }
 
 export function activateSession(sessionId: string): void {
+  if (isSessionDeletionBlocked(sessionId)) return;
   useChatSessionStore.getState().setActiveSession(sessionId);
   useChatStore.getState().setActiveSession(sessionId);
   useChatStore.getState().markSessionRead(sessionId);
