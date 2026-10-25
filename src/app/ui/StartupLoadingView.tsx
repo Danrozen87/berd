@@ -1,8 +1,10 @@
 import { useTranslation } from "react-i18next";
 import { useReducedMotion } from "motion/react";
 
-import { STARTUP_LOADING_LOGO_SIZE_PX } from "@/app/lib/startupLoading";
 import { BerdLoader } from "@/shared/ui/berd-loader";
+
+/** 70px source loader scaled up ~18% for the startup screen. */
+const STARTUP_LOADING_LOGO_SIZE_PX = 83;
 
 export function StartupLoadingView() {
   const { t } = useTranslation("common");

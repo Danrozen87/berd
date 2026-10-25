@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAgentStore } from "@/features/agents/stores/agentStore";
 import { useChatStore } from "@/features/chat/stores/chatStore";
 import { useChatSessionStore } from "@/features/chat/stores/chatSessionStore";
@@ -14,6 +14,7 @@ import { AppShell } from "./AppShell";
 
 const mocks = vi.hoisted(() => ({
   startupRetry: vi.fn(),
+  translationsReady: true,
   defaultModelRepair: vi.fn(),
   startupState: {
     ready: true,
@@ -24,6 +25,17 @@ const mocks = vi.hoisted(() => ({
     error: null as Error | null,
   },
 }));
+
+vi.mock("react-i18next", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-i18next")>();
+  return {
+    ...actual,
+    useTranslation: (...args: Parameters<typeof actual.useTranslation>) =>
+      Object.assign(actual.useTranslation(...args), {
+        ready: mocks.translationsReady,
+      }),
+  };
+});
 
 vi.mock("@tauri-apps/api/path", () => ({
   appLogDir: vi.fn().mockResolvedValue("/Users/test/Library/Logs/goose"),
@@ -115,11 +127,11 @@ function renderAppShell() {
       },
     },
   });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <AppShell />
-    </QueryClientProvider>,
-  );
+  return render(<AppShell />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
 }
 
 describe("AppShell startup diagnostics", () => {
@@ -128,6 +140,7 @@ describe("AppShell startup diagnostics", () => {
     window.history.replaceState(null, "", "/");
     window.localStorage.clear();
     dispatchOnboarding({ type: "complete" });
+    mocks.translationsReady = true;
     mocks.startupState.ready = true;
     mocks.startupState.error = null;
     mocks.migrationState.status = "ready";
@@ -159,6 +172,83 @@ describe("AppShell startup diagnostics", () => {
       activeProjectId: null,
       fetchProjects: vi.fn().mockResolvedValue(undefined),
     });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows content immediately when startup becomes ready", () => {
+    vi.useFakeTimers();
+    mocks.startupState.ready = false;
+    const view = renderAppShell();
+
+    act(() => vi.advanceTimersByTime(50));
+    mocks.startupState.ready = true;
+    view.rerender(<AppShell />);
+
+    expect(screen.getByTestId("app-shell-content")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Starting Berd" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("waits for translated controls before showing app content", () => {
+    mocks.translationsReady = false;
+    const view = renderAppShell();
+
+    expect(
+      screen.getByRole("status", { name: "Starting Berd" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("app-shell-content")).not.toBeInTheDocument();
+
+    mocks.translationsReady = true;
+    view.rerender(<AppShell />);
+    expect(screen.getByTestId("app-shell-content")).toBeInTheDocument();
+  });
+
+  it("keeps the loader until a slow startup becomes ready", () => {
+    vi.useFakeTimers();
+    mocks.startupState.ready = false;
+    const view = renderAppShell();
+
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(
+      screen.getByRole("status", { name: "Starting Berd" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("app-shell-content")).not.toBeInTheDocument();
+
+    mocks.startupState.ready = true;
+    view.rerender(<AppShell />);
+    expect(screen.getByTestId("app-shell-content")).toBeInTheDocument();
+  });
+
+  it("shows diagnostics immediately when startup fails", () => {
+    vi.useFakeTimers();
+    mocks.startupState.ready = false;
+    const view = renderAppShell();
+
+    mocks.startupState.error = new Error("Failed to spawn goose serve");
+    mocks.startupState.ready = true;
+    view.rerender(<AppShell />);
+
+    expect(
+      screen.getByRole("heading", { name: "Berd couldn't start" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Starting Berd" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the development loader preview available", () => {
+    window.history.replaceState(null, "", "/?startupLoading");
+
+    renderAppShell();
+
+    expect(
+      screen.getByRole("status", { name: "Starting Berd" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("app-shell-content")).not.toBeInTheDocument();
   });
 
   it("renders app content even when migration setup fails", () => {

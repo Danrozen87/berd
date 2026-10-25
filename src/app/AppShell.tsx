@@ -277,7 +277,6 @@ import type {
   BuilderbotNavigationRoute,
 } from "./types/appNavigation";
 import type { TopBarBreadcrumb } from "./ui/TopBar";
-import { STARTUP_LOADING_MIN_DISPLAY_MS } from "./lib/startupLoading";
 import { StartupLoadingView } from "./ui/StartupLoadingView";
 import { deriveStarterTaskCompletion } from "@/features/home/onboarding/starterTaskCompletion";
 import {
@@ -681,7 +680,7 @@ export function AppShell({
   children?: React.ReactNode;
   onLoggedOut?: (status: AuthStatus) => void;
 }) {
-  const { t } = useTranslation([
+  const { t, ready: translationsReady } = useTranslation([
     "chat",
     "common",
     "agents",
@@ -1190,18 +1189,7 @@ export function AppShell({
     };
   }, [createProjectOpen, selectedStarterTaskId]);
   const startup = useAppStartup();
-  const [startupLoadingMinElapsed, setStartupLoadingMinElapsed] = useState(
-    () => startup.ready,
-  );
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(
-      () => setStartupLoadingMinElapsed(true),
-      STARTUP_LOADING_MIN_DISPLAY_MS,
-    );
-
-    return () => window.clearTimeout(timeoutId);
-  }, []);
+  const startupViewReady = startup.ready && translationsReady;
   const clearGlobalComposerHandoffTimer = useCallback(() => {
     if (globalComposerHandoffTimeoutRef.current !== null) {
       window.clearTimeout(globalComposerHandoffTimeoutRef.current);
@@ -4837,14 +4825,17 @@ export function AppShell({
     targetLocation.view === "automations" &&
     targetLocation.route.surface === "builder";
   const canShowGlobalComposer =
-    startup.ready &&
+    startupViewReady &&
     !forceStartupLoading &&
     !startupIssue &&
     children == null &&
     (!isPreparingContent || globalComposerPlacement === "handoff") &&
     !isGlobalComposerRouteDisallowed;
   const canUseGlobalComposerShortcut =
-    startup.ready && !forceStartupLoading && !startupIssue && children == null;
+    startupViewReady &&
+    !forceStartupLoading &&
+    !startupIssue &&
+    children == null;
   const showGlobalComposer =
     canShowGlobalComposer &&
     (globalComposerPlacement !== "docked" || renderedLocation.view !== "chat");
@@ -5474,7 +5465,7 @@ export function AppShell({
     return <OnboardingFlow />;
   }
 
-  if (!startup.ready || !startupLoadingMinElapsed) {
+  if (!startupViewReady) {
     return <StartupLoadingView />;
   }
 
