@@ -157,7 +157,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Fetch upstream quality baseline
+        run: git fetch --no-tags https://github.com/block/berd.git refs/heads/main:refs/remotes/upstream/main
 
       - name: Activate Hermit
         uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
@@ -206,6 +210,9 @@ jobs:
         run: pnpm --filter @aaif/goose-sdk build
 
       - name: Build frontend
+        # TypeScript exceeds the runner's default 2 GiB heap on this source tree.
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: just build
 
       - name: Upload frontend build
