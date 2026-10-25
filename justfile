@@ -276,7 +276,7 @@ _tauri-test-windows:
     just _tauri-test-skill-marketplace
 
 # Run the local CI gate.
-ci: release-version-check check tauri-fmt-check tauri-check tauri-test clippy test release-scripts-test build
+ci: personal-quality-test release-version-check check tauri-fmt-check tauri-check tauri-test clippy test release-scripts-test build
 
 # Native x64 MSVC CI gate for the managed Node runtime + ACP bridge.
 # Runs the managed_node / managed_acp_tools module tests (including the
@@ -511,6 +511,7 @@ dev:
     set -euo pipefail
 
     just _ensure-dev-deps
+    node personal/check-quality.mjs
 
     if [[ -z "${GOOSE_BIN:-}" ]]; then
         LOCAL_GOOSE_BIN="$(GOOSE_DEV_MODE=required GOOSE_BUILD_PROFILE=debug ./scripts/ensure-local-goose.sh --print-bin)"
@@ -710,3 +711,7 @@ reset-migration:
     if [[ $removed -eq 0 ]]; then
         echo "No migration marker found under $base/com.squareup.berd{,.dev}/."
     fi
+
+# Check the personal function gate against real Git index/branch fixtures.
+personal-quality-test:
+    pnpm test:quality

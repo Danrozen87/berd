@@ -25,6 +25,8 @@ export default defineConfig({
     ],
   },
   test: {
+    // Use jsdom Storage so browser prototype mocks also work on Node 25+.
+    execArgv: ["--no-experimental-webstorage"],
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],

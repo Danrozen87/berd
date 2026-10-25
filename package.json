@@ -5,7 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "dev": "vite",
+    "dev": "node ./personal/check-quality.mjs && vite",
     "design-system:audit": "node ./scripts/design-system-audit.mjs",
     "design-system:check": "pnpm design-system:manifest-check && pnpm design-system:tokens && pnpm design-system:audit && pnpm design-system:coverage -- --strict",
     "design-system:coverage": "node ./scripts/design-system-coverage.mjs",
@@ -22,7 +22,7 @@
     "artifacts:publish": "node ./scripts/artifacts-manifest.mjs publish",
     "artifacts:promote": "node ./scripts/artifacts-manifest.mjs promote",
     "check:i18n": "node ./scripts/check-i18n-strings.mjs",
-    "lint": "biome lint .",
+    "lint": "node ./personal/check-quality.mjs && biome lint .",
     "check": "biome check . && pnpm check:i18n",
     "format": "biome format --write .",
     "preview": "vite preview",
@@ -44,7 +44,9 @@
     "test-driver": "tsx tests/app-e2e/lib/test-driver-cli.ts",
     "tauri:release:config": "node scripts/release/build-tauri-release-config.mjs",
     "validate:runtime-config": "tsx scripts/validate-runtime-config.ts",
-    "validate:bundled-agents": "tsx scripts/validate-bundled-agents.ts"
+    "validate:bundled-agents": "tsx scripts/validate-bundled-agents.ts",
+    "quality:check": "node ./personal/check-quality.mjs",
+    "test:quality": "node --test personal/check-quality.test.mjs"
   },
   "dependencies": {
     "@aaif/goose-sdk": "workspace:*",

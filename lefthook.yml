@@ -3,6 +3,8 @@
 
 pre-commit:
   commands:
+    personal-quality:
+      run: node personal/check-quality.mjs --staged
     biome-format:
       # Allowlist of biome-supported extensions; safer than a denylist since
       # ignoreUnknown is false and unknown types would cause biome to error.
@@ -21,6 +23,8 @@ pre-commit:
 pre-push:
   parallel: true
   commands:
+    personal-quality:
+      run: node personal/check-quality.mjs
     fmt-check:
       run: just fmt-check
     clippy:

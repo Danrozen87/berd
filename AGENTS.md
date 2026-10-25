@@ -137,3 +137,43 @@ groups, and other persisted references continue to use the original id.
 - All `<button>` elements need `type="button"` unless intentionally submitting.
 - Do not hand-edit generated SDK files unless this repo intentionally freezes a
   generated snapshot; prefer updating `sdk/schema/*` and regenerating.
+
+## Personal fork engineering
+
+This checkout serves `Danrozen87/berd`; `block/berd` remains upstream. Keep
+personal distribution identity and build settings under `personal/` so shared
+upstream mechanics remain reusable. The daily macOS build entrypoint is
+`bash personal/build-macos.sh`; it builds the pinned backend and disables updates.
+
+- Make one focused, reviewable change at a time, with a concrete user outcome.
+  Avoid unrelated cleanup, broad rewrites, and repository-wide formatting.
+- Before adding UI, logic, or a dependency, find the existing shared component,
+  hook, service, token, or upstream feature and reuse or extend it. Do not fork
+  an existing implementation merely to customize its presentation.
+- Keep functions responsible for one operation; separate side effects from
+  calculations, make inputs and error paths explicit, and avoid nesting that
+  hides control flow. Extract helpers when they clarify a real responsibility;
+  do not add speculative abstractions or duplicate state.
+- Use the existing Biome, TypeScript, design-system, Rust formatting, and Clippy
+  gates. Do not add a second linter or weaken rules to make a patch pass. New
+  suppressions require a local explanation and a narrowly scoped exception.
+  When tightening a rule, assess existing violations and enforce it deliberately.
+- Add dependencies only with a concrete need that existing code or platform APIs
+  cannot reasonably meet. Record bundle/runtime cost, cross-platform impact,
+  maintenance ownership, and why reuse is insufficient. Prefer removing unused
+  code and dependencies when the focused change makes that safe.
+- Preserve accessibility, keyboard interaction, reduced motion, and semantic
+  tokens when changing shared UI. Measure performance changes in the affected
+  flow; do not infer improvement from a code-size reduction alone.
+- Validate the changed behavior and relevant repository gates. Report baseline
+  failures separately, fix regressions caused by the patch, and never claim a
+  check passed when it was skipped. Avoid tests that only mirror implementation.
+- Keep upstream syncs separate from product changes. Favor small additive patches
+  with clear ownership and removal criteria over parallel implementations. Do
+  not silently update backend pins or reuse a binary from a different pin.
+
+Personal development, lint, commit, and push gates are documented in
+`personal/CONTRIBUTING.md`. Its writing guidance applies to READMEs, docs,
+contribution guides, comments, and change notes. Keep those checks wired into
+the existing workflow; review reuse, architecture, performance, and prose as
+well as the measurable function limits.
