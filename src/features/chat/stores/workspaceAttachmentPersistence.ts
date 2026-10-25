@@ -126,7 +126,9 @@ function normalizePersistedChatWorkspaceMetadata(
   };
 }
 
-function readAllPersistedChatWorkspaceMetadata(): PersistedChatWorkspaceMetadataBySession {
+function readAllPersistedChatWorkspaceMetadata(
+  strict = false,
+): PersistedChatWorkspaceMetadataBySession {
   if (typeof window === "undefined") return {};
 
   try {
@@ -148,7 +150,8 @@ function readAllPersistedChatWorkspaceMetadata(): PersistedChatWorkspaceMetadata
       }
     }
     return bySession;
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
@@ -169,6 +172,7 @@ function dispatchWorkspaceMetadataChanged(sessionIds: string[]): void {
 function writeAllPersistedChatWorkspaceMetadata(
   bySession: PersistedChatWorkspaceMetadataBySession,
   changedSessionIds: string[],
+  strict = false,
 ): void {
   if (typeof window === "undefined") return;
 
@@ -184,7 +188,8 @@ function writeAllPersistedChatWorkspaceMetadata(
       JSON.stringify(bySession),
     );
     dispatchWorkspaceMetadataChanged(changedSessionIds);
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // localStorage may be unavailable
   }
 }
@@ -211,12 +216,19 @@ export function persistChatWorkspaceMetadata(
   writeAllPersistedChatWorkspaceMetadata(bySession, [sessionId]);
 }
 
-export function removePersistedChatWorkspaceMetadata(sessionId: string): void {
-  const bySession = readAllPersistedChatWorkspaceMetadata();
+export function removePersistedChatWorkspaceMetadata(
+  sessionId: string,
+  strict = false,
+): void {
+  const bySession = readAllPersistedChatWorkspaceMetadata(strict);
   if (!(sessionId in bySession)) return;
 
   delete bySession[sessionId];
-  writeAllPersistedChatWorkspaceMetadata(bySession, [sessionId]);
+  writeAllPersistedChatWorkspaceMetadata(bySession, [sessionId], strict);
+}
+
+export function forgetPersistedWorkspaceMetadata(sessionId: string): void {
+  removePersistedChatWorkspaceMetadata(sessionId, true);
 }
 
 export function subscribeToChatWorkspaceMetadata(

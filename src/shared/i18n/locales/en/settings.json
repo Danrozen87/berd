@@ -95,7 +95,17 @@
     "messageCount_one": "{{displayCount}} message",
     "messageCount_other": "{{displayCount}} messages",
     "sectionTitle": "Archived chats",
-    "title": "Chats"
+    "title": "Chats",
+    "deleteLabel": "Delete {{title}} permanently",
+    "deleteTitle": "Permanently delete “{{title}}”?",
+    "deleteDescription": "Berd’s saved conversation and messages will be deleted. You cannot restore them. Project files, separate agent history and backups are kept.",
+    "deleteConfirm": "Delete permanently",
+    "deleting": "Deleting…",
+    "deleteSuccess": "Chat permanently deleted.",
+    "deleteError": "Couldn’t confirm deletion. The chat is still listed; try again when connected.",
+    "deleteUnavailable": "Archive and close the chat before deleting it.",
+    "deleteCleanupWarning": "Chat deleted. Some local cache or metadata cleanup is incomplete.",
+    "restoreError": "Couldn’t restore the chat. Try again."
   },
   "compaction": {
     "goose": {

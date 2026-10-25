@@ -1,6 +1,6 @@
 const DRAFTS_STORAGE_KEY = "goose:chat-drafts";
 
-export function loadCachedDrafts(): Record<string, string> {
+export function loadCachedDrafts(strict = false): Record<string, string> {
   if (typeof window === "undefined") return {};
   try {
     const stored = window.localStorage.getItem(DRAFTS_STORAGE_KEY);
@@ -14,12 +14,16 @@ export function loadCachedDrafts(): Record<string, string> {
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
 
-export function persistDrafts(drafts: Record<string, string>): void {
+export function persistDrafts(
+  drafts: Record<string, string>,
+  strict = false,
+): void {
   if (typeof window === "undefined") return;
   try {
     const nonEmpty = Object.fromEntries(
@@ -32,7 +36,14 @@ export function persistDrafts(drafts: Record<string, string>): void {
     } else {
       window.localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(nonEmpty));
     }
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // localStorage may be unavailable
   }
+}
+
+export function forgetPersistedDraft(sessionId: string): void {
+  const drafts = loadCachedDrafts(true);
+  delete drafts[sessionId];
+  persistDrafts(drafts, true);
 }

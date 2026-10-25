@@ -1,4 +1,5 @@
-import { create, type StateCreator } from "zustand";
+import { isSessionDeletionBlocked } from "./chatSessionStore";
+import { create, type StateCreator, type StoreApi } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import type {
   ChatAttachmentDraft,
@@ -563,6 +564,38 @@ export type ChatStore = ChatStoreState & ChatStoreActions;
 const cachedDrafts = loadCachedDrafts();
 const cachedMessageQueues = loadCachedMessageQueues();
 
+function activateChatStoreSession(
+  sessionId: string,
+  set: StoreApi<ChatStore>["setState"],
+): void {
+  if (isSessionDeletionBlocked(sessionId)) return;
+  let evictedSessionIds: string[] = [];
+  set((state) => {
+    const recentMessageSessionIds = updateRecentMessageSessionIds(
+      state.recentMessageSessionIds,
+      sessionId,
+    );
+    const trimmedCache = trimMessageSessionCache(
+      state,
+      recentMessageSessionIds,
+    );
+    evictedSessionIds = trimmedCache.evictedSessionIds;
+
+    return {
+      activeSessionId: sessionId,
+      recentMessageSessionIds,
+      messagesBySession: trimmedCache.messagesBySession,
+      sessionStateById: state.sessionStateById[sessionId]
+        ? state.sessionStateById
+        : {
+            ...state.sessionStateById,
+            [sessionId]: createInitialSessionRuntime(),
+          },
+    };
+  });
+  evictedSessionIds.forEach(clearReplayBuffer);
+}
+
 const createChatStore: StateCreator<
   ChatStore,
   [["zustand/subscribeWithSelector", never]]
@@ -585,33 +618,7 @@ const createChatStore: StateCreator<
   scrollTargetMessageBySession: {},
 
   // Session management
-  setActiveSession: (sessionId) => {
-    let evictedSessionIds: string[] = [];
-    set((state) => {
-      const recentMessageSessionIds = updateRecentMessageSessionIds(
-        state.recentMessageSessionIds,
-        sessionId,
-      );
-      const trimmedCache = trimMessageSessionCache(
-        state,
-        recentMessageSessionIds,
-      );
-      evictedSessionIds = trimmedCache.evictedSessionIds;
-
-      return {
-        activeSessionId: sessionId,
-        recentMessageSessionIds,
-        messagesBySession: trimmedCache.messagesBySession,
-        sessionStateById: state.sessionStateById[sessionId]
-          ? state.sessionStateById
-          : {
-              ...state.sessionStateById,
-              [sessionId]: createInitialSessionRuntime(),
-            },
-      };
-    });
-    evictedSessionIds.forEach(clearReplayBuffer);
-  },
+  setActiveSession: (sessionId) => activateChatStoreSession(sessionId, set),
 
   setActiveSessionViewing: (isViewingActiveSession) =>
     set({ isViewingActiveSession }),

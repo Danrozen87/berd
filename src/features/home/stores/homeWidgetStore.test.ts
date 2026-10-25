@@ -1991,3 +1991,51 @@ describe("homeWidgetStore", () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 });
+
+describe("removeChatPins", () => {
+  function pinnedLayout() {
+    return layout({
+      items: [
+        ...layout().items,
+        {
+          ...clockLayoutItem("pin-deleted", 400),
+          kind: "session" as const,
+          targetId: "deleted-chat",
+          titleOverride: "private title",
+        },
+        {
+          ...clockLayoutItem("pin-kept", 500),
+          kind: "session" as const,
+          targetId: "kept-chat",
+        },
+      ],
+    });
+  }
+
+  it("loads persisted pins and confirms removal while preserving other widgets", async () => {
+    vi.mocked(getLayout).mockResolvedValue(pinnedLayout());
+    await useHomeWidgetStore.getState().removeChatPins("deleted-chat");
+    const saved = vi.mocked(saveLayoutItems).mock.calls.at(-1)?.[0].items;
+    expect(saved?.some((item) => item.targetId === "deleted-chat")).toBe(false);
+    expect(saved?.some((item) => item.targetId === "kept-chat")).toBe(true);
+    expect(saved?.some((item) => item.kind === "clock")).toBe(true);
+    expect(
+      useHomeWidgetStore
+        .getState()
+        .instances.some((widget) => widget.state?.sessionId === "deleted-chat"),
+    ).toBe(false);
+  });
+
+  it("reports a failed save instead of treating optimistic removal as confirmed", async () => {
+    vi.mocked(getLayout).mockResolvedValue(pinnedLayout());
+    vi.mocked(saveLayoutItems).mockRejectedValue(new Error("disk unavailable"));
+    await expect(
+      useHomeWidgetStore.getState().removeChatPins("deleted-chat"),
+    ).rejects.toThrow("not saved");
+    expect(
+      useHomeWidgetStore
+        .getState()
+        .instances.some((widget) => widget.state?.sessionId === "deleted-chat"),
+    ).toBe(true);
+  });
+});

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Button } from "@/shared/ui/button";
+import { ArchivedChatActions } from "./ArchivedChatActions";
 import { SettingsRow } from "@/shared/ui/settings-row";
 import { SettingsSection } from "@/shared/ui/settings-section";
 import {
@@ -19,16 +19,14 @@ import { useLocaleFormatting } from "@/shared/i18n";
 export function ArchivedChatsSection() {
   const { t } = useTranslation(["settings", "common"]);
   const { formatRelativeTimeToNow } = useLocaleFormatting();
-  const [archivedChats, setArchivedChats] = useState<ChatSession[]>([]);
-  const [loadingArchivedChats, setLoadingArchivedChats] = useState(true);
+  const sessions = useChatSessionStore((state) => state.sessions);
+  const archivedChats = useMemo(
+    () => sessions.filter((session) => session.archivedAt),
+    [sessions],
+  );
   const [projectsById, setProjectsById] = useState<Map<string, ProjectInfo>>(
     new Map(),
   );
-
-  useEffect(() => {
-    setArchivedChats(useChatSessionStore.getState().getArchivedSessions());
-    setLoadingArchivedChats(false);
-  }, []);
 
   useEffect(() => {
     Promise.all([listProjects(), listArchivedProjects()])
@@ -42,16 +40,6 @@ export function ArchivedChatsSection() {
       .catch(() => setProjectsById(new Map()));
   }, []);
 
-  async function handleRestoreChat(id: string) {
-    try {
-      await useChatSessionStore.getState().unarchiveSession(id);
-    } catch (err) {
-      console.error("Failed to unarchive session in backend:", err);
-      return;
-    }
-    setArchivedChats((prev) => prev.filter((session) => session.id !== id));
-  }
-
   function describeChat(session: ChatSession): string {
     const date = formatRelativeTimeToNow(sessionActivityAt(session));
     if (!session.projectId) {
@@ -63,7 +51,7 @@ export function ArchivedChatsSection() {
 
   return (
     <SettingsSection title={t("chats.sectionTitle")}>
-      {!loadingArchivedChats && archivedChats.length === 0 ? (
+      {archivedChats.length === 0 ? (
         <p className="text-xs text-muted-foreground">{t("chats.empty")}</p>
       ) : null}
       {archivedChats.map((session) => (
@@ -80,17 +68,7 @@ export function ArchivedChatsSection() {
           }
           description={describeChat(session)}
           descriptionClassName="truncate"
-          action={
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              onClick={() => handleRestoreChat(session.id)}
-              className="flex-shrink-0"
-            >
-              {t("common:actions.restore")}
-            </Button>
-          }
+          action={<ArchivedChatActions session={session} />}
         />
       ))}
     </SettingsSection>

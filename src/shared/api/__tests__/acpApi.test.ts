@@ -1088,6 +1088,33 @@ describe("remote session wire translation", () => {
     unregisterSessionBackend("ssh:devbox#20260828_2");
   });
 
+  it("deletes on the owning backend using the wire id and preserves other routing", async () => {
+    const { deleteSession } = await import("../acpApi");
+    const {
+      registerSessionBackend,
+      unregisterSessionBackend,
+      getSessionBackend,
+    } = await import("../acpSessionBackends");
+    registerSessionBackend(
+      "ssh:devbox#delete-fixture",
+      "ssh:devbox",
+      "delete-fixture",
+    );
+    registerSessionBackend(
+      "ssh:devbox#kept-fixture",
+      "ssh:devbox",
+      "kept-fixture",
+    );
+    mocks.extMethod.mockResolvedValueOnce({});
+    await deleteSession("ssh:devbox#delete-fixture");
+    expect(mocks.extMethod).toHaveBeenCalledWith("session/delete", {
+      sessionId: "delete-fixture",
+    });
+    expect(getSessionBackend("ssh:devbox#kept-fixture")).toBe("ssh:devbox");
+    unregisterSessionBackend("ssh:devbox#delete-fixture");
+    unregisterSessionBackend("ssh:devbox#kept-fixture");
+  });
+
   it("composes remote list results and fork children onto their backend", async () => {
     const { listSessionsPage, forkSession } = await import("../acpApi");
     const {

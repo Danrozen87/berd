@@ -12,6 +12,7 @@ const QUEUES_STORAGE_KEY = "goose:chat-message-queues:v1";
 let nativeWriteChain = Promise.resolve();
 
 type PersistedQueues = Record<string, QueuedMessageRecord[]>;
+type QueueUpdates = Record<string, QueuedMessageRecord[] | null>;
 
 function isQueuedRecord(value: unknown): value is QueuedMessageRecord {
   if (!value || typeof value !== "object") return false;
@@ -178,12 +179,13 @@ function parseMessageQueues(stored: string): PersistedQueues {
   );
 }
 
-export function loadCachedMessageQueues(): PersistedQueues {
+export function loadCachedMessageQueues(strict = false): PersistedQueues {
   if (typeof window === "undefined") return {};
   try {
     const stored = window.localStorage.getItem(QUEUES_STORAGE_KEY);
     return stored ? parseMessageQueues(stored) : {};
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return {};
   }
 }
@@ -193,6 +195,17 @@ export function loadCachedMessageQueues(): PersistedQueues {
 // would strand unreachable records; quitting mid-creation drops the message.
 function isSessionPersistable(sessionId: string): boolean {
   return !useChatSessionStore.getState().getSession(sessionId)?.creationState;
+}
+
+function enqueueNativeQueueWrite(updates: QueueUpdates): Promise<void> {
+  const write = nativeWriteChain.then(() =>
+    invoke<void>("persist_message_queue_updates", {
+      serializedUpdates: JSON.stringify(updates),
+    }),
+  );
+  // A failed write must not prevent later writes or acknowledged deletions.
+  nativeWriteChain = write.catch(() => undefined);
+  return write;
 }
 
 export function persistMessageQueues(
@@ -209,25 +222,20 @@ export function persistMessageQueues(
     ]),
   );
   if (window.__TAURI_INTERNALS__) {
-    nativeWriteChain = nativeWriteChain
-      .then(() =>
-        invoke<void>("persist_message_queue_updates", {
-          serializedUpdates: JSON.stringify(updates),
-        }),
-      )
-      .catch((error) => {
-        console.error("Failed to persist message queues:", error);
-      });
+    void enqueueNativeQueueWrite(updates).catch((error) => {
+      console.error("Failed to persist message queues:", error);
+    });
   }
   refreshCachedMessageQueues(updates);
 }
 
 export function refreshCachedMessageQueues(
-  updates: Record<string, QueuedMessageRecord[] | null>,
+  updates: QueueUpdates,
+  strict = false,
 ): void {
   if (typeof window === "undefined") return;
   try {
-    const cached = loadCachedMessageQueues();
+    const cached = loadCachedMessageQueues(strict);
     for (const [sessionId, records] of Object.entries(updates)) {
       if (records?.length) cached[sessionId] = records;
       else delete cached[sessionId];
@@ -237,8 +245,25 @@ export function refreshCachedMessageQueues(
       : null;
     if (serialized) window.localStorage.setItem(QUEUES_STORAGE_KEY, serialized);
     else window.localStorage.removeItem(QUEUES_STORAGE_KEY);
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // The native file remains authoritative when localStorage is unavailable
     // or the queue contains inline image data that exceeds its quota.
   }
+}
+
+/** Finish prior native writes before acknowledging removal from both stores. */
+export async function forgetPersistedMessageQueue(
+  sessionId: string,
+): Promise<void> {
+  if (typeof window === "undefined") return;
+  const updates = { [sessionId]: null };
+  const results = await Promise.allSettled([
+    window.__TAURI_INTERNALS__
+      ? enqueueNativeQueueWrite(updates)
+      : Promise.resolve(),
+    Promise.resolve().then(() => refreshCachedMessageQueues(updates, true)),
+  ]);
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
 }

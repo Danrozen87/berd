@@ -10,6 +10,7 @@ vi.mock("../acpApi", () => ({
 }));
 
 import {
+  forgetSessionSearch,
   searchSessions,
   searchSessionsViaExports,
   sessionSearchStamp,
@@ -501,5 +502,33 @@ describe("searchSessions", () => {
       "connection closed",
     );
     expect(mockExportSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("forgetSessionSearch", () => {
+  it("removes every transcript version and prevents late exports from repopulating it", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const key = ["session-search-corpus", "deleted"];
+    client.setQueryData([...key, "v1"], "secret");
+    client.setQueryData(["session-search-corpus", "kept", "v1"], "retained");
+    let finish!: (value: string) => void;
+    const pending = client.fetchQuery({
+      queryKey: [...key, "v2"],
+      queryFn: () =>
+        new Promise<string>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    const cancelled = pending.catch(() => undefined);
+    await forgetSessionSearch(client, "deleted");
+    finish("late secret");
+    await cancelled;
+    expect(client.getQueriesData({ queryKey: key })).toEqual([]);
+    expect(client.getQueryData(["session-search-corpus", "kept", "v1"])).toBe(
+      "retained",
+    );
+    client.clear();
   });
 });

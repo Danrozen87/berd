@@ -95,7 +95,17 @@
     "messageCount_one": "{{displayCount}} mensaje",
     "messageCount_other": "{{displayCount}} mensajes",
     "sectionTitle": "Chats archivados",
-    "title": "Chats"
+    "title": "Chats",
+    "deleteLabel": "Eliminar {{title}} permanentemente",
+    "deleteTitle": "¿Eliminar «{{title}}» permanentemente?",
+    "deleteDescription": "Se eliminarán la conversación y los mensajes guardados por Berd. No podrás restaurarlos. Se conservan los archivos del proyecto, el historial independiente del agente y las copias de seguridad.",
+    "deleteConfirm": "Eliminar permanentemente",
+    "deleting": "Eliminando…",
+    "deleteSuccess": "Chat eliminado permanentemente.",
+    "deleteError": "No se pudo confirmar la eliminación. El chat sigue en la lista; inténtalo de nuevo cuando haya conexión.",
+    "deleteUnavailable": "Archiva y cierra el chat antes de eliminarlo.",
+    "deleteCleanupWarning": "Chat eliminado. Queda pendiente parte de la limpieza de la caché o los metadatos locales.",
+    "restoreError": "No se pudo restaurar el chat. Inténtalo de nuevo."
   },
   "compaction": {
     "goose": {

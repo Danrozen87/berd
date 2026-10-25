@@ -1,3 +1,6 @@
+import { useSessionWindowStore } from "@/features/chat/stores/sessionWindowStore";
+import { deleteArchivedChat } from "@/features/sessions/lib/deleteArchivedChat";
+import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureReplayBuffer } from "@/features/chat/hooks/replayBuffer";
 import {
@@ -6,6 +9,7 @@ import {
 } from "@/features/chat/acp/acpReplayAssistant";
 import { handleSessionInfoUpdate } from "@/features/chat/acp/acpSessionInfoUpdate";
 import {
+  activateSession,
   clearIdleStreamingMessageAfterReplay,
   loadSessionMessages,
   loadSessionMessagesAndPrepare,
@@ -14,6 +18,7 @@ import { DEFAULT_CHAT_TITLE } from "@/features/chat/lib/sessionTitle";
 import { setMultiWorkspaceEnabled } from "@/features/workspaces/multiWorkspacePreference";
 import { useChatStore } from "@/features/chat/stores/chatStore";
 import {
+  SessionDeletionUnavailableError,
   type ChatSession,
   useChatSessionStore,
 } from "@/features/chat/stores/chatSessionStore";
@@ -29,6 +34,12 @@ import {
   acquireSessionDispatchTarget,
   resetSessionTargetCoordinatorsForTests,
 } from "@/features/chat/lib/sessionTargetCoordinator";
+
+const acpDeleteSession = vi.hoisted(() => vi.fn());
+vi.mock("@/shared/api/acpApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/shared/api/acpApi")>()),
+  deleteSession: acpDeleteSession,
+}));
 
 const acpGetSessionInfo = vi.hoisted(() => vi.fn());
 const acpLoadSession = vi.hoisted(() => vi.fn());
@@ -177,6 +188,47 @@ describe("loadSessionMessages", () => {
       activeWorkspaceBySession: {},
     });
     useProjectStore.setState({ projects: [] });
+  });
+
+  it("cannot open or replay a chat during or after permanent deletion", async () => {
+    const id = "deletion-activation-race";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    useChatSessionStore.setState({ activeSessionId: null });
+    useChatStore.setState({ activeSessionId: null });
+    useSessionWindowStore.getState().setSnapshot([]);
+    const deletion = deferred();
+    acpDeleteSession.mockReturnValueOnce(deletion.promise);
+    const deleting = useChatSessionStore.getState().deleteArchivedSession(id);
+    activateSession(id);
+    useChatSessionStore.getState().setActiveSession(id);
+    useChatStore.getState().setActiveSession(id);
+    expect(useChatSessionStore.getState().activeSessionId).toBeNull();
+    expect(useChatStore.getState().activeSessionId).toBeNull();
+    await expect(loadSessionMessages(id)).resolves.toBe(false);
+    expect(acpLoadSession).not.toHaveBeenCalled();
+    deletion.resolve();
+    await deleting;
+    activateSession(id);
+    await expect(loadSessionMessages(id)).resolves.toBe(false);
+    expect(useChatStore.getState().activeSessionId).toBeNull();
+  });
+
+  it("refuses deletion while an archived chat replay is still loading", async () => {
+    const id = "loading-deletion-race";
+    seedSession({ id, archivedAt: "2026-10-01" });
+    useChatSessionStore.setState({ activeSessionId: null });
+    const replay = deferred();
+    acpLoadSession.mockReturnValueOnce(replay.promise);
+    const loading = loadSessionMessages(id);
+    await vi.waitFor(() => expect(acpLoadSession).toHaveBeenCalled());
+    const client = new QueryClient();
+    await expect(deleteArchivedChat(id, client)).rejects.toBeInstanceOf(
+      SessionDeletionUnavailableError,
+    );
+    expect(acpDeleteSession).not.toHaveBeenCalled();
+    replay.resolve();
+    await loading;
+    client.clear();
   });
 
   it("uses the leased target when ACP load returns a divergent target", async () => {
