@@ -12,6 +12,7 @@ import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog"
 import { DesignSystemInspector } from "@/features/design-system/inspector/DesignSystemInspector";
 import { isDesignSystemExplorerEnabled } from "@/features/design-system/lib/designSystemEnabled";
 import { cn } from "@/shared/lib/cn";
+import { usePrefersReducedMotion } from "@/shared/hooks/usePrefersReducedMotion";
 import {
   SIDEBAR_COLLAPSE_TRANSITION_EASE,
   SIDEBAR_COLLAPSE_TRANSITION_MS,
@@ -80,6 +81,80 @@ function findFirstFocusable(
   return null;
 }
 
+function getSidebarPanelStyle(
+  overlay: boolean | undefined,
+  collapsed: boolean,
+  width: number,
+  timing: string | undefined,
+): CSSProperties {
+  const style: CSSProperties = {
+    width,
+    pointerEvents: collapsed ? "none" : undefined,
+  };
+  if (!overlay) return style;
+  return {
+    ...style,
+    left: 0,
+    right: "auto",
+    transform: `translateX(${collapsed ? "-100%" : "0"})`,
+    // Hide the offscreen shadow after the slide; reversing restores visibility
+    // immediately. Inert and pointer-events block interaction from the start.
+    visibility: collapsed ? "hidden" : undefined,
+    transition: timing
+      ? `transform ${timing}, visibility 0s ${collapsed ? SIDEBAR_COLLAPSE_TRANSITION_MS : 0}ms`
+      : "none",
+  };
+}
+
+function useSidebarMotion({
+  contentUnderSidebar: overlay,
+  sidebarCollapsed: collapsed,
+  sidebarOuterWidth,
+  sidebarPanelOuterWidth,
+  isResizing,
+  sidebarDisableWidthTransition,
+}: Pick<
+  AppShellLayoutProps,
+  | "contentUnderSidebar"
+  | "sidebarCollapsed"
+  | "sidebarOuterWidth"
+  | "sidebarPanelOuterWidth"
+  | "isResizing"
+  | "sidebarDisableWidthTransition"
+>) {
+  const reducedMotion = usePrefersReducedMotion();
+  const disabled = isResizing || sidebarDisableWidthTransition || reducedMotion;
+  const [clipped, setClipped] = useState(collapsed);
+  useEffect(() => {
+    if (collapsed || disabled) {
+      setClipped(collapsed);
+      return;
+    }
+    if (!clipped) return;
+    const timeout = window.setTimeout(
+      () => setClipped(false),
+      SIDEBAR_COLLAPSE_TRANSITION_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [clipped, collapsed, disabled]);
+  const timing = `${SIDEBAR_COLLAPSE_TRANSITION_MS}ms ${SIDEBAR_COLLAPSE_TRANSITION_EASE}`;
+  return {
+    clipOverflow: collapsed || (!disabled && clipped),
+    handleTransition: disabled ? "none" : `opacity ${timing}`,
+    slotStyle: {
+      width: overlay ? sidebarPanelOuterWidth : sidebarOuterWidth,
+      transition: disabled || overlay ? "none" : `width ${timing}`,
+      pointerEvents: overlay && collapsed ? "none" : undefined,
+    } satisfies CSSProperties,
+    panelStyle: getSidebarPanelStyle(
+      overlay,
+      collapsed,
+      sidebarPanelOuterWidth,
+      disabled ? undefined : timing,
+    ),
+  };
+}
+
 export function AppShellLayout({
   children,
   contentUnderSidebar = false,
@@ -121,36 +196,26 @@ export function AppShellLayout({
     null,
   );
   const [mainElement, setMainElement] = useState<HTMLElement | null>(null);
-  const [sidebarClipOverflow, setSidebarClipOverflow] =
-    useState(sidebarCollapsed);
   const sidebarElevated = sidebarHovered || isResizing;
-  useEffect(() => {
-    if (sidebarCollapsed) {
-      setSidebarClipOverflow(true);
-      return;
-    }
-
-    if (!sidebarClipOverflow) return;
-    const timeout = window.setTimeout(
-      () => setSidebarClipOverflow(false),
-      SIDEBAR_COLLAPSE_TRANSITION_MS,
-    );
-    return () => window.clearTimeout(timeout);
-  }, [sidebarClipOverflow, sidebarCollapsed]);
-  const sidebarHandleFadeTransition = isResizing
-    ? "none"
-    : `opacity ${SIDEBAR_COLLAPSE_TRANSITION_MS}ms ${SIDEBAR_COLLAPSE_TRANSITION_EASE}`;
+  const {
+    clipOverflow: sidebarClipOverflow,
+    handleTransition: sidebarHandleFadeTransition,
+    slotStyle,
+    panelStyle,
+  } = useSidebarMotion({
+    contentUnderSidebar,
+    sidebarCollapsed,
+    sidebarOuterWidth,
+    sidebarPanelOuterWidth,
+    isResizing,
+    sidebarDisableWidthTransition,
+  });
   const sidebarWidthResizeEnabled =
     !sidebarResizeDisabled && !sidebarWidthResizeDisabled;
   const sidebarHeightResizeEnabled =
     !sidebarResizeDisabled && !sidebarHeightResizeDisabled;
   const sidebarCornerResizeEnabled =
     sidebarWidthResizeEnabled && sidebarHeightResizeEnabled;
-  const sidebarSpacerTransition =
-    isResizing || sidebarDisableWidthTransition
-      ? "none"
-      : `width ${SIDEBAR_COLLAPSE_TRANSITION_MS}ms ${SIDEBAR_COLLAPSE_TRANSITION_EASE}`;
-
   const sidebarSlotMaxHeight = contentUnderTopBar
     ? "calc(100% - var(--spacing-app-panel-gutter-bottom) - var(--spacing-app-top-bar))"
     : "calc(100% - var(--spacing-app-panel-gutter-bottom)";
@@ -213,9 +278,9 @@ export function AppShellLayout({
 
       <div className="goose-zoom-scope relative flex min-h-0 flex-1">
         {/*
-          This slot owns the sidebar/content gap. The panel is right-aligned
-          inside the slot, so animating the slot width moves the panel and main
-          content from the same edge and keeps their gutter visually constant.
+          Flow pages animate the slot width to move content with the panel.
+          Overlaid content needs no gap: keep its slot fixed and slide the panel
+          by transform so each animation frame avoids laying out the sidebar.
         */}
         <div
           className={cn(
@@ -229,8 +294,7 @@ export function AppShellLayout({
               : undefined,
             height: sidebarOuterHeight,
             maxHeight: sidebarSlotMaxHeight,
-            width: sidebarOuterWidth,
-            transition: sidebarSpacerTransition,
+            ...slotStyle,
           }}
           aria-hidden={contentTakeover || sidebarCollapsed || undefined}
           inert={contentTakeover ? true : undefined}
@@ -251,10 +315,7 @@ export function AppShellLayout({
                 "left-0",
               sidebarElevated && "z-30",
             )}
-            style={{
-              width: sidebarPanelOuterWidth,
-              pointerEvents: sidebarCollapsed ? "none" : undefined,
-            }}
+            style={panelStyle}
             aria-hidden={sidebarCollapsed || undefined}
             inert={sidebarCollapsed ? true : undefined}
             onMouseEnter={() => setSidebarHovered(true)}

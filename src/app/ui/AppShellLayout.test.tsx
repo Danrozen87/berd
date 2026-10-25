@@ -1,5 +1,5 @@
-import { render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShellLayout } from "./AppShellLayout";
 
 vi.mock("@/app/views/NavigationPanesView", () => ({
@@ -30,11 +30,22 @@ vi.mock("./TopBar", () => ({
   TopBar: () => <header>Top bar</header>,
 }));
 
+const motion = vi.hoisted(() => ({ reduced: false }));
+vi.mock("@/shared/hooks/usePrefersReducedMotion", () => ({
+  usePrefersReducedMotion: () => motion.reduced,
+}));
+
+afterEach(() => {
+  motion.reduced = false;
+  vi.useRealTimers();
+});
+
 const noop = vi.fn();
 type TestLayoutProps = Omit<Parameters<typeof AppShellLayout>[0], "children">;
 
 function layoutProps({
   isResizing = false,
+  contentUnderSidebar = false,
   sidebarCollapsed = false,
   sidebarDisableWidthTransition = false,
   sidebarHeightResizeDisabled = false,
@@ -43,6 +54,7 @@ function layoutProps({
   sidebarContentAnchor = "right",
 }: {
   isResizing?: boolean;
+  contentUnderSidebar?: boolean;
   sidebarCollapsed?: boolean;
   sidebarDisableWidthTransition?: boolean;
   sidebarHeightResizeDisabled?: boolean;
@@ -63,6 +75,7 @@ function layoutProps({
       width: 200,
       projects: [],
     },
+    contentUnderSidebar,
     sidebarCollapsed,
     sidebarContentAnchor,
     sidebarDisableWidthTransition,
@@ -200,5 +213,87 @@ describe("AppShellLayout", () => {
     expect(container.querySelector(".sidebar-resize-rail")).toBeNull();
     expect(container.querySelector(".cursor-ns-resize")).toBeInTheDocument();
     expect(container.querySelector(".cursor-nwse-resize")).toBeNull();
+  });
+
+  it("slides an overlay without changing slot width or unmounting its panel", () => {
+    const { rerender, sidebarPanel, sidebarSlot } = renderLayout({
+      contentUnderSidebar: true,
+    });
+    expect(sidebarSlot.style.transition).toBe("none");
+    expect(sidebarPanel.style.transform).toBe("translateX(0)");
+    expect(sidebarPanel.style.transition).toContain("transform 320ms");
+    expect(sidebarPanel.style.left).toBe("0px");
+    expect(sidebarPanel.style.right).toBe("auto");
+
+    rerender(
+      <AppShellLayout
+        {...layoutProps({ contentUnderSidebar: true, sidebarCollapsed: true })}
+      >
+        <main>Content</main>
+      </AppShellLayout>,
+    );
+    expect(sidebarSlot.style.width).toBe("212px");
+    expect(sidebarSlot.style.pointerEvents).toBe("none");
+    expect(sidebarPanel.style.transform).toBe("translateX(-100%)");
+    expect(sidebarPanel).toHaveAttribute("inert");
+    expect(sidebarPanel).toHaveAttribute("aria-hidden", "true");
+    expect(sidebarPanel.style.transition).toContain("visibility 0s 320ms");
+    expect(sidebarPanel.querySelector("aside")).toBeInTheDocument();
+  });
+
+  it("cancels stale clipping timers when an overlay is rapidly reversed", () => {
+    vi.useFakeTimers();
+    const { rerender, sidebarPanel, sidebarSlot } = renderLayout({
+      contentUnderSidebar: true,
+      sidebarCollapsed: true,
+    });
+    const show = (sidebarCollapsed: boolean) =>
+      rerender(
+        <AppShellLayout
+          {...layoutProps({ contentUnderSidebar: true, sidebarCollapsed })}
+        >
+          <main>Content</main>
+        </AppShellLayout>,
+      );
+    show(false);
+    act(() => vi.advanceTimersByTime(100));
+    show(true);
+    act(() => vi.advanceTimersByTime(220));
+    expect(sidebarSlot.style.clipPath).toBe("inset(-100vh 0 -100vh 0)");
+    show(false);
+    act(() => vi.advanceTimersByTime(320));
+    expect(sidebarSlot.style.clipPath).toBe("");
+    expect(sidebarSlot.style.pointerEvents).toBe("");
+    expect(sidebarPanel).not.toHaveAttribute("inert");
+    expect(sidebarPanel.style.visibility).toBe("");
+  });
+
+  it.each([
+    "reduced motion",
+    "resizing",
+    "suppressed transition",
+  ])("reveals overlay content and resize rails immediately for %s", (reason) => {
+    const { rerender, sidebarPanel, sidebarSlot, container } = renderLayout({
+      contentUnderSidebar: true,
+      sidebarCollapsed: true,
+    });
+    motion.reduced = reason === "reduced motion";
+    rerender(
+      <AppShellLayout
+        {...layoutProps({
+          contentUnderSidebar: true,
+          isResizing: reason === "resizing",
+          sidebarDisableWidthTransition: reason === "suppressed transition",
+        })}
+      >
+        <main>Content</main>
+      </AppShellLayout>,
+    );
+    expect(sidebarSlot.style.clipPath).toBe("");
+    expect(sidebarPanel.style.transition).toBe("none");
+    expect(
+      (container.querySelector(".sidebar-resize-rail") as HTMLElement).style
+        .transition,
+    ).toBe("none");
   });
 });
