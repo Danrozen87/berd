@@ -223,13 +223,6 @@
     }
   },
   "experiments": {
-    "frameRate": {
-      "title": "FPS counter (temporary)",
-      "description": "Show renderer FPS, average frame time, and the slowest frame every half second. Estimates animation-frame callbacks, not GPU presentation. Turn off after testing.",
-      "fps": "{{value}} FPS",
-      "timing": "{{average}} ms · max {{worst}} ms",
-      "waiting": "Measuring FPS…"
-    },
     "autoEnable": {
       "description": "Dev builds enable experiments by default. Turn off individual experiments below when you need the stable path.",
       "label": "Auto-enable new experiments"

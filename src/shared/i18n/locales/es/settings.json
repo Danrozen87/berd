@@ -223,13 +223,6 @@
     }
   },
   "experiments": {
-    "frameRate": {
-      "title": "Contador de FPS (temporal)",
-      "description": "Muestra los FPS del renderizador, el tiempo medio por fotograma y el fotograma más lento cada medio segundo. Estima las llamadas de animación, no la presentación en la GPU. Desactívalo al terminar las pruebas.",
-      "fps": "{{value}} FPS",
-      "timing": "{{average}} ms · máx. {{worst}} ms",
-      "waiting": "Midiendo FPS…"
-    },
     "autoEnable": {
       "description": "Las compilaciones de desarrollo activan los experimentos de forma predeterminada. Desactiva experimentos individuales abajo cuando necesites el flujo estable.",
       "label": "Activar nuevos experimentos automáticamente"
