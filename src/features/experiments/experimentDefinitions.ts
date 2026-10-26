@@ -67,9 +67,18 @@ export const RELATED_PULL_REQUESTS_EXPERIMENT_ID = "related-pull-requests";
 
 export const PROMPT_PINS_EXPERIMENT_ID = "prompt-pins";
 
+export const FRAME_RATE_MONITOR_EXPERIMENT_ID = "frame-rate-monitor";
+
 export const REMOTE_SSH_SESSIONS_EXPERIMENT_ID = "remote-ssh-sessions";
 
 export const EXPERIMENT_DEFINITIONS = [
+  {
+    id: FRAME_RATE_MONITOR_EXPERIMENT_ID,
+    titleKey: "experiments.frameRate.title",
+    descriptionKey: "experiments.frameRate.description",
+    defaultEnabled: false,
+    manualEnableOnly: true,
+  },
   {
     id: BUILDERBOT_SURFACE_EXPERIMENT_ID,
     titleKey: "experiments.builderbot.title",

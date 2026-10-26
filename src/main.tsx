@@ -1,3 +1,4 @@
+import { FrameRateMonitor } from "@/features/experiments/FrameRateMonitor";
 import {
   focusManager,
   QueryClient,
@@ -184,6 +185,7 @@ if (voiceBuddy) {
                 sessionId={decodedSessionId}
               >
                 <SessionWindowApp sessionId={decodedSessionId} />
+                <FrameRateMonitor />
               </SessionWindowRuntime>
             </RendererErrorBoundary>
           </TooltipProvider>
@@ -239,6 +241,7 @@ if (voiceBuddy) {
                   <ThemeProvider>
                     <UpdaterProvider>
                       <App />
+                      <FrameRateMonitor />
                     </UpdaterProvider>
                   </ThemeProvider>
                 </I18nProvider>
