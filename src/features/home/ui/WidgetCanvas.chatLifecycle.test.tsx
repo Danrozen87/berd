@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
     maxItems: 100,
   },
   saveCamera: vi.fn(),
+  moveWidget: vi.fn(),
 }));
 
 const messages: Message[] = [
@@ -188,6 +189,7 @@ function expandedChat(): WidgetInstance {
 function CanvasHarness() {
   const [instances, setInstances] = useState([expandedChat()]);
   const mutatePosition = (id: string, x: number, y: number) => {
+    mocks.moveWidget(id, x, y);
     setInstances((current) => {
       const moved = current.map((instance) =>
         instance.id === id ? { ...instance, x, y } : instance,
@@ -217,6 +219,7 @@ function TestProviders({ children }: { children: ReactNode }) {
 
 describe("expanded chat canvas drag lifecycle", () => {
   beforeEach(() => {
+    mocks.moveWidget.mockClear();
     mocks.transcriptMounts = 0;
     mocks.transcriptUnmounts = 0;
     mocks.composerMounts = 0;
@@ -280,10 +283,18 @@ describe("expanded chat canvas drag lifecycle", () => {
       "[data-home-widget-canvas]",
     ) as HTMLElement;
 
+    // Mock only the widget's unscaled bounds so appzoom remains1 in JSDOM.
+    widgetNode.style.width = "800px";
+    const dragHandle = widgetNode.querySelector<HTMLElement>(
+      "[data-home-widget-drag-handle='true']",
+    );
+    if (!dragHandle)
+      throw new Error("Expanded chat must expose its drag handle");
+    const originalLeft = widgetNode.style.left;
     await user.pointer([
       {
         keys: "[MouseLeft>]",
-        target: widgetNode,
+        target: dragHandle,
         coords: { clientX: 30, clientY: 30 },
       },
       {
@@ -292,6 +303,9 @@ describe("expanded chat canvas drag lifecycle", () => {
       },
     ]);
     // Cross fully outside the viewport, then return before ending the drag.
+    await waitFor(() => expect(widgetNode.style.translate).toBe("1000px 0px"));
+    expect(widgetNode.style.left).toBe(originalLeft);
+    expect(mocks.moveWidget).not.toHaveBeenCalled();
     expect(
       screen.getByRole("region", { name: "Canvas session" }),
     ).toHaveAttribute("data-canvas-chat-focused", "true");
@@ -305,6 +319,13 @@ describe("expanded chat canvas drag lifecycle", () => {
     ]);
 
     await act(async () => undefined);
+    expect(mocks.moveWidget).toHaveBeenCalledExactlyOnceWith(
+      "expanded-chat",
+      50,
+      50,
+    );
+    expect(widgetNode.style.translate).toBe("");
+    expect(widgetNode.style.left).not.toBe(originalLeft);
     expect(screen.getByTestId("hydrated-transcript")).toBe(transcript);
     expect(screen.getByTestId("canvas-card-composer")).toBe(composer);
     expect(screen.queryByTestId("transcript-placeholder")).toBeNull();

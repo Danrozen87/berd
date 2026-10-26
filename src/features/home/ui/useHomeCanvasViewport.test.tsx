@@ -572,4 +572,147 @@ describe("useHomeCanvasViewport", () => {
     });
     expect(result.current.canvasSize).toEqual({ width: 800, height: 600 });
   });
+
+  it("coalesces transform previews without rerendering widget contents during movement", () => {
+    vi.useFakeTimers();
+    let renders = 0;
+    const element = document.createElement("div");
+    const onWidgetDragEnd = vi.fn();
+    const onWidgetDragStart = vi.fn();
+    const { result } = renderHook(() => {
+      renders++;
+      return useHomeCanvasViewport({
+        camera,
+        constraints,
+        saveCamera: vi.fn(),
+        onWidgetDragEnd,
+        onWidgetDragStart,
+      });
+    });
+    act(() => {
+      result.current.beginWidgetDrag(
+        pointerEvent({ ...widgetStart, currentTarget: element }),
+        instance,
+        { transformPreview: true },
+      );
+      result.current.handlePointerMove(
+        pointerEvent({ clientX: 30, clientY: 34 }),
+      );
+    });
+    const rendersAtStart = renders;
+    act(() => {
+      for (let x = 31; x <= 124; x++)
+        result.current.handlePointerMove(
+          pointerEvent({ clientX: x, clientY: 34 }),
+        );
+    });
+    expect(renders).toBe(rendersAtStart);
+    expect(onWidgetDragStart).toHaveBeenCalledTimes(1);
+    expect(onWidgetDragEnd).not.toHaveBeenCalled();
+    expect(element.style.translate).toBe("");
+    act(() => vi.advanceTimersToNextFrame());
+    expect(element.style.translate).toBe("100px 0px");
+    expect(result.current.dragPositions[instance.id]).toEqual({ x: 20, y: 30 });
+    act(() =>
+      result.current.finishPointerGesture(
+        pointerEvent({ clientX: 130, clientY: 34 }),
+      ),
+    );
+    expectWidgetDragEnd(onWidgetDragEnd, { x: 126, y: 30 }, { x: 106, y: 0 });
+    expect(element.style.translate).toBe("");
+    expect(element.style.willChange).toBe("");
+    act(() => vi.advanceTimersToNextFrame());
+    expect(element.style.translate).toBe("");
+  });
+
+  it("flushes final coordinates through app and canvas zoom before committing", () => {
+    vi.useFakeTimers();
+    const element = document.createElement("div");
+    element.style.width = "100px";
+    vi.spyOn(element, "getBoundingClientRect").mockReturnValue({
+      width: 130,
+    } as DOMRect);
+    let previewDuringCommit = "";
+    const onWidgetDragEnd = vi.fn(() => {
+      previewDuringCommit = element.style.translate;
+    });
+    const { result } = renderViewportHook({
+      camera: { ...camera, zoomBps: 20_000 },
+      onWidgetDragEnd,
+    });
+    act(() => {
+      result.current.beginWidgetDrag(
+        pointerEvent({ ...widgetStart, currentTarget: element }),
+        instance,
+        { transformPreview: true },
+      );
+      result.current.handlePointerMove(
+        pointerEvent({ clientX: 76, clientY: 34 }),
+      );
+      vi.advanceTimersToNextFrame();
+    });
+    expect(element.style.translate).toBe("40px 0px");
+    act(() =>
+      result.current.finishPointerGesture(
+        pointerEvent({ clientX: 102, clientY: 34 }),
+      ),
+    );
+    expect(previewDuringCommit).toBe("60px 0px");
+    expectWidgetDragEnd(onWidgetDragEnd, { x: 50, y: 30 }, { x: 78, y: 0 });
+    expect(element.style.translate).toBe("");
+  });
+
+  it("cancels pending transform frames without saving or leaving transient styles", () => {
+    vi.useFakeTimers();
+    const element = document.createElement("div");
+    const onWidgetDragEnd = vi.fn();
+    const { result } = renderViewportHook({ onWidgetDragEnd });
+    act(() => {
+      result.current.beginWidgetDrag(
+        pointerEvent({ ...widgetStart, currentTarget: element }),
+        instance,
+        { transformPreview: true },
+      );
+      result.current.handlePointerMove(
+        pointerEvent({ clientX: 76, clientY: 34 }),
+      );
+      result.current.finishPointerGesture(
+        pointerEvent({ type: "pointercancel", clientX: 76, clientY: 34 }),
+      );
+      vi.advanceTimersToNextFrame();
+    });
+    expect(onWidgetDragEnd).not.toHaveBeenCalled();
+    expect(element.style.translate).toBe("");
+    expect(element.style.willChange).toBe("");
+    expect(result.current.dragPositions).toEqual({});
+  });
+
+  it("cleans a transform preview if the commit callback throws", () => {
+    const element = document.createElement("div");
+    const { result } = renderViewportHook({
+      onWidgetDragEnd: () => {
+        throw new Error("Save rejected");
+      },
+    });
+    act(() => {
+      result.current.beginWidgetDrag(
+        pointerEvent({ ...widgetStart, currentTarget: element }),
+        instance,
+        { transformPreview: true },
+      );
+      result.current.handlePointerMove(
+        pointerEvent({ clientX: 76, clientY: 34 }),
+      );
+    });
+    act(() =>
+      expect(() =>
+        result.current.finishPointerGesture(
+          pointerEvent({ clientX: 76, clientY: 34 }),
+        ),
+      ).toThrow("Save rejected"),
+    );
+    expect(element.style.translate).toBe("");
+    expect(element.style.willChange).toBe("");
+    expect(result.current.dragPositions).toEqual({});
+  });
 });

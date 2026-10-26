@@ -32,6 +32,7 @@ import {
   offsetBetween,
 } from "../lib/widgetGesture";
 import type { WidgetInstance } from "../widgets/types";
+import { useWidgetDragPreview } from "./useWidgetDragPreview";
 
 type ActivePointer =
   | {
@@ -51,6 +52,8 @@ type ActivePointer =
       startViewport: CanvasViewport;
       startPosition: CanvasPoint;
       didDrag: boolean;
+      transformPreview: boolean;
+      clientScale: number;
       instance: WidgetInstance;
     }
   | {
@@ -194,10 +197,10 @@ function widgetPositionFromOffset(
   activePointer: Extract<ActivePointer, { kind: "widget" }>,
   offset: CanvasPoint,
 ): CanvasPoint {
-  const { startPosition, startViewport } = activePointer;
+  const { startPosition, startViewport, clientScale } = activePointer;
   return {
-    x: startPosition.x + offset.x / startViewport.zoom,
-    y: startPosition.y + offset.y / startViewport.zoom,
+    x: startPosition.x + offset.x / (startViewport.zoom * clientScale),
+    y: startPosition.y + offset.y / (startViewport.zoom * clientScale),
   };
 }
 
@@ -214,6 +217,115 @@ function widgetResizeFromOffset(
   });
 }
 
+function widgetClientScale(element: HTMLElement): number {
+  const width = Number.parseFloat(getComputedStyle(element).width);
+  return width > 0 ? element.getBoundingClientRect().width / width || 1 : 1;
+}
+
+function updateDragTranslation(
+  pointer: Extract<ActivePointer, { kind: "widget" }>,
+  offset: CanvasPoint,
+  update: ReturnType<typeof useWidgetDragPreview>["update"],
+) {
+  update(pointer.captureElement, {
+    x: offset.x / pointer.clientScale,
+    y: offset.y / pointer.clientScale,
+  });
+}
+
+type PointerMoveHandlers = Pick<
+  UseHomeCanvasViewportOptions,
+  "constraints" | "onWidgetDragStart"
+> & {
+  setViewport: React.Dispatch<React.SetStateAction<CanvasViewport>>;
+  setResizePreviews: React.Dispatch<
+    React.SetStateAction<Record<string, ResolvedWidgetResize>>
+  >;
+  setDragPositions: React.Dispatch<
+    React.SetStateAction<Record<string, CanvasPoint>>
+  >;
+  lockDocumentSelection: () => void;
+  updateDragPreview: ReturnType<typeof useWidgetDragPreview>["update"];
+};
+
+function updatePointerGesture(
+  pointer: ActivePointer,
+  client: CanvasPoint,
+  handlers: PointerMoveHandlers,
+) {
+  if (pointer.kind === "pan") {
+    handlers.setViewport(
+      panCanvasViewport(pointer.startViewport, pointer.startClient, client),
+    );
+    return;
+  }
+  const offset = offsetBetween(client, pointer.startClient);
+  if (pointer.kind === "resize") {
+    handlers.setResizePreviews((current) => ({
+      ...current,
+      [pointer.widgetId]: widgetResizeFromOffset(
+        pointer,
+        handlers.constraints,
+        offset,
+      ),
+    }));
+    return;
+  }
+  if (!pointer.didDrag && !movedBeyondWidgetDragThreshold(offset)) return;
+  const started = !pointer.didDrag;
+  if (started) {
+    handlers.lockDocumentSelection();
+    markWidgetDragStarted(pointer, handlers.onWidgetDragStart, true);
+  }
+  if (started || !pointer.transformPreview) {
+    const position = pointer.transformPreview
+      ? pointer.startPosition
+      : widgetPositionFromOffset(pointer, offset);
+    handlers.setDragPositions((current) => ({
+      ...current,
+      [pointer.widgetId]: position,
+    }));
+  }
+  if (pointer.transformPreview) {
+    updateDragTranslation(pointer, offset, handlers.updateDragPreview);
+  }
+}
+
+type WidgetDragCommitHandlers = Pick<
+  UseHomeCanvasViewportOptions,
+  "onWidgetDragStart" | "onWidgetDragEnd"
+> & {
+  clearScheduledCameraSave: () => void;
+  clearWidgetDragPosition: (id: string) => void;
+  updateDragPreview: ReturnType<typeof useWidgetDragPreview>["update"];
+  flushDragPreview: () => void;
+};
+
+function commitWidgetDrag(
+  pointer: Extract<ActivePointer, { kind: "widget" }>,
+  offset: CanvasPoint,
+  handlers: WidgetDragCommitHandlers,
+) {
+  if (!pointer.didDrag && !movedBeyondWidgetDragThreshold(offset)) return;
+  if (!pointer.didDrag) {
+    markWidgetDragStarted(pointer, handlers.onWidgetDragStart, false);
+  }
+  if (pointer.transformPreview) {
+    updateDragTranslation(pointer, offset, handlers.updateDragPreview);
+    handlers.flushDragPreview();
+  }
+  handlers.clearScheduledCameraSave();
+  try {
+    handlers.onWidgetDragEnd?.({
+      id: pointer.widgetId,
+      position: widgetPositionFromOffset(pointer, offset),
+      offset,
+    });
+  } finally {
+    handlers.clearWidgetDragPosition(pointer.widgetId);
+  }
+}
+
 export function useHomeCanvasViewport({
   camera,
   constraints,
@@ -228,6 +340,11 @@ export function useHomeCanvasViewport({
 }: UseHomeCanvasViewportOptions) {
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const activePointerRef = useRef<ActivePointer | null>(null);
+  const {
+    update: updateDragPreview,
+    flush: flushDragPreview,
+    clear: clearDragPreview,
+  } = useWidgetDragPreview();
   const cameraSaveTimerRef = useRef<number | null>(null);
   const documentSelectionLockRef = useRef<SelectionLockSnapshot | null>(null);
   const gestureScaleRef = useRef<number | null>(null);
@@ -377,9 +494,11 @@ export function useHomeCanvasViewport({
   );
 
   const clearWidgetDragPosition = useCallback(
-    (widgetId: string) =>
-      setDragPositions(({ [widgetId]: _removed, ...rest }) => rest),
-    [],
+    (widgetId: string) => {
+      clearDragPreview();
+      setDragPositions(({ [widgetId]: _removed, ...rest }) => rest);
+    },
+    [clearDragPreview],
   );
 
   const clearWidgetResizePreview = useCallback(
@@ -417,7 +536,11 @@ export function useHomeCanvasViewport({
   );
 
   const beginWidgetDrag = useCallback(
-    (event: React.PointerEvent<HTMLElement>, instance: WidgetInstance) => {
+    (
+      event: React.PointerEvent<HTMLElement>,
+      instance: WidgetInstance,
+      { transformPreview = false }: { transformPreview?: boolean } = {},
+    ) => {
       if (typeof event.button === "number" && event.button !== 0) {
         return;
       }
@@ -433,6 +556,8 @@ export function useHomeCanvasViewport({
         startViewport: viewport,
         startPosition: { x: instance.x, y: instance.y },
         didDrag: false,
+        transformPreview,
+        clientScale: widgetClientScale(event.currentTarget),
         instance,
       };
     },
@@ -474,47 +599,17 @@ export function useHomeCanvasViewport({
         return;
       }
 
-      const eventClient = eventClientPoint(event);
-
-      if (activePointer.kind === "pan") {
-        setViewport(
-          panCanvasViewport(
-            activePointer.startViewport,
-            activePointer.startClient,
-            eventClient,
-          ),
-        );
-        return;
-      }
-
-      const offset = offsetBetween(eventClient, activePointer.startClient);
-      if (activePointer.kind === "resize") {
-        setResizePreviews((current) => ({
-          ...current,
-          [activePointer.widgetId]: widgetResizeFromOffset(
-            activePointer,
-            constraints,
-            offset,
-          ),
-        }));
-        return;
-      }
-
-      if (!activePointer.didDrag && !movedBeyondWidgetDragThreshold(offset)) {
-        return;
-      }
-      if (!activePointer.didDrag) {
-        lockDocumentSelection();
-        markWidgetDragStarted(activePointer, onWidgetDragStart, true);
-      }
-
-      const nextPosition = widgetPositionFromOffset(activePointer, offset);
-      setDragPositions((current) => ({
-        ...current,
-        [activePointer.widgetId]: nextPosition,
-      }));
+      updatePointerGesture(activePointer, eventClientPoint(event), {
+        constraints,
+        setViewport,
+        setResizePreviews,
+        setDragPositions,
+        lockDocumentSelection,
+        onWidgetDragStart,
+        updateDragPreview,
+      });
     },
-    [constraints, lockDocumentSelection, onWidgetDragStart],
+    [constraints, lockDocumentSelection, onWidgetDragStart, updateDragPreview],
   );
 
   const finishPointerGesture = useCallback(
@@ -593,22 +688,14 @@ export function useHomeCanvasViewport({
         return;
       }
 
-      if (!activePointer.didDrag && !movedBeyondWidgetDragThreshold(offset)) {
-        return;
-      }
-      if (!activePointer.didDrag) {
-        markWidgetDragStarted(activePointer, onWidgetDragStart, false);
-      }
-
-      const finalPosition = widgetPositionFromOffset(activePointer, offset);
-
-      clearScheduledCameraSave();
-      onWidgetDragEnd?.({
-        id: activePointer.widgetId,
-        position: finalPosition,
-        offset,
+      commitWidgetDrag(activePointer, offset, {
+        clearScheduledCameraSave,
+        clearWidgetDragPosition,
+        onWidgetDragStart,
+        onWidgetDragEnd,
+        updateDragPreview,
+        flushDragPreview,
       });
-      clearWidgetDragPosition(activePointer.widgetId);
     },
     [
       clearScheduledCameraSave,
@@ -622,6 +709,8 @@ export function useHomeCanvasViewport({
       onWidgetResizeCancel,
       onWidgetResizeEnd,
       unlockDocumentSelection,
+      updateDragPreview,
+      flushDragPreview,
     ],
   );
 

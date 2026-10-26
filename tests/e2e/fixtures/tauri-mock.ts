@@ -10,6 +10,7 @@
 
 import { test as base, expect, type Page } from "@playwright/test";
 import { MOCK_PERSONAS, MOCK_PROJECTS, MOCK_SKILLS } from "./mock-data";
+import type { Layout } from "../../../src/features/layout/api/layout";
 
 /**
  * Build the init script that will be injected into the page via
@@ -25,6 +26,7 @@ export function buildInitScript(options?: {
   skills?: unknown[];
   projects?: unknown[];
   sessions?: unknown[];
+  homeLayout?: Pick<Layout, "items" | "camera">;
   voiceConversationStatus?: unknown;
   enabledExperiments?: string[];
   providerCatalog?: unknown[];
@@ -184,6 +186,7 @@ export function buildInitScript(options?: {
           zoomBps: 10000,
         },
         items: [],
+        ...${JSON.stringify(options?.homeLayout ?? {})},
         constraints: LAYOUT_CONSTRAINTS,
       };
       let nextCallbackId = 1;

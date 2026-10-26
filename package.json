@@ -50,7 +50,8 @@
     "test:theme-contrast": "playwright test --config tests/theme-contrast/playwright.config.ts",
     "test:provider-setup": "playwright test --config tests/provider-setup/playwright.config.ts",
     "test:tooltips": "playwright test --config tests/tooltips/playwright.config.ts",
-    "test:sidebar-motion": "playwright test --config tests/sidebar-motion/playwright.config.ts"
+    "test:sidebar-motion": "playwright test --config tests/sidebar-motion/playwright.config.ts",
+    "test:canvas-motion": "playwright test --config tests/canvas-motion/playwright.config.ts"
   },
   "dependencies": {
     "@aaif/goose-sdk": "workspace:*",

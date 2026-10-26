@@ -240,6 +240,24 @@ function renderedWidgetContentStyleForResizePreview({
   };
 }
 
+function startWidgetDrag(
+  event: React.PointerEvent<HTMLDivElement>,
+  instance: WidgetInstance,
+  beginDrag: ReturnType<typeof useHomeCanvasViewport>["beginWidgetDrag"],
+) {
+  const expandedChat =
+    instance.type === "chatPin" && instance.state?.presentation === "expanded";
+  if (
+    expandedChat &&
+    !(event.target as HTMLElement).closest(HOME_WIDGET_DRAG_HANDLE_SELECTOR)
+  )
+    return;
+  // Berdy's sway consumes live positions; other widgets only need translation.
+  beginDrag(event, instance, {
+    transformPreview: instance.type !== "onboardingTour",
+  });
+}
+
 const HOME_MIN_ZOOM_BPS = 5_000;
 const HOME_MAX_ZOOM_BPS = 20_000;
 const WIDGET_TEXT_SCALE_MULTIPLIER = 1.08;
@@ -722,18 +740,7 @@ export function WidgetCanvas({
                 if (instance.id !== focusedCanvasChatId) {
                   setFocusedCanvasChatId(null);
                 }
-                const expandedCanvasChat =
-                  instance.type === "chatPin" &&
-                  instance.state?.presentation === "expanded";
-                if (
-                  expandedCanvasChat &&
-                  !(event.target as HTMLElement).closest(
-                    HOME_WIDGET_DRAG_HANDLE_SELECTOR,
-                  )
-                ) {
-                  return;
-                }
-                beginWidgetDrag(event, instance);
+                startWidgetDrag(event, instance, beginWidgetDrag);
               }}
               onDragStart={preventNativeDrag}
               style={widgetStyle}
